@@ -1,0 +1,13 @@
+node_modules/
+out/
+dist/
+release/
+release-*/
+artifacts/
+output/
+.agents/
+*.recovery-backup
+*.log
+ui-check*.png
+ui-check*.jpg
+.DS_Store

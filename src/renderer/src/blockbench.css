@@ -1,0 +1,330 @@
+.bb-workspace {
+  position: relative;
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 520px;
+  display: grid;
+  grid-template-rows: 42px 32px minmax(0, 1fr) 25px;
+  overflow: hidden;
+  color: #27272a;
+  background: #ececee;
+}
+
+.bb-workspace button {
+  color: inherit;
+  font: inherit;
+  letter-spacing: 0;
+}
+
+.bb-toolbar {
+  z-index: 2;
+  min-width: 0;
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto minmax(180px, 1fr);
+  align-items: center;
+  gap: 12px;
+  padding: 0 10px;
+  border-bottom: 1px solid rgba(0, 0, 0, .13);
+  background: rgba(247, 247, 249, .94);
+  backdrop-filter: blur(20px) saturate(140%);
+}
+
+.bb-toolbar-group {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 3px;
+}
+
+.bb-toolbar-end {
+  justify-content: flex-end;
+}
+
+.bb-tool-button {
+  width: 29px;
+  height: 28px;
+  padding: 0;
+  border: 0;
+  border-radius: 6px;
+  display: inline-grid;
+  place-items: center;
+  flex: 0 0 auto;
+  background: transparent;
+  cursor: pointer;
+}
+
+.bb-tool-button:hover:not(:disabled) {
+  background: rgba(0, 0, 0, .065);
+}
+
+.bb-tool-button:active:not(:disabled) {
+  background: rgba(0, 0, 0, .11);
+}
+
+.bb-tool-button:disabled {
+  opacity: .38;
+  cursor: default;
+}
+
+.bb-toolbar-divider {
+  width: 1px;
+  height: 18px;
+  margin: 0 4px;
+  background: rgba(0, 0, 0, .13);
+}
+
+.bb-mode-control {
+  height: 30px;
+  padding: 2px;
+  display: flex;
+  align-items: center;
+  border: 1px solid rgba(0, 0, 0, .06);
+  border-radius: 7px;
+  background: #e5e5e8;
+}
+
+.bb-mode-control button {
+  height: 24px;
+  min-width: 66px;
+  padding: 0 9px;
+  border: 0;
+  border-radius: 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  background: transparent;
+  color: #5b5b61;
+  font-size: 10px;
+  cursor: pointer;
+}
+
+.bb-mode-control button:hover {
+  color: #202024;
+  background: rgba(255, 255, 255, .62);
+}
+
+.bb-mode-control button:focus-visible,
+.bb-tool-button:focus-visible {
+  outline: 2px solid rgba(20, 116, 224, .48);
+  outline-offset: 1px;
+}
+
+.bb-ai-state {
+  max-width: 136px;
+  height: 25px;
+  padding: 0 8px;
+  border: 1px solid #d7d7da;
+  border-radius: 6px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  overflow: hidden;
+  color: #707076;
+  background: rgba(255, 255, 255, .65);
+  font-size: 9px;
+  white-space: nowrap;
+}
+
+.bb-ai-state span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bb-ai-state.active {
+  border-color: #b7d6f5;
+  color: #1768b8;
+  background: #edf6ff;
+}
+
+.bb-document-bar {
+  z-index: 2;
+  min-width: 0;
+  padding: 0 12px;
+  border-bottom: 1px solid rgba(0, 0, 0, .12);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  background: #f1f1f3;
+}
+
+.bb-document-name,
+.bb-runtime-state {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 9px;
+}
+
+.bb-document-name strong,
+.bb-runtime-state span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bb-document-name strong {
+  font-size: 10px;
+}
+
+.bb-document-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #9d9da2;
+}
+
+.bb-document-dot.dirty {
+  background: #e39724;
+}
+
+.bb-runtime-state {
+  max-width: 46%;
+  color: #6f6f75;
+}
+
+.bb-runtime-state.ai {
+  color: #1768b8;
+}
+
+.bb-runtime-state.error {
+  color: #b22f28;
+}
+
+.bb-viewport-shell {
+  min-width: 0;
+  min-height: 0;
+  position: relative;
+  overflow: hidden;
+  background: #29292d;
+}
+
+.bb-native-viewport {
+  position: absolute;
+  inset: 0;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.bb-viewport-placeholder {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  color: #b9b9be;
+  background: #29292d;
+  font-size: 10px;
+}
+
+.bb-viewport-placeholder strong {
+  color: #ededee;
+  font-size: 12px;
+}
+
+.bb-viewport-placeholder span {
+  max-width: min(420px, 80%);
+  overflow: hidden;
+  text-align: center;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bb-viewport-placeholder.error {
+  color: #e0837c;
+}
+
+.bb-statusbar {
+  z-index: 2;
+  min-width: 0;
+  padding: 0 10px;
+  border-top: 1px solid rgba(0, 0, 0, .14);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 14px;
+  color: #77777c;
+  background: #f1f1f3;
+  font-size: 9px;
+}
+
+.bb-connection,
+.bb-status-message {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.bb-connection {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.bb-connection i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #a2a2a7;
+}
+
+.bb-connection.connected i {
+  background: #34a853;
+}
+
+.bb-notice {
+  position: absolute;
+  z-index: 5;
+  left: 50%;
+  bottom: 38px;
+  max-width: min(520px, calc(100% - 40px));
+  padding: 8px 11px;
+  border-radius: 6px;
+  overflow: hidden;
+  color: #fff;
+  background: rgba(35, 35, 38, .94);
+  box-shadow: 0 7px 25px rgba(0, 0, 0, .22);
+  font-size: 10px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  transform: translateX(-50%);
+}
+
+.bb-spin {
+  animation: bb-spin .8s linear infinite;
+}
+
+@keyframes bb-spin {
+  to { transform: rotate(360deg); }
+}
+
+@media (max-width: 900px) {
+  .bb-toolbar {
+    grid-template-columns: 1fr auto;
+  }
+
+  .bb-mode-control {
+    display: none;
+  }
+}
+
+@media (max-width: 620px) {
+  .bb-ai-state span,
+  .bb-status-message {
+    display: none;
+  }
+
+  .bb-ai-state {
+    width: 29px;
+    padding: 0;
+    justify-content: center;
+  }
+}

@@ -1,0 +1,79 @@
+export type MinecraftRuntimeStage =
+  | 'idle'
+  | 'preparing'
+  | 'downloading-java'
+  | 'downloading-game'
+  | 'installing-fabric'
+  | 'building-mod'
+  | 'syncing-mod'
+  | 'launching'
+  | 'running'
+  | 'stopped'
+  | 'error'
+
+export interface MinecraftRuntimeEvent {
+  stage: MinecraftRuntimeStage
+  message: string
+  time: string
+  progress?: number
+  total?: number
+  level?: 'info' | 'warning' | 'error'
+}
+
+export interface MinecraftManagedMod {
+  name: string
+  path: string
+  size: number
+  modifiedAt: string
+  projectArtifact: boolean
+}
+
+export interface MinecraftCrashInfo {
+  summary: string
+  reportPath?: string
+  exitCode: number | null
+  time: string
+}
+
+export interface MinecraftRuntimeState {
+  stage: MinecraftRuntimeStage
+  minecraftVersion: string
+  fabricVersionId?: string
+  loaderVersion?: string
+  javaPath?: string
+  instancePath?: string
+  installed: boolean
+  running: boolean
+  pid?: number
+  message: string
+  mods: MinecraftManagedMod[]
+  lastCrash?: MinecraftCrashInfo
+}
+
+export interface MinecraftLaunchOptions {
+  username: string
+  maxMemoryMb: number
+  width?: number
+  height?: number
+}
+
+export interface MinecraftLaunchTestResult {
+  success: boolean
+  state: MinecraftRuntimeState
+  crash?: MinecraftCrashInfo
+}
+
+export interface MinecraftApi {
+  getState: () => Promise<MinecraftRuntimeState>
+  prepare: () => Promise<MinecraftRuntimeState>
+  buildProject: () => Promise<MinecraftManagedMod>
+  launch: (options: MinecraftLaunchOptions) => Promise<MinecraftRuntimeState>
+  testLaunch: (options: MinecraftLaunchOptions) => Promise<MinecraftLaunchTestResult>
+  stop: () => Promise<MinecraftRuntimeState>
+  syncProjectMod: () => Promise<MinecraftManagedMod | null>
+  importMods: () => Promise<MinecraftManagedMod[]>
+  removeMod: (name: string) => Promise<MinecraftManagedMod[]>
+  listMods: () => Promise<MinecraftManagedMod[]>
+  onState: (listener: (state: MinecraftRuntimeState) => void) => () => void
+  onEvent: (listener: (event: MinecraftRuntimeEvent) => void) => () => void
+}
