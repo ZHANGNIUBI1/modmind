@@ -1,8 +1,22 @@
 import type { BlockbenchAction, BlockbenchBounds, BlockbenchBridgeStatus } from './blockbench'
 import type { MinecraftApi } from './minecraft'
 import type { MappingsApi } from './mappings'
+import type { ProductionApi, ProjectFileMutationResult } from './production'
 
-export type LoaderKind = 'fabric' | 'neoforge'
+export type LoaderKind = 'fabric' | 'quilt' | 'forge' | 'neoforge'
+
+export type LoaderSupportTier = 'stable' | 'experimental'
+
+export interface LoaderVersionOption {
+  loader: LoaderKind
+  minecraftVersion: string
+  loaderVersion: string
+  apiVersion?: string
+  javaVersion: number
+  channel: 'release' | 'beta'
+  supportTier: LoaderSupportTier
+  notes: string[]
+}
 
 export interface ProjectInfo {
   name: string
@@ -11,6 +25,9 @@ export interface ProjectInfo {
   minecraftVersion: string
   namespace: string
   createdAt: string
+  loaderVersion?: string
+  apiVersion?: string
+  javaVersion?: number
   toolDataDirectory?: '.modmind' | '.modtool'
 }
 
@@ -18,6 +35,27 @@ export interface ProjectCreateInput {
   name: string
   loader: LoaderKind
   minecraftVersion: string
+}
+
+export interface ProjectMigrationInput {
+  loader: LoaderKind
+  minecraftVersion: string
+}
+
+export interface ProjectMigrationPreview {
+  source: Pick<ProjectInfo, 'loader' | 'minecraftVersion'>
+  target: LoaderVersionOption
+  automaticChanges: string[]
+  warnings: string[]
+  blockers: string[]
+}
+
+export interface ProjectMigrationResult {
+  project: ProjectInfo
+  snapshot: SnapshotInfo
+  reportPath: string
+  changedFiles: string[]
+  warnings: string[]
 }
 
 export type ExistingProjectKind = 'complete' | 'partial' | 'api-docs'
@@ -76,6 +114,12 @@ export interface SnapshotInfo {
   label: string
   createdAt: string
   fileCount: number
+}
+
+export interface SnapshotRestoreResult {
+  snapshot: SnapshotInfo
+  backup: SnapshotInfo
+  project: ProjectInfo
 }
 
 export interface AiRecoveryInfo {
@@ -147,6 +191,7 @@ export interface ModMindApi {
     close: () => Promise<void>
   }
   project: {
+    listLoaderVersions: (refresh?: boolean) => Promise<LoaderVersionOption[]>
     create: (input: ProjectCreateInput) => Promise<ProjectInfo | null>
     open: () => Promise<ProjectInfo | null>
     openRecent: (projectPath: string) => Promise<ProjectInfo>
@@ -158,7 +203,16 @@ export interface ModMindApi {
     listFiles: () => Promise<FileNode[]>
     readFile: (relativePath: string) => Promise<string>
     writeFile: (relativePath: string, content: string) => Promise<void>
+    createFile: (relativePath: string, content?: string) => Promise<ProjectFileMutationResult>
+    createDirectory: (relativePath: string) => Promise<ProjectFileMutationResult>
+    renamePath: (from: string, to: string) => Promise<ProjectFileMutationResult>
+    deletePath: (relativePath: string) => Promise<void>
+    reveal: (relativePath?: string) => Promise<void>
+    prepareIde: () => Promise<string[]>
+    openIde: () => Promise<void>
     captureIdea: (prompt: string) => Promise<void>
+    previewMigration: (input: ProjectMigrationInput) => Promise<ProjectMigrationPreview>
+    migrate: (input: ProjectMigrationInput) => Promise<ProjectMigrationResult | null>
   }
   build: {
     preflight: () => Promise<PreflightResult>
@@ -169,6 +223,8 @@ export interface ModMindApi {
   snapshots: {
     create: (label: string) => Promise<SnapshotInfo>
     list: () => Promise<SnapshotInfo[]>
+    restore: (id: string) => Promise<SnapshotRestoreResult>
+    delete: (id: string) => Promise<SnapshotInfo[]>
   }
   settings: {
     getAi: () => Promise<AiSettings>
@@ -204,4 +260,5 @@ export interface ModMindApi {
   }
   mappings: MappingsApi
   minecraft: MinecraftApi
+  production: ProductionApi
 }

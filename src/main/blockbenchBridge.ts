@@ -35,6 +35,7 @@ const PAGE_DISPATCHER = String.raw`async function dispatchBlockbenchAction(actio
   const CubeApi = typeof Cube !== 'undefined' ? Cube : root.Cube;
   const TextureApi = typeof Texture !== 'undefined' ? Texture : root.Texture;
   const GroupApi = typeof Group !== 'undefined' ? Group : root.Group;
+  const AnimationApi = typeof Animation !== 'undefined' ? Animation : root.Animation;
   const UndoApi = typeof Undo !== 'undefined' ? Undo : root.Undo;
   const CanvasApi = typeof Canvas !== 'undefined' ? Canvas : root.Canvas;
   const CodecsApi = typeof Codecs !== 'undefined' ? Codecs : root.Codecs;
@@ -58,6 +59,10 @@ const PAGE_DISPATCHER = String.raw`async function dispatchBlockbenchAction(actio
       CanvasApi.updateAll();
     }
   };
+  const findGroup = (uuid, name) => {
+    const groups = GroupApi && Array.isArray(GroupApi.all) ? GroupApi.all : [];
+    return groups.find((group) => uuid ? group.uuid === uuid : group.name === name);
+  };
 
   if (action.type === 'new-model') {
     const format = FormatsApi[action.format];
@@ -76,6 +81,23 @@ const PAGE_DISPATCHER = String.raw`async function dispatchBlockbenchAction(actio
     return {message: 'Model created', data: {name: action.name, format: action.format}};
   }
 
+  if (action.type === 'add-group') {
+    if (!GroupApi) throw new Error('Blockbench group API is unavailable');
+    const requestedParent = action.parentGroupUuid || action.parentGroupName
+      ? findGroup(action.parentGroupUuid, action.parentGroupName)
+      : null;
+    if ((action.parentGroupUuid || action.parentGroupName) && !requestedParent) {
+      throw new Error('Parent group not found: ' + (action.parentGroupUuid || action.parentGroupName));
+    }
+    if (UndoApi && typeof UndoApi.initEdit === 'function') UndoApi.initEdit({outliner: true});
+    let group = new GroupApi({name: action.name, origin: action.origin, rotation: action.rotation});
+    if (typeof group.addTo === 'function') group = group.addTo(requestedParent || 'root');
+    if (typeof group.init === 'function') group = group.init();
+    if (UndoApi && typeof UndoApi.finishEdit === 'function') UndoApi.finishEdit('Add group', {outliner: true});
+    updateCanvas([]);
+    return {message: 'Group added', data: {uuid: String(group.uuid), name: action.name}};
+  }
+
   if (action.type === 'add-cube') {
     if (UndoApi && typeof UndoApi.initEdit === 'function') UndoApi.initEdit({elements: []});
     const config = {
@@ -87,7 +109,13 @@ const PAGE_DISPATCHER = String.raw`async function dispatchBlockbenchAction(actio
       inflate: action.inflate || 0
     };
     let cube = new CubeApi(config);
-    const parent = GroupApi && GroupApi.first_selected || 'root';
+    const requestedParent = action.parentGroupUuid || action.parentGroupName
+      ? findGroup(action.parentGroupUuid, action.parentGroupName)
+      : null;
+    if ((action.parentGroupUuid || action.parentGroupName) && !requestedParent) {
+      throw new Error('Parent group not found: ' + (action.parentGroupUuid || action.parentGroupName));
+    }
+    const parent = requestedParent || GroupApi && GroupApi.first_selected || 'root';
     if (typeof cube.addTo === 'function') cube = cube.addTo(parent);
     if (typeof cube.init === 'function') cube = cube.init();
     const textures = typeof Texture !== 'undefined' && Texture.all ? Texture.all : TextureApi.all;
@@ -105,6 +133,32 @@ const PAGE_DISPATCHER = String.raw`async function dispatchBlockbenchAction(actio
     }
     updateCanvas([cube]);
     return {message: 'Cube added', data: {uuid: String(cube.uuid), name: action.name}};
+  }
+
+  if (action.type === 'add-animation') {
+    if (!AnimationApi) throw new Error('Blockbench animation API is unavailable');
+    let animation = new AnimationApi({name: action.name, length: action.length, loop: action.loop || 'once', snapping: action.snapping || 20});
+    if (typeof animation.add === 'function') animation = animation.add();
+    return {message: 'Animation added', data: {uuid: String(animation.uuid), name: action.name}};
+  }
+
+  if (action.type === 'add-keyframe') {
+    if (!AnimationApi) throw new Error('Blockbench animation API is unavailable');
+    const animations = Array.isArray(AnimationApi.all) ? AnimationApi.all : [];
+    const animation = animations.find((item) => action.animationUuid ? item.uuid === action.animationUuid : item.name === action.animationName);
+    const group = findGroup(action.groupUuid, action.groupName);
+    if (!animation) throw new Error('Animation not found: ' + (action.animationUuid || action.animationName));
+    if (!group) throw new Error('Animation group not found: ' + (action.groupUuid || action.groupName));
+    if (typeof animation.getBoneAnimator !== 'function') throw new Error('Blockbench bone animator API is unavailable');
+    const animator = animation.getBoneAnimator(group);
+    if (!animator || typeof animator.addKeyframe !== 'function') throw new Error('Blockbench keyframe API is unavailable');
+    const keyframe = animator.addKeyframe({
+      channel: action.channel,
+      time: action.time,
+      interpolation: action.interpolation || 'linear',
+      data_points: [{x: action.value[0], y: action.value[1], z: action.value[2]}]
+    });
+    return {message: 'Keyframe added', data: {uuid: String(keyframe && keyframe.uuid || ''), channel: action.channel, time: action.time}};
   }
 
   if (action.type === 'create-texture') {
@@ -210,6 +264,14 @@ const PAGE_DISPATCHER = String.raw`async function dispatchBlockbenchAction(actio
     const compiled = await CodecsApi.project.compile({compressed: false});
     const content = typeof compiled === 'string' ? compiled : JSON.stringify(compiled, null, 2);
     return {message: 'Project serialized', content};
+  }
+
+  if (action.type === 'serialize-export') {
+    const codec = ProjectApi && ProjectApi.format && ProjectApi.format.codec;
+    if (!codec || typeof codec.compile !== 'function') throw new Error('The active Blockbench format cannot be exported');
+    const compiled = await codec.compile({raw: true});
+    const content = typeof compiled === 'string' ? compiled : JSON.stringify(compiled, null, 2);
+    return {message: 'Model exported', content};
   }
 
   if (action.type === 'serialize-texture') {
@@ -373,6 +435,16 @@ export class BlockbenchBridge {
       }
     }
 
+    if (action.type === 'export-model') {
+      const pageResult = await this.invokePage({ type: 'serialize-export' })
+      if (typeof pageResult.content !== 'string' || Buffer.byteLength(pageResult.content, 'utf8') > 50 * 1024 * 1024) {
+        throw new Error('Blockbench returned an invalid or oversized model export')
+      }
+      const destination = await this.resolveProjectFile(action.relativePath)
+      await fs.writeFile(destination, pageResult.content, { encoding: 'utf8', flag: 'w' })
+      return { action: action.type, success: true, message: 'Blockbench model exported', data: { relativePath: action.relativePath } }
+    }
+
     if (action.type === 'save-texture') {
       const pageResult = await this.invokePage({
         type: 'serialize-texture',
@@ -408,6 +480,7 @@ export class BlockbenchBridge {
     action:
       | BlockbenchAction
       | { type: 'serialize-project' }
+      | { type: 'serialize-export' }
       | { type: 'serialize-texture'; textureUuid?: string; textureName?: string }
   ): Promise<PageActionResult> {
     const encoded = Buffer.from(JSON.stringify(action), 'utf8').toString('base64')
@@ -522,7 +595,23 @@ function validateBounds(bounds: BlockbenchBounds): Rectangle {
   return { ...bounds }
 }
 
-function validateAction(input: BlockbenchAction): BlockbenchAction {
+function normalizeBlockbenchPath(value: unknown, extensions: string[], label: string): string {
+  if (typeof value !== 'string' || value.length < 1 || value.length > 240) throw new Error(`Invalid ${label} path`)
+  const normalized = value.replaceAll('\\', '/')
+  const root = normalized.split('/')[0].toLowerCase()
+  if (
+    path.posix.isAbsolute(normalized) ||
+    normalized.split('/').includes('..') ||
+    normalized.includes('\0') ||
+    ['.git', '.modmind', '.modtool', 'node_modules', 'build', '.gradle'].includes(root) ||
+    !extensions.some((extension) => normalized.toLowerCase().endsWith(extension))
+  ) {
+    throw new Error(`${label} path must be a safe project-relative ${extensions.join(' / ')} path`)
+  }
+  return normalized
+}
+
+export function validateAction(input: BlockbenchAction): BlockbenchAction {
   if (!isRecord(input) || typeof input.type !== 'string') throw new Error('Invalid Blockbench action')
 
   if (input.type === 'new-model') {
@@ -537,7 +626,7 @@ function validateAction(input: BlockbenchAction): BlockbenchAction {
   }
 
   if (input.type === 'add-cube') {
-    assertOnlyKeys(input, ['type', 'name', 'from', 'to', 'origin', 'rotation', 'inflate', 'textureUuid', 'textureName'])
+    assertOnlyKeys(input, ['type', 'name', 'from', 'to', 'origin', 'rotation', 'inflate', 'textureUuid', 'textureName', 'parentGroupUuid', 'parentGroupName'])
     assertName(input.name, 'cube name')
     assertVector(input.from, 'from', -1024, 1024)
     assertVector(input.to, 'to', -1024, 1024)
@@ -549,6 +638,43 @@ function validateAction(input: BlockbenchAction): BlockbenchAction {
     if (input.inflate !== undefined) assertNumber(input.inflate, 'inflate', -64, 64)
     if (input.textureUuid !== undefined) assertIdentifier(input.textureUuid, 'texture UUID')
     if (input.textureName !== undefined) assertName(input.textureName, 'texture name')
+    if (input.parentGroupUuid !== undefined) assertIdentifier(input.parentGroupUuid, 'parent group UUID')
+    if (input.parentGroupName !== undefined) assertName(input.parentGroupName, 'parent group name')
+    return input as unknown as BlockbenchAction
+  }
+
+  if (input.type === 'add-group') {
+    assertOnlyKeys(input, ['type', 'name', 'origin', 'rotation', 'parentGroupUuid', 'parentGroupName'])
+    assertName(input.name, 'group name')
+    if (input.origin !== undefined) assertVector(input.origin, 'origin', -1024, 1024)
+    if (input.rotation !== undefined) assertVector(input.rotation, 'rotation', -360, 360)
+    if (input.parentGroupUuid !== undefined) assertIdentifier(input.parentGroupUuid, 'parent group UUID')
+    if (input.parentGroupName !== undefined) assertName(input.parentGroupName, 'parent group name')
+    return input as unknown as BlockbenchAction
+  }
+
+  if (input.type === 'add-animation') {
+    assertOnlyKeys(input, ['type', 'name', 'length', 'loop', 'snapping'])
+    assertName(input.name, 'animation name')
+    assertNumber(input.length, 'animation length', Number.EPSILON, 3600)
+    if (input.loop !== undefined && !['once', 'loop', 'hold'].includes(String(input.loop))) throw new Error('Animation loop mode is invalid')
+    if (input.snapping !== undefined && (!Number.isInteger(input.snapping) || input.snapping < 1 || input.snapping > 120)) throw new Error('Animation snapping must be an integer from 1 to 120')
+    return input as unknown as BlockbenchAction
+  }
+
+  if (input.type === 'add-keyframe') {
+    assertOnlyKeys(input, ['type', 'animationUuid', 'animationName', 'groupUuid', 'groupName', 'channel', 'time', 'value', 'interpolation'])
+    const uuids = input.animationUuid !== undefined && input.groupUuid !== undefined
+    const names = input.animationName !== undefined && input.groupName !== undefined
+    if (!uuids && !names) throw new Error('Animation and group must be referenced by UUIDs or names')
+    if (input.animationUuid !== undefined) assertIdentifier(input.animationUuid, 'animation UUID')
+    if (input.animationName !== undefined) assertName(input.animationName, 'animation name')
+    if (input.groupUuid !== undefined) assertIdentifier(input.groupUuid, 'group UUID')
+    if (input.groupName !== undefined) assertName(input.groupName, 'group name')
+    if (!['rotation', 'position', 'scale'].includes(String(input.channel))) throw new Error('Animation channel is invalid')
+    assertNumber(input.time, 'keyframe time', 0, 3600)
+    assertVector(input.value, 'keyframe value', -1024, 1024)
+    if (input.interpolation !== undefined && !['linear', 'catmullrom', 'step', 'bezier'].includes(String(input.interpolation))) throw new Error('Keyframe interpolation is invalid')
     return input as unknown as BlockbenchAction
   }
 
@@ -603,19 +729,12 @@ function validateAction(input: BlockbenchAction): BlockbenchAction {
 
   if (input.type === 'save-project') {
     assertOnlyKeys(input, ['type', 'relativePath'])
-    if (typeof input.relativePath !== 'string' || input.relativePath.length > 240) {
-      throw new Error('Invalid Blockbench project path')
-    }
-    const normalized = input.relativePath.replaceAll('\\', '/')
-    if (
-      path.posix.isAbsolute(normalized) ||
-      normalized.split('/').includes('..') ||
-      normalized.includes('\0') ||
-      !normalized.toLowerCase().endsWith('.bbmodel')
-    ) {
-      throw new Error('Blockbench project path must be a safe project-relative .bbmodel path')
-    }
-    return { type: input.type, relativePath: normalized }
+    return { type: input.type, relativePath: normalizeBlockbenchPath(input.relativePath, ['.bbmodel'], 'Blockbench project') }
+  }
+
+  if (input.type === 'export-model') {
+    assertOnlyKeys(input, ['type', 'relativePath'])
+    return { type: input.type, relativePath: normalizeBlockbenchPath(input.relativePath, ['.geo.json', '.json', '.java'], 'Blockbench export') }
   }
 
   if (input.type === 'run-command') {
@@ -640,23 +759,14 @@ function validateAction(input: BlockbenchAction): BlockbenchAction {
 
   if (input.type === 'save-texture') {
     assertOnlyKeys(input, ['type', 'relativePath', 'textureUuid', 'textureName'])
-    if (typeof input.relativePath !== 'string' || input.relativePath.length > 240) throw new Error('Invalid texture save path')
-    const normalized = input.relativePath.replaceAll('\\', '/')
-    if (
-      path.posix.isAbsolute(normalized) ||
-      normalized.split('/').includes('..') ||
-      normalized.includes('\0') ||
-      !normalized.toLowerCase().endsWith('.png')
-    ) {
-      throw new Error('Blockbench texture path must be a safe project-relative .png path')
-    }
+    const normalized = normalizeBlockbenchPath(input.relativePath, ['.png'], 'Blockbench texture')
     if (input.textureUuid === undefined && input.textureName === undefined) throw new Error('save-texture requires textureUuid or textureName')
     if (input.textureUuid !== undefined) assertIdentifier(input.textureUuid, 'texture UUID')
     if (input.textureName !== undefined) assertName(input.textureName, 'texture name')
     return input as unknown as BlockbenchAction
   }
 
-  throw new Error(`Unsupported Blockbench action: ${String(input.type)}`)
+  throw new Error(`Unsupported Blockbench action: ${String((input as { type?: unknown }).type)}`)
 }
 
 function assertOnlyKeys(record: Record<string, unknown>, allowed: string[]): void {

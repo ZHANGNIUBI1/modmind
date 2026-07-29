@@ -1,10 +1,14 @@
+import type { LoaderKind } from './types'
+
 export type MinecraftRuntimeStage =
   | 'idle'
   | 'preparing'
   | 'downloading-java'
   | 'downloading-game'
+  | 'installing-loader'
   | 'installing-fabric'
   | 'building-mod'
+  | 'testing-server'
   | 'syncing-mod'
   | 'launching'
   | 'running'
@@ -38,6 +42,8 @@ export interface MinecraftCrashInfo {
 export interface MinecraftRuntimeState {
   stage: MinecraftRuntimeStage
   minecraftVersion: string
+  loader?: LoaderKind
+  loaderVersionId?: string
   fabricVersionId?: string
   loaderVersion?: string
   javaPath?: string
@@ -61,6 +67,14 @@ export interface MinecraftLaunchTestResult {
   success: boolean
   state: MinecraftRuntimeState
   crash?: MinecraftCrashInfo
+}
+
+export interface GradleVerificationResult {
+  task?: string
+  skipped: boolean
+  success: boolean
+  summary: string
+  logPath?: string
 }
 
 export interface MinecraftApi {

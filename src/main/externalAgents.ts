@@ -24,6 +24,11 @@ export interface ExternalAgentBridgeHandlers {
   updateTodo: (tasks: unknown[]) => Promise<unknown>
   mappingsSearch: (query: string, limit?: number) => Promise<unknown>
   mappingsClass: (className: string, memberQuery?: string) => Promise<unknown>
+  dependencySearch: (query: string, offset?: number) => Promise<unknown>
+  dependencyInstall: (projectId: string, versionId?: string) => Promise<unknown>
+  contentValidate: () => Promise<unknown>
+  testMatrix: (targets: string[]) => Promise<unknown>
+  releasePreflight: () => Promise<unknown>
   build: () => Promise<unknown>
   testMinecraft: () => Promise<unknown>
   blockbenchActions: (actions: unknown[]) => Promise<unknown>
@@ -32,6 +37,7 @@ export interface ExternalAgentBridgeHandlers {
 
 export interface ExternalAgentRunOptions {
   kind: ExternalAgentKind
+  appVersion?: string
   executable?: string
   project: ProjectInfo
   settings: AiSettings
@@ -104,8 +110,8 @@ export function parseExternalAgentOutputLine(line: string, stream: 'stdout' | 's
 }
 
 const EXTERNAL_AGENT_DOCS: Record<ExternalAgentKind, string> = {
-  codex: 'https://developers.openai.com/codex/cli/',
-  claude: 'https://docs.anthropic.com/en/docs/claude-code/setup'
+  codex: 'https://search.bilibili.com/all?keyword=Codex%20CLI%20%E5%AE%89%E8%A3%85%E6%95%99%E7%A8%8B',
+  claude: 'https://search.bilibili.com/all?keyword=Claude%20Code%20%E5%AE%89%E8%A3%85%E6%95%99%E7%A8%8B'
 }
 
 const EXTERNAL_AGENT_PACKAGES: Record<ExternalAgentKind, {winget: string; npm: string}> = {
@@ -143,6 +149,11 @@ const tools = [
   {name:'modmind_update_todo', description:'Publish the complete task list to ModMind. Call after inspection, whenever statuses change, and before building. Existing tasks cannot be removed and statuses cannot move backward. Multiple tasks may be in progress.', inputSchema:{type:'object',properties:{tasks:{type:'array',minItems:1,maxItems:30,items:{type:'object',properties:{id:{type:'string'},title:{type:'string'},status:{type:'string',enum:['pending','in_progress','completed']}},required:['id','title','status']}}},required:['tasks']}, annotations:safeStateChange},
   {name:'modmind_mapping_search', description:'Search mappings.dev for the active Minecraft version.', inputSchema:{type:'object',properties:{query:{type:'string'},limit:{type:'number'}},required:['query']}, annotations:readOnlyRemote},
   {name:'modmind_mapping_class', description:'Inspect an exact mapped Minecraft class and optional member query.', inputSchema:{type:'object',properties:{className:{type:'string'},memberQuery:{type:'string'}},required:['className']}, annotations:readOnlyRemote},
+  {name:'modmind_dependency_search', description:'Search Modrinth for projects compatible with the active Loader and Minecraft version.', inputSchema:{type:'object',properties:{query:{type:'string'},offset:{type:'number'}},required:['query']}, annotations:readOnlyRemote},
+  {name:'modmind_dependency_install', description:'Install a compatible Modrinth dependency through the managed Gradle and test-instance integration.', inputSchema:{type:'object',properties:{projectId:{type:'string'},versionId:{type:'string'}},required:['projectId']}, annotations:managedAction},
+  {name:'modmind_validate_content', description:'Validate project JSON, OGG headers, and sound references without changing files.', inputSchema:{type:'object',properties:{}}, annotations:readOnlyLocal},
+  {name:'modmind_test_matrix', description:'Run selected managed build, client, server, or GameTest targets.', inputSchema:{type:'object',properties:{targets:{type:'array',items:{type:'string',enum:['build','client','server','gametest']}}},required:['targets']}, annotations:managedAction},
+  {name:'modmind_release_preflight', description:'Inspect release artifact, metadata, license, version, and changelog readiness. This tool cannot publish.', inputSchema:{type:'object',properties:{}}, annotations:readOnlyLocal},
   {name:'modmind_build_project', description:'Run the ModMind-managed Gradle build. Use only after all Todo work is complete.', inputSchema:{type:'object',properties:{}}, annotations:managedAction},
   {name:'modmind_test_minecraft', description:'Build and launch the isolated ModMind Minecraft test instance, then return startup/crash evidence.', inputSchema:{type:'object',properties:{}}, annotations:managedAction},
   {name:'modmind_blockbench_actions', description:'Execute validated Blockbench actions through the embedded ModMind bridge.', inputSchema:{type:'object',properties:{actions:{type:'array'}},required:['actions']}, annotations:managedAction},
@@ -159,7 +170,7 @@ input.on('line', async (line) => {
   try { request = JSON.parse(line); } catch { return; }
   if (request.method === 'notifications/initialized' || request.method?.startsWith('notifications/')) return;
   if (request.method === 'initialize') {
-    process.stdout.write(JSON.stringify(result(request.id,{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'modmind',version:'1.0.0'}}))+'\n');
+    process.stdout.write(JSON.stringify(result(request.id,{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'modmind',version:config.version || 'development'}}))+'\n');
     return;
   }
   if (request.method === 'tools/list') {
@@ -176,6 +187,11 @@ input.on('line', async (line) => {
       modmind_update_todo: 'update_todo',
       modmind_mapping_search: 'mappings_search',
       modmind_mapping_class: 'mappings_class',
+      modmind_dependency_search: 'dependency_search',
+      modmind_dependency_install: 'dependency_install',
+      modmind_validate_content: 'content_validate',
+      modmind_test_matrix: 'test_matrix',
+      modmind_release_preflight: 'release_preflight',
       modmind_build_project: 'build_project',
       modmind_test_minecraft: 'test_minecraft',
       modmind_blockbench_actions: 'blockbench_actions',
@@ -449,7 +465,7 @@ export class ModMindBridge {
   private readonly token = randomUUID()
   private readonly directory: string
 
-  constructor(private readonly project: ProjectInfo, private readonly handlers: ExternalAgentBridgeHandlers) {
+  constructor(private readonly project: ProjectInfo, private readonly handlers: ExternalAgentBridgeHandlers, private readonly appVersion = 'development') {
     this.directory = path.join(project.path, project.toolDataDirectory ?? '.modmind', 'external-agents')
   }
 
@@ -464,7 +480,7 @@ export class ModMindBridge {
     if (!address || typeof address === 'string') throw new Error('无法启动 ModMind 外部代理桥接服务')
     this.port = address.port
     const bridgePath = path.join(this.directory, 'bridge.json')
-    await fs.writeFile(bridgePath, JSON.stringify({port: this.port, token: this.token}, null, 2), 'utf8')
+    await fs.writeFile(bridgePath, JSON.stringify({port: this.port, token: this.token, version: this.appVersion}, null, 2), 'utf8')
     const mcpPath = path.join(this.directory, 'modmind-mcp-server.mjs')
     await fs.writeFile(mcpPath, MCP_SERVER, 'utf8')
     const contextPath = path.join(this.directory, 'agent-context.md')
@@ -487,7 +503,7 @@ export class ModMindBridge {
   }
 
   private contextText(): string {
-    return `# ModMind External Agent Context\n\nActive project: ${this.project.name}\nProject path: ${this.project.path}\nLoader: ${this.project.loader}\nMinecraft: ${this.project.minecraftVersion}\nNamespace: ${this.project.namespace}\n\nModMind is the orchestrator. First classify the request with modmind_set_intent. Use engineering only for an explicit request to change the project. Greetings, questions, explanations, reviews, audits, and status checks without a requested change are informational: answer them without Todo, edits, build, or test. For engineering work, preserve existing files and use ModMind for source edits, Todo tracking, mappings, builds, Minecraft tests, runtime state, and Blockbench. Inspect before editing, then publish a concrete Todo list with modmind_update_todo. On Windows, make source changes with modmind_apply_edits; do not use native apply_patch, junctions, subst drives, or absolute paths. Keep every task and its status current; several tasks may be in progress, but completed tasks cannot move backward or be removed. Do not modify .modmind or generated build directories. Complete all Todo work before building. Never claim engineering success without a successful ModMind build and, when behavior changed, a Minecraft smoke test.\n\nThe MCP tools are authoritative integration points:\n- modmind_set_intent (required first call)\n- modmind_apply_edits\n- modmind_update_todo\n- modmind_mapping_search / modmind_mapping_class\n- modmind_build_project (only after every Todo is complete)\n- modmind_test_minecraft\n- modmind_blockbench_actions\n- modmind_runtime_state\n`
+    return `# ModMind External Agent Context\n\nActive project: ${this.project.name}\nProject path: ${this.project.path}\nLoader: ${this.project.loader}\nMinecraft: ${this.project.minecraftVersion}\nNamespace: ${this.project.namespace}\n\nModMind is the orchestrator. First classify the request with modmind_set_intent. Use engineering only for an explicit request to change the project. Greetings, questions, explanations, reviews, audits, and status checks without a requested change are informational: answer them without Todo, edits, build, or test. For engineering work, preserve existing files and use ModMind for source edits, Todo tracking, mappings, dependencies, content validation, test matrices, release preflight, builds, Minecraft tests, runtime state, and Blockbench. Inspect before editing, then publish a concrete Todo list with modmind_update_todo. On Windows, make source changes with modmind_apply_edits; do not use native apply_patch, junctions, subst drives, or absolute paths. Keep every task and its status current; several tasks may be in progress, but completed tasks cannot move backward or be removed. Do not modify .modmind or generated build directories. Complete all Todo work before building. Never claim engineering success without a successful ModMind build and, when behavior changed, a Minecraft smoke test. External agents can run release preflight but cannot publish.\n\nThe MCP tools are authoritative integration points:\n- modmind_set_intent (required first call)\n- modmind_apply_edits\n- modmind_update_todo\n- modmind_mapping_search / modmind_mapping_class\n- modmind_dependency_search / modmind_dependency_install\n- modmind_validate_content / modmind_test_matrix\n- modmind_release_preflight (preflight only; publishing is never exposed)\n- modmind_build_project (only after every Todo is complete)\n- modmind_test_minecraft\n- modmind_blockbench_actions\n- modmind_runtime_state\n`
   }
 
   private async handle(request: http.IncomingMessage, response: http.ServerResponse): Promise<void> {
@@ -507,6 +523,11 @@ export class ModMindBridge {
         case 'update_todo': value = await this.handlers.updateTodo(Array.isArray(input.tasks) ? input.tasks : []); break
         case 'mappings_search': value = await this.handlers.mappingsSearch(String(input.query ?? ''), Number(input.limit ?? 20)); break
         case 'mappings_class': value = await this.handlers.mappingsClass(String(input.className ?? ''), typeof input.memberQuery === 'string' ? input.memberQuery : undefined); break
+        case 'dependency_search': value = await this.handlers.dependencySearch(String(input.query ?? ''), Number(input.offset ?? 0)); break
+        case 'dependency_install': value = await this.handlers.dependencyInstall(String(input.projectId ?? ''), typeof input.versionId === 'string' ? input.versionId : undefined); break
+        case 'content_validate': value = await this.handlers.contentValidate(); break
+        case 'test_matrix': value = await this.handlers.testMatrix(Array.isArray(input.targets) ? input.targets.map(String) : []); break
+        case 'release_preflight': value = await this.handlers.releasePreflight(); break
         case 'build_project': value = await this.handlers.build(); break
         case 'test_minecraft': value = await this.handlers.testMinecraft(); break
         case 'blockbench_actions': value = await this.handlers.blockbenchActions(Array.isArray(input.actions) ? input.actions : []); break
@@ -521,7 +542,7 @@ export class ModMindBridge {
 }
 
 export async function runExternalAgent(options: ExternalAgentRunOptions): Promise<ExternalAgentRunResult> {
-  const bridge = new ModMindBridge(options.project, options.bridge)
+  const bridge = new ModMindBridge(options.project, options.bridge, options.appVersion ?? 'development')
   const {mcpConfigPath} = await bridge.start()
   await bridge.writeMcpConfig(mcpConfigPath)
   const executable = options.executable || (await detectExternalAgents()).find((item) => item.kind === options.kind)?.executable

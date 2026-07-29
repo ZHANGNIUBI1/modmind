@@ -2,7 +2,14 @@ import { afterEach, describe, expect, it } from 'vitest'
 import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { extractSingleJsonObject, listManagedFiles, redactSensitiveContent, restoreManagedTreeExact } from './agentCore'
+import {
+  extractSingleJsonObject,
+  listManagedFiles,
+  redactSensitiveContent,
+  restoreManagedTreeExact,
+  snapshotManifestBelongsToProject,
+  validateSnapshotId
+} from './agentCore'
 
 const temporaryRoots: string[] = []
 
@@ -71,5 +78,21 @@ describe('restoreManagedTreeExact', () => {
     await expect(fs.readFile(path.join(project, 'src', 'Existing.java'), 'utf8')).resolves.toBe('original')
     await expect(fs.stat(path.join(project, 'src', 'CreatedByAi.java'))).rejects.toThrow()
     await expect(fs.readFile(path.join(project, '.modmind', 'keep.json'), 'utf8')).resolves.toBe('{}')
+  })
+})
+
+describe('snapshot identity validation', () => {
+  it('accepts generated IDs and rejects path traversal', () => {
+    expect(validateSnapshotId('2026-07-29T13-20-10-123Z')).toBe('2026-07-29T13-20-10-123Z')
+    expect(() => validateSnapshotId('../snapshot')).toThrow(/Invalid snapshot ID/)
+    expect(() => validateSnapshotId('folder\\snapshot')).toThrow(/Invalid snapshot ID/)
+  })
+
+  it('rejects manifests copied from another project', () => {
+    const current = path.join(os.tmpdir(), 'modmind-current-project')
+    const other = path.join(os.tmpdir(), 'modmind-other-project')
+    expect(snapshotManifestBelongsToProject({ id: 'snapshot-1', projectPath: current }, 'snapshot-1', current)).toBe(true)
+    expect(snapshotManifestBelongsToProject({ id: 'snapshot-1' }, 'snapshot-1', current)).toBe(true)
+    expect(snapshotManifestBelongsToProject({ id: 'snapshot-1', projectPath: other }, 'snapshot-1', current)).toBe(false)
   })
 })

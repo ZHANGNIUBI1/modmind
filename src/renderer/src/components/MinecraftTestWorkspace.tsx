@@ -146,7 +146,7 @@ export default function MinecraftTestWorkspace(): React.JSX.Element {
   const progress = activeDownload?.total
     ? Math.max(0, Math.min(100, (activeDownload.progress! / activeDownload.total) * 100))
     : undefined
-  const preparing = ['preparing', 'downloading-java', 'downloading-game', 'installing-fabric', 'building-mod'].includes(state.stage)
+  const preparing = ['preparing', 'downloading-java', 'downloading-game', 'installing-loader', 'installing-fabric', 'building-mod'].includes(state.stage)
 
   const removeMod = (mod: MinecraftManagedMod): void => {
     void run(`remove:${mod.name}`, async () => {
@@ -160,7 +160,7 @@ export default function MinecraftTestWorkspace(): React.JSX.Element {
       <header className="mc-test-header">
         <div className="mc-test-title">
           <span className={`mc-test-icon ${state.running ? 'running' : ''}`}><Gamepad2 size={20} /></span>
-          <div><h1>Minecraft 测试</h1><p>{state.minecraftVersion || '项目版本'} · Fabric {state.loaderVersion || '待安装'}</p></div>
+          <div><h1>Minecraft 测试</h1><p>{state.minecraftVersion || '项目版本'} · {state.loader ? state.loader === 'fabric' ? 'Fabric' : state.loader === 'quilt' ? 'Quilt' : state.loader === 'forge' ? 'Forge' : 'NeoForge' : 'Loader'} {state.loaderVersion || '待安装'}</p></div>
         </div>
         <div className="mc-test-actions">
           <button className="secondary-button" disabled={Boolean(busy) || state.running} onClick={() => void run('prepare', () => window.modmind.minecraft.prepare())}>

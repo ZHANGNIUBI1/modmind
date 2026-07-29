@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import { marked } from 'marked'
 import {
   Archive,
@@ -9,14 +9,17 @@ import {
   ChevronRight,
   CircleAlert,
   Clock3,
+  CloudUpload,
   Code2,
   Copy,
   Download,
   ExternalLink,
   File,
   FileCode2,
+  FilePlus2,
   Folder,
   FolderOpen,
+  FolderPlus,
   Gamepad2,
   Hammer,
   History,
@@ -28,6 +31,7 @@ import {
   MoreHorizontal,
   PanelLeft,
   PackageOpen,
+  Pencil,
   Play,
   Plus,
   RotateCcw,
@@ -39,6 +43,7 @@ import {
   Square,
   Sparkles,
   TerminalSquare,
+  Trash2,
   UserRound,
   X
 } from 'lucide-react'
@@ -53,18 +58,25 @@ import type {
   ExistingProjectAnalysis,
   FileNode,
   InspirationChatMessage,
+  LoaderKind,
+  LoaderVersionOption,
   PipelineEvent,
   PreflightResult,
   ProjectInfo,
+  ProjectMigrationPreview,
   SnapshotInfo
 } from '../../shared/types'
 import type { MappingClassDetail, MappingClassResult } from '../../shared/mappings'
 import type { MinecraftRuntimeEvent } from '../../shared/minecraft'
 import BlockbenchWorkspace from './components/BlockbenchWorkspace'
+import GitWorkspace from './components/GitWorkspace'
 import MinecraftTestWorkspace from './components/MinecraftTestWorkspace'
+import ProductionWorkspace from './components/ProductionWorkspace'
 import appLogo from './assets/logo.png'
 
-type ViewId = 'workspace' | 'inspiration' | 'blockbench' | 'minecraft' | 'mappings' | 'code' | 'build' | 'snapshots' | 'settings'
+const MonacoCodeEditor = lazy(() => import('./components/MonacoCodeEditor'))
+
+type ViewId = 'workspace' | 'inspiration' | 'blockbench' | 'minecraft' | 'mappings' | 'code' | 'build' | 'snapshots' | 'production' | 'settings'
 type InspirationConversation = { id: string; title: string; updatedAt: string; messages: InspirationChatMessage[] }
 type AiTimelineItem = {
   id: string
@@ -133,6 +145,22 @@ function formatDate(value: string): string {
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
+}
+
+function editorLanguage(relativePath: string): string {
+  const extension = relativePath.split('.').at(-1)?.toLowerCase() ?? ''
+  return {
+    java: 'java', kt: 'kotlin', kts: 'kotlin', gradle: 'groovy', groovy: 'groovy',
+    json: 'json', mcmeta: 'json', md: 'markdown', html: 'html', htm: 'html',
+    xml: 'xml', yaml: 'yaml', yml: 'yaml', js: 'javascript', jsx: 'javascript',
+    ts: 'typescript', tsx: 'typescript', css: 'css', scss: 'scss', properties: 'ini'
+  }[extension] ?? 'plaintext'
+}
+
+function isEditablePath(relativePath: string): boolean {
+  const name = relativePath.split('/').at(-1)?.toLowerCase() ?? ''
+  if (['gradlew', 'license', 'copying'].includes(name)) return true
+  return /\.(?:java|kt|kts|gradle|groovy|json|mcmeta|md|txt|toml|html?|xml|ya?ml|js|jsx|ts|tsx|css|scss|properties|bat|cmd|sh|gitignore)$/i.test(name)
 }
 
 function shouldOfferAiRecovery(error: unknown): boolean {
@@ -317,7 +345,7 @@ function AdoptProjectDialog({
           <label className="field-label">项目名称<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></label>
           <label className="field-label">命名空间<input value={form.namespace} onChange={(event) => setForm({ ...form, namespace: event.target.value })} /></label>
           <label className="field-label">Minecraft 版本<input value={form.minecraftVersion} onChange={(event) => setForm({ ...form, minecraftVersion: event.target.value })} /></label>
-          <label className="field-label">加载器<select value={form.loader} disabled={analysis.kind !== 'complete'} onChange={(event) => setForm({ ...form, loader: event.target.value as ExistingProjectAdoptInput['loader'] })}><option value="fabric">Fabric</option><option value="neoforge">NeoForge</option></select></label>
+          <label className="field-label">加载器<select value={form.loader} disabled={analysis.kind !== 'complete'} onChange={(event) => setForm({ ...form, loader: event.target.value as ExistingProjectAdoptInput['loader'] })}><option value="fabric">Fabric</option><option value="quilt">Quilt</option><option value="forge">Forge</option><option value="neoforge">NeoForge</option></select></label>
         </div>
         {analysis.detectedFiles.length ? <div className="adopt-files"><span>检测到的关键文件</span><code>{analysis.detectedFiles.slice(0, 8).join('\n')}</code></div> : null}
         {error ? <div className="inline-error"><CircleAlert size={15} />{error}</div> : null}
@@ -472,10 +500,29 @@ function InspirationWorkspace({ project, onSendToCoding }: { project: ProjectInf
 
 function CreateProjectDialog({ onClose, onCreated }: { onClose: () => void; onCreated: (project: ProjectInfo) => void }): React.JSX.Element {
   const [name, setName] = useState('')
-  const [loader, setLoader] = useState<'fabric' | 'neoforge'>('fabric')
+  const [loader, setLoader] = useState<LoaderKind>('fabric')
   const [version, setVersion] = useState('1.21.1')
+  const [catalog, setCatalog] = useState<LoaderVersionOption[]>([])
+  const [catalogBusy, setCatalogBusy] = useState(true)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
+
+  useEffect(() => {
+    void window.modmind.project.listLoaderVersions().then((options) => {
+      setCatalog(options)
+      setCatalogBusy(false)
+    }).catch((reason) => {
+      setError(errorMessage(reason))
+      setCatalogBusy(false)
+    })
+  }, [])
+
+  const availableVersions = catalog.filter((option) => option.loader === loader)
+
+  useEffect(() => {
+    if (!availableVersions.length || availableVersions.some((option) => option.minecraftVersion === version)) return
+    setVersion(availableVersions[0].minecraftVersion)
+  }, [loader, catalog, version, availableVersions])
 
   const create = async (): Promise<void> => {
     if (!name.trim()) return setError('请输入项目名称')
@@ -509,22 +556,22 @@ function CreateProjectDialog({ onClose, onCreated }: { onClose: () => void; onCr
           加载器
           <div className="segmented-control">
             <button className={loader === 'fabric' ? 'active' : ''} onClick={() => setLoader('fabric')}>Fabric</button>
-            <button disabled title="下一阶段支持" className={loader === 'neoforge' ? 'active' : ''} onClick={() => setLoader('neoforge')}>NeoForge</button>
+            <button className={loader === 'quilt' ? 'active' : ''} onClick={() => setLoader('quilt')}>Quilt</button>
+            <button className={loader === 'forge' ? 'active' : ''} onClick={() => setLoader('forge')}>Forge</button>
+            <button className={loader === 'neoforge' ? 'active' : ''} onClick={() => setLoader('neoforge')}>NeoForge</button>
           </div>
-          {loader === 'neoforge' ? <small>当前原型会记录 NeoForge 配置，模板构建将在后续接入。</small> : null}
         </div>
         <label className="field-label">
           Minecraft 版本
-          <select value={version} onChange={(event) => setVersion(event.target.value)}>
-            <option value="1.21.1">1.21.1</option>
-            <option value="1.20.6">1.20.6</option>
-            <option value="1.20.1">1.20.1</option>
+          <select value={version} disabled={catalogBusy || !availableVersions.length} onChange={(event) => setVersion(event.target.value)}>
+            {availableVersions.map((option) => <option key={`${option.loader}-${option.minecraftVersion}`} value={option.minecraftVersion}>{option.minecraftVersion}{option.supportTier === 'experimental' ? '（实验性）' : ''}</option>)}
           </select>
+          {catalogBusy ? <small>正在读取加载器兼容目录…</small> : null}
         </label>
         {error ? <div className="inline-error"><CircleAlert size={15} />{error}</div> : null}
         <div className="dialog-footer">
           <button className="secondary-button" onClick={onClose}>取消</button>
-          <button className="primary-button" disabled={busy} onClick={() => void create()}>
+          <button className="primary-button" disabled={busy || catalogBusy || !availableVersions.length} onClick={() => void create()}>
             {busy ? <LoaderCircle className="spin" size={16} /> : <Plus size={16} />}创建项目
           </button>
         </div>
@@ -552,6 +599,13 @@ export default function App(): React.JSX.Element {
   const [minecraftEvents, setMinecraftEvents] = useState<MinecraftRuntimeEvent[]>([])
   const [building, setBuilding] = useState(false)
   const [snapshots, setSnapshots] = useState<SnapshotInfo[]>([])
+  const [restoringSnapshotId, setRestoringSnapshotId] = useState('')
+  const [deletingSnapshotId, setDeletingSnapshotId] = useState('')
+  const [loaderCatalog, setLoaderCatalog] = useState<LoaderVersionOption[]>([])
+  const [migrationLoader, setMigrationLoader] = useState<LoaderKind>('fabric')
+  const [migrationVersion, setMigrationVersion] = useState('')
+  const [migrationPreview, setMigrationPreview] = useState<ProjectMigrationPreview | null>(null)
+  const [migrationBusy, setMigrationBusy] = useState(false)
   const [buildTrustRequest, setBuildTrustRequest] = useState<BuildTrustRequest | null>(null)
   const [settings, setSettings] = useState<AiSettings>(initialSettings)
   const [notice, setNotice] = useState('')
@@ -686,6 +740,7 @@ export default function App(): React.JSX.Element {
       if (current) void window.modmind.ai.getRecovery().then((recovery) => { if (recovery.pending) setAiRecovery(recovery) })
     })
     void window.modmind.settings.getAi().then(setSettings)
+    void window.modmind.project.listLoaderVersions().then(setLoaderCatalog).catch(() => undefined)
     void window.modmind.externalAgents.detect().then(setExternalAgents).catch(() => undefined).finally(() => setExternalAgentsReady(true))
     const removeBuildListener = window.modmind.build.onProgress((event) => setEvents((current) => [event, ...current]))
     const removeBuildTrustListener = window.modmind.build.onTrustRequired(setBuildTrustRequest)
@@ -773,6 +828,9 @@ export default function App(): React.JSX.Element {
     if (!project) return
     void refreshFiles()
     void refreshSnapshots()
+    setMigrationLoader(project.loader)
+    setMigrationVersion('')
+    setMigrationPreview(null)
   }, [project])
 
   useEffect(() => {
@@ -887,8 +945,17 @@ export default function App(): React.JSX.Element {
   const selectFile = async (node: FileNode): Promise<void> => {
     if (node.type !== 'file') return
     try {
-      const content = await window.modmind.project.readFile(node.path)
+      if (editorDirty && selectedFile && selectedFile !== node.path) {
+        await window.modmind.project.writeFile(selectedFile, editorContent)
+      }
       setSelectedFile(node.path)
+      if (!isEditablePath(node.path)) {
+        setEditorContent('')
+        setEditorDirty(false)
+        setNotice('该文件不是可编辑文本，可使用工具栏在文件管理器中显示。')
+        return
+      }
+      const content = await window.modmind.project.readFile(node.path)
       setEditorContent(content)
       setEditorDirty(false)
     } catch (error) {
@@ -938,6 +1005,65 @@ export default function App(): React.JSX.Element {
       setNotice('文件已保存')
     } catch (error) {
       setNotice(`保存失败：${errorMessage(error)}`)
+    }
+  }
+
+  const createProjectFile = async (): Promise<void> => {
+    const suggestedDirectory = selectedFile.includes('/') ? selectedFile.slice(0, selectedFile.lastIndexOf('/') + 1) : 'src/main/'
+    const relativePath = window.prompt('输入新文件的项目相对路径', `${suggestedDirectory}NewFile.java`)?.trim()
+    if (!relativePath) return
+    try {
+      const result = await window.modmind.project.createFile(relativePath)
+      await refreshFiles()
+      setSelectedFile(result.path)
+      setEditorContent('')
+      setEditorDirty(false)
+      setNotice(`已创建 ${result.path}`)
+    } catch (error) {
+      setNotice(`创建文件失败：${errorMessage(error)}`)
+    }
+  }
+
+  const createProjectDirectory = async (): Promise<void> => {
+    const suggestedDirectory = selectedFile.includes('/') ? selectedFile.slice(0, selectedFile.lastIndexOf('/')) : 'src/main'
+    const relativePath = window.prompt('输入新目录的项目相对路径', `${suggestedDirectory}/new-directory`)?.trim()
+    if (!relativePath) return
+    try {
+      const result = await window.modmind.project.createDirectory(relativePath)
+      await refreshFiles()
+      setNotice(`已创建 ${result.path}`)
+    } catch (error) {
+      setNotice(`创建目录失败：${errorMessage(error)}`)
+    }
+  }
+
+  const renameSelectedFile = async (): Promise<void> => {
+    if (!selectedFile) return
+    const nextPath = window.prompt('输入新的项目相对路径', selectedFile)?.trim()
+    if (!nextPath || nextPath === selectedFile) return
+    try {
+      if (editorDirty) await window.modmind.project.writeFile(selectedFile, editorContent)
+      const result = await window.modmind.project.renamePath(selectedFile, nextPath)
+      setSelectedFile(result.path)
+      setEditorDirty(false)
+      await refreshFiles()
+      setNotice(`已重命名为 ${result.path}`)
+    } catch (error) {
+      setNotice(`重命名失败：${errorMessage(error)}`)
+    }
+  }
+
+  const deleteSelectedFile = async (): Promise<void> => {
+    if (!selectedFile || !window.confirm(`删除“${selectedFile}”？\n\n此操作不会删除受保护的项目目录。`)) return
+    try {
+      await window.modmind.project.deletePath(selectedFile)
+      setSelectedFile('')
+      setEditorContent('')
+      setEditorDirty(false)
+      await refreshFiles()
+      setNotice('文件已删除')
+    } catch (error) {
+      setNotice(`删除失败：${errorMessage(error)}`)
     }
   }
 
@@ -1153,6 +1279,78 @@ export default function App(): React.JSX.Element {
     }
   }
 
+  const restoreSnapshot = async (snapshot: SnapshotInfo): Promise<void> => {
+    if (!project || restoringSnapshotId || building || planning || migrationBusy) return
+    const unsavedMessage = editorDirty
+      ? '\n\n当前代码编辑器有未保存内容；继续后会先保存，并包含在自动安全备份中。'
+      : ''
+    if (!window.confirm(`恢复快照“${snapshot.label}”？\n\n当前项目状态会先自动备份，恢复失败时会自动回滚。${unsavedMessage}`)) return
+    setRestoringSnapshotId(snapshot.id)
+    try {
+      if (editorDirty && selectedFile) await window.modmind.project.writeFile(selectedFile, editorContent)
+      const result = await window.modmind.snapshots.restore(snapshot.id)
+      setProject(result.project)
+      setSelectedFile('')
+      setEditorContent('')
+      setEditorDirty(false)
+      setBuildResult(null)
+      setBuildError('')
+      setEvents([])
+      setMinecraftEvents([])
+      setAiRecovery(null)
+      await Promise.all([refreshFiles(), refreshSnapshots()])
+      setNotice(`已恢复“${result.snapshot.label}”，恢复前状态已备份为 ${result.backup.id.slice(0, 19)}`)
+    } catch (error) {
+      setNotice(`恢复失败：${errorMessage(error)}`)
+    } finally {
+      setRestoringSnapshotId('')
+    }
+  }
+
+  const deleteSnapshot = async (snapshot: SnapshotInfo): Promise<void> => {
+    if (!project || restoringSnapshotId || deletingSnapshotId || building || planning || migrationBusy) return
+    if (!window.confirm(`永久删除快照“${snapshot.label}”？\n\n删除后无法从 ModMind 恢复。`)) return
+    setDeletingSnapshotId(snapshot.id)
+    try {
+      setSnapshots(await window.modmind.snapshots.delete(snapshot.id))
+      setNotice(`已删除快照“${snapshot.label}”`)
+    } catch (error) {
+      setNotice(`删除快照失败：${errorMessage(error)}`)
+    } finally {
+      setDeletingSnapshotId('')
+    }
+  }
+
+  const previewMigration = async (): Promise<void> => {
+    if (!project || !selectedMigrationVersion) return
+    setMigrationBusy(true)
+    try {
+      setMigrationPreview(await window.modmind.project.previewMigration({ loader: migrationLoader, minecraftVersion: selectedMigrationVersion }))
+    } catch (error) {
+      setNotice(`迁移预检失败：${errorMessage(error)}`)
+    } finally {
+      setMigrationBusy(false)
+    }
+  }
+
+  const runMigration = async (): Promise<void> => {
+    if (!migrationPreview || migrationPreview.blockers.length) return
+    setMigrationBusy(true)
+    try {
+      const result = await window.modmind.project.migrate({ loader: migrationPreview.target.loader, minecraftVersion: migrationPreview.target.minecraftVersion })
+      if (result) {
+        setProject(result.project)
+        setMigrationPreview(null)
+        setNotice(`迁移项目已生成，报告：${result.reportPath}`)
+        void refreshRecentProjects()
+      }
+    } catch (error) {
+      setNotice(`迁移失败：${errorMessage(error)}`)
+    } finally {
+      setMigrationBusy(false)
+    }
+  }
+
   const saveSettings = async (): Promise<void> => {
     try {
       const saved = await window.modmind.settings.saveAi(settings)
@@ -1220,22 +1418,35 @@ export default function App(): React.JSX.Element {
   }
 
   const latestEvent = events[0]
+  const migrationVersions = loaderCatalog.filter((option) => option.loader === migrationLoader)
+  const selectedMigrationVersion = migrationVersion || migrationVersions[0]?.minecraftVersion || ''
   const filteredModels = availableModels.filter((model) => model.id.toLowerCase().includes(modelSearch.trim().toLowerCase()))
   const filteredMappingMembers = mappingDetail?.members.filter((member) => {
     const query = mappingMemberQuery.trim().toLowerCase()
     return !query || `${member.type} ${Object.values(member.names).join(' ')}`.toLowerCase().includes(query)
   }) ?? []
-  const navItems = useMemo(
+  const navGroups = useMemo(
     () => [
-      { id: 'workspace' as const, label: '工作台', icon: MessageSquareText },
-      { id: 'inspiration' as const, label: '灵感台', icon: Lightbulb },
-      { id: 'blockbench' as const, label: 'Blockbench', icon: Box },
-      { id: 'build' as const, label: '构建', icon: Hammer },
-      { id: 'minecraft' as const, label: '游戏测试', icon: Gamepad2 },
-      { id: 'snapshots' as const, label: '版本', icon: History },
-      { id: 'mappings' as const, label: 'Mappings', icon: LibraryBig },
-      { id: 'code' as const, label: '代码编辑', icon: Code2 },
-      { id: 'settings' as const, label: '设置', icon: Settings }
+      {
+        label: '开发',
+        items: [
+          { id: 'workspace' as const, label: '工作台', icon: MessageSquareText },
+          { id: 'inspiration' as const, label: '灵感台', icon: Lightbulb },
+          { id: 'blockbench' as const, label: 'Blockbench', icon: Box },
+          { id: 'code' as const, label: '代码编辑', icon: Code2 },
+          { id: 'minecraft' as const, label: '游戏测试', icon: Gamepad2 },
+          { id: 'build' as const, label: '构建', icon: Hammer }
+        ]
+      },
+      {
+        label: '交付',
+        items: [
+          { id: 'production' as const, label: '生产中心', icon: CloudUpload },
+          { id: 'snapshots' as const, label: '版本', icon: History },
+          { id: 'mappings' as const, label: 'Mappings', icon: LibraryBig },
+          { id: 'settings' as const, label: '设置', icon: Settings }
+        ]
+      }
     ],
     []
   )
@@ -1262,19 +1473,15 @@ export default function App(): React.JSX.Element {
           </div>
 
           <nav className="sidebar-nav">
-            <span className="nav-caption">开发</span>
-            {navItems.slice(0, 6).map((item) => (
-              <button key={item.id} className={view === item.id ? 'active' : ''} onClick={() => setView(item.id)} type="button">
-                <item.icon size={16} /><span>{item.label}</span>
-                {item.id === 'build' && latestEvent ? <i className={`status-dot ${latestEvent.status}`} /> : null}
-              </button>
-            ))}
-            <span className="nav-caption settings-caption">高级</span>
-            {navItems.slice(6).map((item) => (
-              <button key={item.id} className={view === item.id ? 'active' : ''} onClick={() => setView(item.id)} type="button">
-                <item.icon size={16} /><span>{item.label}</span>
-              </button>
-            ))}
+            {navGroups.map((group, index) => <div className="sidebar-nav-group" key={group.label}>
+              <span className={`nav-caption ${index ? 'settings-caption' : ''}`}>{group.label}</span>
+              {group.items.map((item) => (
+                <button key={item.id} className={view === item.id ? 'active' : ''} onClick={() => setView(item.id)} type="button">
+                  <item.icon size={16} /><span>{item.label}</span>
+                  {item.id === 'build' && latestEvent ? <i className={`status-dot ${latestEvent.status}`} /> : null}
+                </button>
+              ))}
+            </div>)}
           </nav>
 
           <div className="sidebar-footer">
@@ -1361,7 +1568,8 @@ export default function App(): React.JSX.Element {
                   </div>
                   <div className="ai-timeline">{aiTimeline.length ? aiTimeline.map((item) => {
                     const label = timelineLabel(item.kind)
-                    return <article className={`ai-timeline-item ${item.kind}`} key={item.id}><div className="ai-timeline-meta">{label ? <strong>{label}</strong> : <span />}<time>{formatTime(item.time)}</time></div>{item.kind === 'answer' || item.kind === 'response' ? <MarkdownMessage content={item.content} /> : <p>{item.content}</p>}{item.diff ? <div className="code-diff-list">{item.diff.map((file) => <div className="code-diff-file" key={file.path}><strong>{file.path}</strong><span className="diff-count">+{file.added} / -{file.removed}</span>{file.additions.map((line, index) => <code className="diff-add" key={`a-${index}`}>+ {line || ' '}</code>)}{file.removals.map((line, index) => <code className="diff-remove" key={`r-${index}`}>- {line || ' '}</code>)}</div>)}</div> : null}</article>
+                    const icon = item.kind === 'tool' ? <TerminalSquare size={11} /> : item.kind === 'diff' ? <FileCode2 size={11} /> : item.kind === 'history' ? <History size={11} /> : item.kind === 'start' ? <Play size={11} /> : item.kind === 'retry' ? <RotateCcw size={11} /> : <CircleAlert size={11} />
+                    return <article className={`ai-timeline-item ${item.kind}`} key={item.id}>{label ? <div className="ai-output-event-header"><span className="ai-output-event-badge">{icon}{label}</span></div> : null}{item.kind === 'answer' || item.kind === 'response' ? <MarkdownMessage content={item.content} /> : <p>{item.content}</p>}{item.diff ? <div className="code-diff-list">{item.diff.map((file) => <div className="code-diff-file" key={file.path}><strong>{file.path}</strong><span className="diff-count">+{file.added} / -{file.removed}</span>{file.additions.map((line, index) => <code className="diff-add" key={`a-${index}`}>+ {line || ' '}</code>)}{file.removals.map((line, index) => <code className="diff-remove" key={`r-${index}`}>- {line || ' '}</code>)}</div>)}</div> : null}</article>
                   }) : <div className="ai-timeline-empty">AI 的工作过程会显示在这里。</div>}</div>
                 </section>
                 <aside className="ai-todo-section">
@@ -1417,7 +1625,10 @@ export default function App(): React.JSX.Element {
               <div className="mappings-page">
                 <div className="content-toolbar">
                   <div><h1>Minecraft Mappings</h1><p>查询 {project.minecraftVersion} 的 Mojang、Yarn、Intermediary 与其他映射。</p></div>
-                  <button className="mapping-source-link" onClick={() => void window.modmind.mappings.openSource(project.minecraftVersion)}>mappings.dev</button>
+                  <div className="toolbar-actions">
+                    <button className="mapping-source-link" onClick={() => void window.modmind.mappings.openLoaderDocs(project.loader)}><ExternalLink size={13} />{project.loader === 'fabric' ? 'Fabric' : project.loader === 'quilt' ? 'Quilt' : project.loader === 'forge' ? 'Forge' : 'NeoForge'} 文档</button>
+                    <button className="mapping-source-link" onClick={() => void window.modmind.mappings.openSource(project.minecraftVersion)}><ExternalLink size={13} />mappings.dev</button>
+                  </div>
                 </div>
                 <div className="mapping-search-band">
                   <div className="mapping-search-box">
@@ -1478,16 +1689,36 @@ export default function App(): React.JSX.Element {
             {view === 'code' && project ? (
               <div className="code-layout">
                 <aside className="file-panel">
-                  <div className="panel-title"><span>项目文件</span><button className="icon-button" title="刷新" onClick={() => void refreshFiles()}><RotateCcw size={14} /></button></div>
+                  <div className="panel-title"><span>项目文件</span><div className="file-panel-actions">
+                    <button className="icon-button" title="新建文件" onClick={() => void createProjectFile()}><FilePlus2 size={14} /></button>
+                    <button className="icon-button" title="新建目录" onClick={() => void createProjectDirectory()}><FolderPlus size={14} /></button>
+                    <button className="icon-button" title="刷新文件树" onClick={() => void refreshFiles()}><RotateCcw size={14} /></button>
+                  </div></div>
                   <FileTree nodes={files} selectedPath={selectedFile} onSelect={(node) => void selectFile(node)} />
                 </aside>
                 <section className="editor-panel">
                   <div className="editor-toolbar">
-                    <span>{selectedFile || '选择一个文件开始编辑'}</span>
-                    <button className="secondary-button compact" disabled={!editorDirty} onClick={() => void saveFile()}><Save size={14} />保存</button>
+                    <span className="editor-path"><FileCode2 size={14} />{selectedFile || '选择一个文件开始编辑'}{editorDirty ? <i title="有未保存修改" /> : null}</span>
+                    <div className="editor-actions">
+                      <button className="icon-button" title="在文件管理器中显示" disabled={!selectedFile} onClick={() => void window.modmind.project.reveal(selectedFile)}><FolderOpen size={14} /></button>
+                      <button className="secondary-button compact" title="使用 Java LSP 与调试器打开完整项目" onClick={() => void window.modmind.project.openIde().catch((error) => window.alert(errorMessage(error)))}><ExternalLink size={14} />Java IDE</button>
+                      <button className="icon-button" title="重命名文件" disabled={!selectedFile} onClick={() => void renameSelectedFile()}><Pencil size={14} /></button>
+                      <button className="icon-button danger" title="删除文件" disabled={!selectedFile} onClick={() => void deleteSelectedFile()}><Trash2 size={14} /></button>
+                      <button className="secondary-button compact" disabled={!editorDirty} onClick={() => void saveFile()}><Save size={14} />保存</button>
+                    </div>
                   </div>
-                  {selectedFile ? (
-                    <textarea className="code-editor" spellCheck={false} value={editorContent} onChange={(event) => { setEditorContent(event.target.value); setEditorDirty(true) }} />
+                  {selectedFile && isEditablePath(selectedFile) ? (
+                    <Suspense fallback={<div className="editor-empty"><LoaderCircle className="spin" size={22} /><p>正在载入本地编辑器...</p></div>}><MonacoCodeEditor
+                      key={selectedFile}
+                      path={selectedFile}
+                      language={editorLanguage(selectedFile)}
+                      darkMode={settings.darkMode}
+                      value={editorContent}
+                      onChange={(value) => { setEditorContent(value); setEditorDirty(true) }}
+                      onSave={() => void saveFile()}
+                    /></Suspense>
+                  ) : selectedFile ? (
+                    <div className="editor-empty"><File size={28} /><p>该文件不是可编辑文本，可在文件管理器中查看。</p></div>
                   ) : (
                     <div className="editor-empty"><FileCode2 size={28} /><p>从左侧文件树中选择源码或配置文件。</p></div>
                   )}
@@ -1536,20 +1767,60 @@ export default function App(): React.JSX.Element {
             {view === 'snapshots' && project ? (
               <div className="standard-page">
                 <div className="content-toolbar">
-                  <div><h1>版本快照</h1><p>在 AI 修改和构建前保存项目状态。</p></div>
+                  <div><h1>版本与迁移</h1><p>{project.loader} · Minecraft {project.minecraftVersion}</p></div>
                   <button className="primary-button" onClick={() => void createSnapshot()}><Plus size={16} />创建快照</button>
                 </div>
+                <section className="migration-band">
+                  <div className="section-title-row"><h2>迁移目标</h2><span>生成到新目录</span></div>
+                  <div className="migration-controls">
+                    <div className="segmented-control">
+                      {(['fabric', 'quilt', 'forge', 'neoforge'] as const).map((loader) => <button key={loader} className={migrationLoader === loader ? 'active' : ''} onClick={() => { setMigrationLoader(loader); setMigrationVersion(''); setMigrationPreview(null) }}>{loader === 'fabric' ? 'Fabric' : loader === 'quilt' ? 'Quilt' : loader === 'forge' ? 'Forge' : 'NeoForge'}</button>)}
+                    </div>
+                    <select value={selectedMigrationVersion} onChange={(event) => { setMigrationVersion(event.target.value); setMigrationPreview(null) }}>
+                      {migrationVersions.map((option) => <option key={`${option.loader}-${option.minecraftVersion}`} value={option.minecraftVersion}>{option.minecraftVersion}{option.supportTier === 'experimental' ? '（实验性）' : ''}</option>)}
+                    </select>
+                    <button className="secondary-button" disabled={migrationBusy || !selectedMigrationVersion} onClick={() => void previewMigration()}>{migrationBusy ? <LoaderCircle className="spin" size={15} /> : <Search size={15} />}预检</button>
+                  </div>
+                  {migrationPreview ? <div className="migration-preview">
+                    <div><strong>{migrationPreview.source.loader} {migrationPreview.source.minecraftVersion}</strong><ChevronRight size={15} /><strong>{migrationPreview.target.loader} {migrationPreview.target.minecraftVersion}</strong><span className={`migration-tier ${migrationPreview.target.supportTier}`}>{migrationPreview.target.supportTier === 'stable' ? '稳定' : '实验性'}</span></div>
+                    {migrationPreview.warnings.map((warning) => <p key={warning}><CircleAlert size={14} />{warning}</p>)}
+                    {migrationPreview.blockers.map((blocker) => <p className="error" key={blocker}><X size={14} />{blocker}</p>)}
+                    <button className="primary-button" disabled={migrationBusy || Boolean(migrationPreview.blockers.length)} onClick={() => void runMigration()}>{migrationBusy ? <LoaderCircle className="spin" size={15} /> : <PackageOpen size={15} />}生成迁移项目</button>
+                  </div> : null}
+                </section>
+                <GitWorkspace project={project} onFilesChanged={() => { void refreshFiles(); void refreshSnapshots() }} />
                 <div className="snapshot-list">
                   {snapshots.length ? snapshots.map((snapshot) => (
                     <article className="snapshot-row" key={snapshot.id}>
                       <span className="snapshot-icon"><Archive size={18} /></span>
                       <div><h3>{snapshot.label}</h3><p>{formatDate(snapshot.createdAt)} · {snapshot.fileCount} 个文件</p></div>
                       <code>{snapshot.id.slice(0, 19)}</code>
-                      <button className="icon-button" title="恢复功能将在下一阶段提供" disabled><RotateCcw size={15} /></button>
+                      <div className="snapshot-actions">
+                        <button
+                          className="icon-button"
+                          title="恢复此快照"
+                          disabled={Boolean(restoringSnapshotId) || Boolean(deletingSnapshotId) || building || planning || migrationBusy}
+                          onClick={() => void restoreSnapshot(snapshot)}
+                        >
+                          {restoringSnapshotId === snapshot.id ? <LoaderCircle className="spin" size={15} /> : <RotateCcw size={15} />}
+                        </button>
+                        <button
+                          className="icon-button danger"
+                          title="删除此快照"
+                          disabled={Boolean(restoringSnapshotId) || Boolean(deletingSnapshotId) || building || planning || migrationBusy}
+                          onClick={() => void deleteSnapshot(snapshot)}
+                        >
+                          {deletingSnapshotId === snapshot.id ? <LoaderCircle className="spin" size={15} /> : <Trash2 size={15} />}
+                        </button>
+                      </div>
                     </article>
                   )) : <div className="large-empty"><History size={26} /><h3>还没有版本快照</h3><p>创建快照后，项目文件会保存在项目内的 {project.toolDataDirectory ?? '.modmind'} 目录。</p></div>}
                 </div>
               </div>
+            ) : null}
+
+            {view === 'production' && project ? (
+              <ProductionWorkspace project={project} onFilesChanged={() => { void refreshFiles(); void refreshSnapshots() }} />
             ) : null}
 
             {view === 'settings' ? (
@@ -1568,7 +1839,7 @@ export default function App(): React.JSX.Element {
                           <input value={configuredPath} onChange={(event) => setSettings({ ...settings, [kind === 'codex' ? 'codexExecutable' : 'claudeExecutable']: event.target.value })} placeholder={status?.executable || '留空则从 PATH 查找'} />
                           <div className="external-agent-actions">
                             {status?.installed || configuredPath.trim() ? <button className="secondary-button compact" type="button" onClick={() => void launchExternalAgent(kind)}><TerminalSquare size={14} />打开</button> : <button className="primary-button compact" type="button" disabled={!externalAgentsReady || installingAgents[kind]} onClick={() => void installExternalAgent(kind)}>{installingAgents[kind] ? <LoaderCircle className="spin" size={14} /> : <Download size={14} />}一键安装</button>}
-                            <button className="secondary-button compact" type="button" onClick={() => void openExternalAgentDocs(kind)}><ExternalLink size={14} />安装教程</button>
+                            <button className="secondary-button compact" type="button" onClick={() => void openExternalAgentDocs(kind)}><ExternalLink size={14} />B站安装教程</button>
                           </div>
                         </article>
                       })}

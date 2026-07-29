@@ -1,0 +1,70 @@
+name: ModMind Loader Matrix
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "src/main/projectTemplates.ts"
+      - "src/main/loaderCatalog.ts"
+      - "src/main/minecraftRuntime.ts"
+      - "src/shared/types.ts"
+      - "scripts/generate-loader-fixture.ts"
+      - ".github/workflows/loader-matrix.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  template-build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - loader: fabric
+            minecraft: "1.21.1"
+            loaderVersion: "0.16.10"
+            apiVersion: "0.116.13+1.21.1"
+            java: 21
+            gradle: "8.12.1"
+          - loader: quilt
+            minecraft: "1.20.1"
+            loaderVersion: "0.27.1"
+            apiVersion: "7.7.0+0.92.2-1.20.1"
+            java: 17
+            gradle: "8.4"
+          - loader: forge
+            minecraft: "1.20.1"
+            loaderVersion: "1.20.1-47.4.0"
+            java: 17
+            gradle: "8.12.1"
+          - loader: neoforge
+            minecraft: "1.21.1"
+            loaderVersion: "21.1.244"
+            java: 21
+            gradle: "8.12.1"
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Generate template project
+        env:
+          LOADER: ${{ matrix.loader }}
+          MINECRAFT: ${{ matrix.minecraft }}
+          LOADER_VERSION: ${{ matrix.loaderVersion }}
+          API_VERSION: ${{ matrix.apiVersion }}
+          JAVA_VERSION: ${{ matrix.java }}
+        run: npx vite-node scripts/generate-loader-fixture.ts matrix-project
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ matrix.java }}
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: ${{ matrix.gradle }}
+      - name: Build generated Loader fixture
+        run: cd matrix-project && gradle build --no-daemon --stacktrace

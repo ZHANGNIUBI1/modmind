@@ -58,6 +58,34 @@ export type BlockbenchAction =
       inflate?: number
       textureUuid?: string
       textureName?: string
+      parentGroupUuid?: string
+      parentGroupName?: string
+    }
+  | {
+      type: 'add-group'
+      name: string
+      origin?: BlockbenchVector3
+      rotation?: BlockbenchVector3
+      parentGroupUuid?: string
+      parentGroupName?: string
+    }
+  | {
+      type: 'add-animation'
+      name: string
+      length: number
+      loop?: 'once' | 'loop' | 'hold'
+      snapping?: number
+    }
+  | {
+      type: 'add-keyframe'
+      animationUuid?: string
+      animationName?: string
+      groupUuid?: string
+      groupName?: string
+      channel: 'rotation' | 'position' | 'scale'
+      time: number
+      value: BlockbenchVector3
+      interpolation?: 'linear' | 'catmullrom' | 'step' | 'bezier'
     }
   | {
       type: 'create-texture'
@@ -78,6 +106,10 @@ export type BlockbenchAction =
     }
   | {
       type: 'save-project'
+      relativePath: string
+    }
+  | {
+      type: 'export-model'
       relativePath: string
     }
   | {
@@ -132,7 +164,54 @@ export const BLOCKBENCH_AI_TOOL_DEFINITION = {
             rotation: { $ref: '#/$defs/rotation' },
             inflate: { type: 'number', minimum: -64, maximum: 64 },
             textureUuid: { type: 'string', minLength: 1, maxLength: 64 },
-            textureName: { type: 'string', minLength: 1, maxLength: 64 }
+            textureName: { type: 'string', minLength: 1, maxLength: 64 },
+            parentGroupUuid: { type: 'string', minLength: 1, maxLength: 64 },
+            parentGroupName: { type: 'string', minLength: 1, maxLength: 64 }
+          }
+        },
+        {
+          type: 'object',
+          additionalProperties: false,
+          required: ['type', 'name'],
+          properties: {
+            type: { const: 'add-group' },
+            name: { type: 'string', minLength: 1, maxLength: 64 },
+            origin: { $ref: '#/$defs/vector3' },
+            rotation: { $ref: '#/$defs/rotation' },
+            parentGroupUuid: { type: 'string', minLength: 1, maxLength: 64 },
+            parentGroupName: { type: 'string', minLength: 1, maxLength: 64 }
+          }
+        },
+        {
+          type: 'object',
+          additionalProperties: false,
+          required: ['type', 'name', 'length'],
+          properties: {
+            type: { const: 'add-animation' },
+            name: { type: 'string', minLength: 1, maxLength: 64 },
+            length: { type: 'number', exclusiveMinimum: 0, maximum: 3600 },
+            loop: { enum: ['once', 'loop', 'hold'] },
+            snapping: { type: 'integer', minimum: 1, maximum: 120 }
+          }
+        },
+        {
+          type: 'object',
+          additionalProperties: false,
+          required: ['type', 'channel', 'time', 'value'],
+          anyOf: [
+            { required: ['animationUuid', 'groupUuid'] },
+            { required: ['animationName', 'groupName'] }
+          ],
+          properties: {
+            type: { const: 'add-keyframe' },
+            animationUuid: { type: 'string', minLength: 1, maxLength: 64 },
+            animationName: { type: 'string', minLength: 1, maxLength: 64 },
+            groupUuid: { type: 'string', minLength: 1, maxLength: 64 },
+            groupName: { type: 'string', minLength: 1, maxLength: 64 },
+            channel: { enum: ['rotation', 'position', 'scale'] },
+            time: { type: 'number', minimum: 0, maximum: 3600 },
+            value: { $ref: '#/$defs/vector3' },
+            interpolation: { enum: ['linear', 'catmullrom', 'step', 'bezier'] }
           }
         },
         {
@@ -198,6 +277,20 @@ export const BLOCKBENCH_AI_TOOL_DEFINITION = {
               minLength: 1,
               maxLength: 240,
               description: 'Project-relative path ending in .bbmodel.'
+            }
+          }
+        },
+        {
+          type: 'object',
+          additionalProperties: false,
+          required: ['type', 'relativePath'],
+          properties: {
+            type: { const: 'export-model' },
+            relativePath: {
+              type: 'string',
+              minLength: 1,
+              maxLength: 240,
+              description: 'Project-relative export path ending in .json, .geo.json, or .java.'
             }
           }
         },

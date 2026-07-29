@@ -129,7 +129,7 @@ function parseClassPage(
 export class MappingService {
   private readonly indexes = new Map<string, MappingIndex>()
 
-  constructor(private readonly cacheRoot: string) {}
+  constructor(private readonly cacheRoot: string, private readonly productVersion = 'development') {}
 
   private cachePath(version: string, name: string): string {
     return path.join(this.cacheRoot, version, name)
@@ -146,7 +146,7 @@ export class MappingService {
     let response: Response
     try {
       response = await fetch(url, {
-        headers: { 'User-Agent': 'ModMind/0.1 mappings integration' },
+        headers: { 'User-Agent': `ModMind/${this.productVersion} (mappings)` },
         signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
       })
     } catch (error) {

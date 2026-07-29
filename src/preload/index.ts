@@ -1,7 +1,8 @@
 import { contextBridge, ipcRenderer } from 'electron'
-import type { AiOutputEvent, AiSettings, BuildTrustRequest, ExistingProjectAdoptInput, InspirationChatMessage, ModMindApi, PipelineEvent, ProjectCreateInput } from '../shared/types'
+import type { AiOutputEvent, AiSettings, BuildTrustRequest, ExistingProjectAdoptInput, InspirationChatMessage, ModMindApi, PipelineEvent, ProjectCreateInput, ProjectMigrationInput } from '../shared/types'
 import type { BlockbenchAction, BlockbenchBounds } from '../shared/blockbench'
 import type { MinecraftLaunchOptions, MinecraftRuntimeEvent, MinecraftRuntimeState } from '../shared/minecraft'
+import type { AudioImportInput, ContentCreateInput, DependencyInstallInput, GitCommitInput, MavenDependencyInput, ReleasePublishInput, ReleaseSettings, TestTarget } from '../shared/production'
 
 const api: ModMindApi = {
   app: {
@@ -11,6 +12,7 @@ const api: ModMindApi = {
     close: () => ipcRenderer.invoke('window:close')
   },
   project: {
+    listLoaderVersions: (refresh?: boolean) => ipcRenderer.invoke('project:listLoaderVersions', refresh),
     create: (input: ProjectCreateInput) => ipcRenderer.invoke('project:create', input),
     open: () => ipcRenderer.invoke('project:open'),
     openRecent: (projectPath: string) => ipcRenderer.invoke('project:openRecent', projectPath),
@@ -22,7 +24,16 @@ const api: ModMindApi = {
     listFiles: () => ipcRenderer.invoke('project:listFiles'),
     readFile: (relativePath: string) => ipcRenderer.invoke('project:readFile', relativePath),
     writeFile: (relativePath: string, content: string) => ipcRenderer.invoke('project:writeFile', relativePath, content),
-    captureIdea: (prompt: string) => ipcRenderer.invoke('project:captureIdea', prompt)
+    createFile: (relativePath: string, content?: string) => ipcRenderer.invoke('project:createFile', relativePath, content),
+    createDirectory: (relativePath: string) => ipcRenderer.invoke('project:createDirectory', relativePath),
+    renamePath: (from: string, to: string) => ipcRenderer.invoke('project:renamePath', from, to),
+    deletePath: (relativePath: string) => ipcRenderer.invoke('project:deletePath', relativePath),
+    reveal: (relativePath?: string) => ipcRenderer.invoke('project:reveal', relativePath),
+    prepareIde: () => ipcRenderer.invoke('project:prepareIde'),
+    openIde: () => ipcRenderer.invoke('project:openIde'),
+    captureIdea: (prompt: string) => ipcRenderer.invoke('project:captureIdea', prompt),
+    previewMigration: (input: ProjectMigrationInput) => ipcRenderer.invoke('project:previewMigration', input),
+    migrate: (input: ProjectMigrationInput) => ipcRenderer.invoke('project:migrate', input)
   },
   build: {
     preflight: () => ipcRenderer.invoke('build:preflight'),
@@ -40,7 +51,9 @@ const api: ModMindApi = {
   },
   snapshots: {
     create: (label: string) => ipcRenderer.invoke('snapshots:create', label),
-    list: () => ipcRenderer.invoke('snapshots:list')
+    list: () => ipcRenderer.invoke('snapshots:list'),
+    restore: (id: string) => ipcRenderer.invoke('snapshots:restore', id),
+    delete: (id: string) => ipcRenderer.invoke('snapshots:delete', id)
   },
   settings: {
     getAi: () => ipcRenderer.invoke('settings:getAi'),
@@ -91,7 +104,8 @@ const api: ModMindApi = {
     search: (version: string, query: string, limit?: number) => ipcRenderer.invoke('mappings:search', version, query, limit),
     getClass: (version: string, className: string, memberQuery?: string) =>
       ipcRenderer.invoke('mappings:getClass', version, className, memberQuery),
-    openSource: (version: string) => ipcRenderer.invoke('mappings:openSource', version)
+    openSource: (version: string) => ipcRenderer.invoke('mappings:openSource', version),
+    openLoaderDocs: (loader) => ipcRenderer.invoke('mappings:openLoaderDocs', loader)
   },
   minecraft: {
     getState: () => ipcRenderer.invoke('minecraft:getState'),
@@ -113,6 +127,48 @@ const api: ModMindApi = {
       const handler = (_event: Electron.IpcRendererEvent, value: MinecraftRuntimeEvent): void => listener(value)
       ipcRenderer.on('minecraft:event', handler)
       return () => ipcRenderer.removeListener('minecraft:event', handler)
+    }
+  },
+  production: {
+    dependencies: {
+      search: (query: string, offset?: number) => ipcRenderer.invoke('dependencies:search', query, offset),
+      versions: (projectId: string) => ipcRenderer.invoke('dependencies:versions', projectId),
+      list: () => ipcRenderer.invoke('dependencies:list'),
+      install: (input: DependencyInstallInput) => ipcRenderer.invoke('dependencies:install', input),
+      installMaven: (input: MavenDependencyInput) => ipcRenderer.invoke('dependencies:installMaven', input),
+      audit: () => ipcRenderer.invoke('dependencies:audit'),
+      remove: (projectId: string) => ipcRenderer.invoke('dependencies:remove', projectId)
+    },
+    git: {
+      status: () => ipcRenderer.invoke('git:status'),
+      initialize: () => ipcRenderer.invoke('git:initialize'),
+      diff: (relativePath?: string) => ipcRenderer.invoke('git:diff', relativePath),
+      commit: (input: GitCommitInput) => ipcRenderer.invoke('git:commit', input),
+      createBranch: (name: string) => ipcRenderer.invoke('git:createBranch', name),
+      listRemotes: () => ipcRenderer.invoke('git:listRemotes'),
+      addRemote: (name: string, url: string) => ipcRenderer.invoke('git:addRemote', name, url),
+      removeRemote: (name: string) => ipcRenderer.invoke('git:removeRemote', name),
+      fetch: (remote?: string) => ipcRenderer.invoke('git:fetch', remote),
+      pull: (remote?: string, branch?: string) => ipcRenderer.invoke('git:pull', remote, branch),
+      push: (remote?: string, branch?: string) => ipcRenderer.invoke('git:push', remote, branch),
+      merge: (branch: string) => ipcRenderer.invoke('git:merge', branch),
+      rebase: (branch: string) => ipcRenderer.invoke('git:rebase', branch),
+      pullRequestUrl: (remote?: string) => ipcRenderer.invoke('git:pullRequestUrl', remote)
+    },
+    content: {
+      create: (input: ContentCreateInput) => ipcRenderer.invoke('content:create', input),
+      importAudio: (input: AudioImportInput) => ipcRenderer.invoke('content:importAudio', input),
+      validate: () => ipcRenderer.invoke('content:validate')
+    },
+    tests: {
+      runMatrix: (targets: TestTarget[]) => ipcRenderer.invoke('tests:runMatrix', targets),
+      generateWorkflow: () => ipcRenderer.invoke('tests:generateWorkflow')
+    },
+    release: {
+      getSettings: () => ipcRenderer.invoke('release:getSettings'),
+      saveSettings: (settings: ReleaseSettings) => ipcRenderer.invoke('release:saveSettings', settings),
+      preflight: () => ipcRenderer.invoke('release:preflight'),
+      publish: (input: ReleasePublishInput) => ipcRenderer.invoke('release:publish', input)
     }
   }
 }

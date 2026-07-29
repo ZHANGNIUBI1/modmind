@@ -25,6 +25,16 @@ These packages are provided under the MIT License by the Voxelum project.
 ModMind uses `extract-zip` to unpack the verified Gradle distribution. It is provided
 under the BSD-2-Clause License.
 
+## ffmpeg-static
+
+ModMind uses `ffmpeg-static` to convert imported audio to OGG Vorbis. The packaged
+FFmpeg executable is distributed under GPL-3.0-or-later. Its license and build information
+are retained beside the executable in the unpacked `node_modules/ffmpeg-static` directory.
+
+- Project: https://github.com/eugeneware/ffmpeg-static
+- FFmpeg: https://ffmpeg.org/
+- License: GPL-3.0-or-later
+
 ## mappings.dev
 
 ModMind can query class and member mapping pages from https://mappings.dev at runtime.

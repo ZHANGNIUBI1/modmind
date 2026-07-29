@@ -1,6 +1,6 @@
 {
   "name": "modmind",
-  "version": "1.0.0",
+  "version": "1.1.2",
   "private": true,
   "description": "AI-assisted Minecraft mod development workspace",
   "main": "out/main/index.js",
@@ -11,18 +11,27 @@
     "build": "electron-vite build",
     "preview": "electron-vite preview",
     "test": "vitest run",
-    "typecheck": "tsc --noEmit",
-    "dist:win": "npm run build && electron-builder --win"
+    "typecheck": "tsc --noEmit -p tsconfig.node.json --pretty false && tsc --noEmit -p tsconfig.web.json --pretty false",
+    "version:patch": "npm version patch --no-git-tag-version",
+    "dist:win": "npm run build && electron-builder --win --config.forceCodeSigning=true && node scripts/verify-release.mjs",
+    "dist:win:unsigned": "npm run build && electron-builder --win --config.win.signAndEditExecutable=false && node scripts/verify-release.mjs --allow-unsigned",
+    "dist:linux": "npm run build && electron-builder --linux AppImage zip",
+    "dist:mac": "npm run build && electron-builder --mac dmg zip",
+    "verify:release": "node scripts/verify-release.mjs"
   },
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",
     "@electron-toolkit/utils": "^4.0.0",
+    "@monaco-editor/react": "^4.7.0",
     "@types/marked": "^6.0.0",
     "@xmcl/core": "^2.15.1",
     "@xmcl/installer": "^6.1.2",
     "extract-zip": "^2.0.1",
+    "fast-xml-parser": "^5.2.5",
+    "ffmpeg-static": "^5.3.0",
     "lucide-react": "^0.468.0",
     "marked": "^15.0.7",
+    "monaco-editor": "^0.56.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "undici": "7.2.3"
@@ -43,12 +52,17 @@
   "build": {
     "appId": "dev.modmind.desktop",
     "productName": "ModMind",
+    "copyright": "Copyright © ModMind contributors",
     "directories": {
       "output": "release"
     },
     "files": [
       "out/**/*",
-      "package.json"
+      "package.json",
+      "THIRD_PARTY_NOTICES.md"
+    ],
+    "asarUnpack": [
+      "node_modules/ffmpeg-static/**"
     ],
     "extraResources": [
       {
@@ -68,7 +82,10 @@
       }
     ],
     "win": {
-      "target": "nsis",
+      "target": [
+        "nsis",
+        "portable"
+      ],
       "icon": "resources/icon.ico"
     },
     "nsis": {
@@ -76,6 +93,22 @@
       "allowToChangeInstallationDirectory": true,
       "installerIcon": "resources/icon.ico",
       "uninstallerIcon": "resources/icon.ico"
+    },
+    "mac": {
+      "target": [
+        "dmg",
+        "zip"
+      ],
+      "icon": "resources/icon.png",
+      "category": "public.app-category.developer-tools"
+    },
+    "linux": {
+      "target": [
+        "AppImage",
+        "zip"
+      ],
+      "icon": "resources/icon.png",
+      "category": "Development"
     }
   }
 }

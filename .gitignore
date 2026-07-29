@@ -8,6 +8,14 @@ output/
 .agents/
 *.recovery-backup
 *.log
+*.tsbuildinfo
 ui-check*.png
 ui-check*.jpg
 .DS_Store
+
+# Local development artifacts
+/video-assets/
+/scripts/inspect-loader-ui.mjs
+/scripts/inspect-production-ui.mjs
+/scripts/smoke-loader-templates.ts
+/scripts/smoke-packaged-app.mjs

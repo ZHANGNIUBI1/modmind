@@ -1,0 +1,67 @@
+name: Build Windows and Linux
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "src/**"
+      - "resources/**"
+      - "vendor/**"
+      - "scripts/**"
+      - "package.json"
+      - "package-lock.json"
+      - "electron.vite.config.ts"
+      - "tsconfig*.json"
+      - ".github/workflows/build-windows-linux.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  package:
+    needs: verify
+    strategy:
+      matrix:
+        include:
+          - os: windows-latest
+            command: npm.cmd run dist:win:unsigned
+            artifact: ModMind-Windows-unsigned
+            paths: |
+              release/ModMind Setup *.exe
+              release/ModMind *.exe
+              release/SHA256SUMS.txt
+          - os: ubuntu-latest
+            command: npm run dist:linux
+            artifact: ModMind-Linux
+            paths: |
+              release/*.AppImage
+              release/*.zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: ${{ matrix.command }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.paths }}
+          if-no-files-found: error
+          retention-days: 30

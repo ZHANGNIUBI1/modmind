@@ -67,6 +67,21 @@ export function redactSensitiveContent(relativePath: string, content: string): s
   return content
 }
 
+export function validateSnapshotId(value: unknown): string {
+  if (typeof value !== 'string' || !/^[0-9A-Za-z._-]{1,120}$/.test(value)) {
+    throw new Error('Invalid snapshot ID')
+  }
+  return value
+}
+
+export function snapshotManifestBelongsToProject(value: unknown, id: string, projectPath: string): boolean {
+  if (!value || typeof value !== 'object') return false
+  const manifest = value as { id?: unknown; projectPath?: unknown }
+  if (manifest.id !== id) return false
+  return manifest.projectPath === undefined
+    || (typeof manifest.projectPath === 'string' && path.resolve(manifest.projectPath) === path.resolve(projectPath))
+}
+
 export async function listManagedFiles(root: string, ignoreDirectory: (name: string) => boolean): Promise<string[]> {
   const files: string[] = []
   const visit = async (directory: string): Promise<void> => {

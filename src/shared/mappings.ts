@@ -25,8 +25,11 @@ export interface MappingClassDetail extends MappingClassResult {
   members: MappingMember[]
 }
 
+import type { LoaderKind } from './types'
+
 export interface MappingsApi {
   search: (version: string, query: string, limit?: number) => Promise<MappingSearchResult>
   getClass: (version: string, className: string, memberQuery?: string) => Promise<MappingClassDetail>
   openSource: (version: string) => Promise<void>
+  openLoaderDocs: (loader: LoaderKind) => Promise<void>
 }

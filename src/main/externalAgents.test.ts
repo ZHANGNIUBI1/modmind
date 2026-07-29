@@ -3,7 +3,7 @@ import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { ModMindBridge, parseExternalAgentOutputLine, runExternalAgent, type ExternalAgentBridgeHandlers } from './externalAgents'
+import { externalAgentDocsUrl, ModMindBridge, parseExternalAgentOutputLine, runExternalAgent, type ExternalAgentBridgeHandlers } from './externalAgents'
 import type { AiSettings, ProjectInfo } from '../shared/types'
 
 const temporaryRoots: string[] = []
@@ -35,6 +35,11 @@ async function rpc(child: ChildProcessWithoutNullStreams, request: Record<string
 }
 
 describe('ModMind external agent MCP bridge', () => {
+  it('opens Bilibili installation tutorials', () => {
+    expect(externalAgentDocsUrl('codex')).toMatch(/^https:\/\/search\.bilibili\.com\//)
+    expect(externalAgentDocsUrl('claude')).toMatch(/^https:\/\/search\.bilibili\.com\//)
+  })
+
   it('does not classify ordinary stderr output as an error', () => {
     expect(parseExternalAgentOutputLine('Loading project metadata', 'stderr')?.kind).toBe('tool')
     expect(parseExternalAgentOutputLine('warning: deprecated API', 'stderr')?.kind).toBe('warning')
@@ -65,6 +70,11 @@ describe('ModMind external agent MCP bridge', () => {
       updateTodo: async (tasks) => { todoCount = tasks.length; return {todoCount} },
       mappingsSearch: async (query) => { mappingQuery = query; return {query} },
       mappingsClass: async () => ({}),
+      dependencySearch: async () => ({}),
+      dependencyInstall: async () => ({}),
+      contentValidate: async () => ({}),
+      testMatrix: async () => ({}),
+      releasePreflight: async () => ({}),
       build: async () => ({}),
       testMinecraft: async () => ({}),
       blockbenchActions: async () => ({}),
@@ -87,6 +97,12 @@ describe('ModMind external agent MCP bridge', () => {
     expect(toolNames).toContain('modmind_set_intent')
     expect(toolNames).toContain('modmind_apply_edits')
     expect(toolNames).toContain('modmind_mapping_search')
+    expect(toolNames).toContain('modmind_dependency_search')
+    expect(toolNames).toContain('modmind_dependency_install')
+    expect(toolNames).toContain('modmind_validate_content')
+    expect(toolNames).toContain('modmind_test_matrix')
+    expect(toolNames).toContain('modmind_release_preflight')
+    expect(toolNames).not.toContain('modmind_publish_release')
     expect(tools.find((tool) => tool.name === 'modmind_project_info')?.annotations).toEqual({
       readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false
     })
@@ -122,6 +138,11 @@ describe('ModMind external agent MCP bridge', () => {
       updateTodo: async () => ({}),
       mappingsSearch: async () => ({}),
       mappingsClass: async () => ({}),
+      dependencySearch: async () => ({}),
+      dependencyInstall: async () => ({}),
+      contentValidate: async () => ({}),
+      testMatrix: async () => ({}),
+      releasePreflight: async () => ({}),
       build: async () => ({}),
       testMinecraft: async () => ({}),
       blockbenchActions: async () => ({}),
