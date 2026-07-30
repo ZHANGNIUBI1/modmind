@@ -16,10 +16,11 @@ import {
   TerminalSquare,
   Trash2
 } from 'lucide-react'
-import type {
-  MinecraftManagedMod,
-  MinecraftRuntimeEvent,
-  MinecraftRuntimeState
+import {
+  appendMinecraftRuntimeEvent,
+  type MinecraftRuntimeEvent,
+  type MinecraftRuntimeState,
+  type MinecraftManagedMod
 } from '../../../shared/minecraft'
 import '../minecraft-test.css'
 
@@ -54,7 +55,7 @@ export default function MinecraftTestWorkspace(): React.JSX.Element {
     void window.modmind.minecraft.getState().then(setState).catch((error: unknown) => setNotice(String(error)))
     const removeState = window.modmind.minecraft.onState(setState)
     const removeEvent = window.modmind.minecraft.onEvent((event) => {
-      setEvents((current) => [...current, event].slice(-250))
+      setEvents((current) => appendMinecraftRuntimeEvent(current, event, 250))
     })
     const removeAiOutput = window.modmind.ai.onOutput((event) => {
       if (event.kind === 'start') {

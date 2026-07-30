@@ -1,5 +1,15 @@
 # Third-Party Notices
 
+## Gradle Wrapper
+
+ModMind bundles the unmodified Gradle Wrapper scripts and JAR from Gradle 9.2.1 so
+new and migrated projects can use their pinned Gradle distribution. Gradle is provided
+under the Apache License 2.0. Upstream metadata, SHA-256 checksums, and the license are
+retained under `vendor/gradle-wrapper`.
+
+- Project: https://github.com/gradle/gradle/tree/v9.2.1
+- License: Apache-2.0
+
 ## Blockbench
 
 ModMind includes an unmodified offline copy of the official Blockbench Web application.

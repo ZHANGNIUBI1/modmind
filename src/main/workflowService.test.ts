@@ -16,7 +16,7 @@ describe('generated mod CI workflow', () => {
 
   it('pins Quilt 1.20.1 to its compatible Gradle generation', () => {
     const result = githubWorkflow({ name: 'Quilt', path: '', loader: 'quilt', minecraftVersion: '1.20.1', namespace: 'quilt_mod', createdAt: '', javaVersion: 17 })
-    expect(result).toContain("gradle-version: '8.4'")
+    expect(result).toContain("gradle-version: '8.9'")
   })
 
   it('covers Fabric, Quilt, Forge, and NeoForge in the real-loader workflow', () => {
@@ -26,5 +26,9 @@ describe('generated mod CI workflow', () => {
     expect(result).toContain('loader: forge')
     expect(result).toContain('loader: neoforge')
     expect(result).toContain('actions/setup-java@v4')
+    expect(result).toContain("minecraft: '26.2'")
+    expect(result).toContain('java: 25')
+    expect(result).toContain("qslVersion: '10.0.0-alpha.1+1.21'")
+    expect(result).toContain('pull_request:')
   })
 })

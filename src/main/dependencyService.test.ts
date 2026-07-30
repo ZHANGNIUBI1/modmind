@@ -45,12 +45,22 @@ describe('managed Gradle dependencies', () => {
         repository: 'https://repo.example.com/releases/',
         configuration: 'modImplementation'
       })
+      await service.installMaven({
+        coordinate: 'com.example:crystal-api:2.1.0',
+        repository: 'https://repo.example.com/releases/',
+        configuration: 'modImplementation'
+      })
       const gradle = await fs.readFile(path.join(root, 'build.gradle'), 'utf8')
       expect(gradle).toContain("modImplementation 'com.example:crystal-api:2.1.0'")
       expect(gradle).toContain("maven { url = 'https://repo.example.com/releases' }")
+      expect(gradle.match(/MODMIND REPOSITORIES START/g)).toHaveLength(1)
+      expect(gradle.match(/MODMIND DEPENDENCIES START/g)).toHaveLength(1)
       await expect(service.audit()).resolves.toMatchObject({ success: true, checked: 1 })
       await expect(service.installMaven({ coordinate: 'broken', repository: 'http://insecure.example.com' })).rejects.toThrow()
       await expect(service.remove(installed.projectId)).resolves.toEqual([])
+      const removed = await fs.readFile(path.join(root, 'build.gradle'), 'utf8')
+      expect(removed).not.toContain('MODMIND REPOSITORIES')
+      expect(removed).not.toContain('MODMIND DEPENDENCIES')
     } finally {
       await fs.rm(root, { recursive: true, force: true })
     }

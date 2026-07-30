@@ -4,8 +4,8 @@ Electron-based workspace for AI-assisted Minecraft mod development.
 
 ## Versioning
 
-The stable product version is `1.1.2`. Every subsequent product change increments only
-the patch component (`1.1.3`, `1.1.4`, and so on) unless this policy is explicitly changed.
+The stable product version is `1.1.3`. Every subsequent product change increments only
+the patch component (`1.1.4`, `1.1.5`, and so on) unless this policy is explicitly changed.
 Run `npm.cmd run version:patch` once for each future change set; it updates both
 `package.json` and `package-lock.json` without creating a Git tag.
 
@@ -35,6 +35,15 @@ The test runner downloads managed Java, Gradle, Minecraft assets, and the select
 Quilt, Forge, or NeoForge loader only when needed. Starting a test performs a real Gradle build,
 syncs the project JAR without removing user-added dependency mods, and launches with a
 deterministic offline profile.
+
+Projects use their pinned Gradle Wrapper by default. Users who prefer an existing local
+installation can enable `优先使用本机 Gradle` in Settings and provide an executable path or
+use `gradle` from `PATH`; ModMind warns about version mismatches but honors that preference.
+
+Managed Gradle downloads default to `自动择优`: ModMind samples Huawei Cloud, Tencent Cloud,
+and the official Gradle service, then downloads from the fastest reachable source. Users can
+instead choose domestic mirrors first or restrict downloads to the official service. Every
+managed distribution is verified against the SHA-256 pinned by the project template.
 
 Run `npm.cmd run typecheck`, `npm.cmd test`, and `npm.cmd run build` before packaging with
 `npm.cmd run dist:win`. The signed release command fails if no valid Windows signing identity

@@ -14,6 +14,7 @@ const project: ProjectInfo = {
   minecraftVersion: process.env.MINECRAFT ?? '',
   loaderVersion: process.env.LOADER_VERSION ?? '',
   ...(process.env.API_VERSION ? { apiVersion: process.env.API_VERSION } : {}),
+  ...(process.env.QSL_VERSION ? { qslVersion: process.env.QSL_VERSION } : {}),
   javaVersion: Number(process.env.JAVA_VERSION),
   namespace: `modmind_${loader}_fixture`,
   createdAt: new Date(0).toISOString(),

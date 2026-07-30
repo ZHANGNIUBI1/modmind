@@ -63,6 +63,23 @@ function safeSegment(value: unknown, label: string): string {
   return value
 }
 
+function groovySingleQuoted(value: string): string {
+  return value.replaceAll('\\', '\\\\').replaceAll("'", "\\'")
+}
+
+function normalizedRepositoryUrl(value: unknown): string {
+  if (value === undefined || value === null || value === '') return ''
+  if (typeof value !== 'string') throw new Error('Maven 仓库地址无效')
+  let parsed: URL
+  try {
+    parsed = new URL(value.trim())
+  } catch {
+    throw new Error('Maven 仓库必须使用有效的 HTTPS 地址')
+  }
+  if (parsed.protocol !== 'https:' || parsed.username || parsed.password) throw new Error('Maven 仓库必须使用无凭据的 HTTPS 地址')
+  return parsed.toString().replace(/\/+$/, '')
+}
+
 function side(value: unknown): DependencyProject['clientSide'] {
   return value === 'required' || value === 'optional' || value === 'unsupported' ? value : 'unknown'
 }
@@ -186,10 +203,10 @@ export function updateManagedGradleDependencies(source: string, project: Project
 }
 
 function updateManagedGradleRepositories(source: string, dependencies: ManagedDependency[], kotlin: boolean): string {
-  const withoutManaged = source.replace(new RegExp(`\n?${REPOSITORY_START_MARKER}[\s\S]*?${REPOSITORY_END_MARKER}\n?`, 'g'), '\n')
+  const withoutManaged = source.replace(new RegExp(`\\n?${REPOSITORY_START_MARKER}[\\s\\S]*?${REPOSITORY_END_MARKER}\\n?`, 'g'), '\n')
   const repositories = [...new Set(dependencies.filter((entry) => entry.source === 'maven').map((entry) => entry.repository).filter((value): value is string => Boolean(value)))]
   if (!repositories.length) return withoutManaged
-  const lines = repositories.map((url) => kotlin ? `    maven("${url}")` : `    maven { url = '${url}' }`)
+  const lines = repositories.map((url) => kotlin ? `    maven(${JSON.stringify(url)})` : `    maven { url = '${groovySingleQuoted(url)}' }`)
   const block = [REPOSITORY_START_MARKER, ...lines, REPOSITORY_END_MARKER].join('\n')
   const match = /\brepositories\s*\{/.exec(withoutManaged)
   if (!match) return `${withoutManaged.trimEnd()}\n\nrepositories {\n${block}\n}\n`
@@ -333,8 +350,7 @@ export class DependencyService {
     const coordinate = input.coordinate.trim()
     const match = coordinate.match(/^([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+):([A-Za-z0-9_.+\-]+)$/)
     if (!match) throw new Error('Maven 坐标必须使用 group:artifact:version 格式')
-    const repository = input.repository?.trim().replace(/\/+$/, '') ?? ''
-    if (repository && !/^https:\/\/[^\s]+$/i.test(repository)) throw new Error('Maven 仓库必须使用 HTTPS 地址')
+    const repository = normalizedRepositoryUrl(input.repository)
     const allowedConfigurations = ['implementation', 'modImplementation', 'compileOnly', 'runtimeOnly'] as const
     const configuration = allowedConfigurations.includes(input.configuration as typeof allowedConfigurations[number])
       ? input.configuration

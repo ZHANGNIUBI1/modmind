@@ -1,0 +1,2 @@
+export const CURRENT_PROJECT_VERSION = '1.1.3'
+export const MIGRATABLE_PROJECT_VERSION = '1.1.2'

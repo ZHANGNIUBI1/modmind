@@ -24,6 +24,23 @@ export interface MinecraftRuntimeEvent {
   level?: 'info' | 'warning' | 'error'
 }
 
+export function appendMinecraftRuntimeEvent(
+  events: MinecraftRuntimeEvent[],
+  event: MinecraftRuntimeEvent,
+  limit: number
+): MinecraftRuntimeEvent[] {
+  const last = events.at(-1)
+  if (
+    event.progress !== undefined
+    && last?.progress !== undefined
+    && last.stage === event.stage
+    && last.message === event.message
+  ) {
+    return [...events.slice(0, -1), event].slice(-limit)
+  }
+  return [...events, event].slice(-limit)
+}
+
 export interface MinecraftManagedMod {
   name: string
   path: string

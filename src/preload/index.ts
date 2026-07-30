@@ -29,6 +29,7 @@ const api: ModMindApi = {
     renamePath: (from: string, to: string) => ipcRenderer.invoke('project:renamePath', from, to),
     deletePath: (relativePath: string) => ipcRenderer.invoke('project:deletePath', relativePath),
     reveal: (relativePath?: string) => ipcRenderer.invoke('project:reveal', relativePath),
+    exportArtifact: () => ipcRenderer.invoke('project:exportArtifact'),
     prepareIde: () => ipcRenderer.invoke('project:prepareIde'),
     openIde: () => ipcRenderer.invoke('project:openIde'),
     captureIdea: (prompt: string) => ipcRenderer.invoke('project:captureIdea', prompt),

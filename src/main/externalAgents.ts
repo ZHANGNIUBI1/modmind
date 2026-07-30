@@ -555,6 +555,7 @@ export async function runExternalAgent(options: ExternalAgentRunOptions): Promis
   const resumedHistory = persistedSessionId ? await readExternalSessionHistory(options.kind, persistedSessionId) : ''
   const mcpServerPath = path.join(options.project.path, options.project.toolDataDirectory ?? '.modmind', 'external-agents', 'modmind-mcp-server.mjs').replaceAll('\\', '\\\\')
   const codexConfig = [
+    '-c', 'sandbox_mode="read-only"',
     '-c', `mcp_servers.modmind.command=${JSON.stringify(runtime.command)}`,
     '-c', `mcp_servers.modmind.args=["${mcpServerPath}"]`,
     '-c', 'mcp_servers.modmind.default_tools_approval_mode="approve"',
@@ -563,7 +564,7 @@ export async function runExternalAgent(options: ExternalAgentRunOptions): Promis
   const args = options.kind === 'codex'
     ? persistedSessionId
       ? ['--ask-for-approval', 'never', 'exec', 'resume', persistedSessionId, '--json', '--skip-git-repo-check', ...codexConfig, '-']
-      : ['--ask-for-approval', 'never', 'exec', '--json', '--skip-git-repo-check', '--sandbox', 'workspace-write', '-C', options.project.path, ...codexConfig, '-']
+      : ['--ask-for-approval', 'never', 'exec', '--json', '--skip-git-repo-check', '--sandbox', 'read-only', '-C', options.project.path, ...codexConfig, '-']
     : ['-p', ...(persistedSessionId ? ['--resume', persistedSessionId] : []), '--output-format', 'stream-json', '--verbose', '--permission-mode', 'auto', '--mcp-config', mcpConfigPath, '--strict-mcp-config', '--add-dir', options.project.path, '--append-system-prompt', 'Write user-facing responses in Simplified Chinese unless explicitly asked otherwise. Call modmind_set_intent before any inspection or other tool. Informational requests must not create Todo, edit, build, or test. Engineering requests must use modmind_update_todo before edits and whenever task statuses change. Do not edit .modmind.']
   const historyLabel = options.kind === 'codex' ? 'Codex' : 'Claude Code'
   const startContent = `${historyLabel} 托管任务已启动${resumedHistory ? `\n\n[已恢复的 ${historyLabel} 对话上下文]\n${resumedHistory}` : ''}`

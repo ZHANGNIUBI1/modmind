@@ -3,6 +3,7 @@ out/
 dist/
 release/
 release-*/
+cleanup-backup-*/
 artifacts/
 output/
 .agents/

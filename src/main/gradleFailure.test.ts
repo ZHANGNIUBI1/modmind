@@ -1,0 +1,29 @@
+import { describe, expect, it } from 'vitest'
+import {
+  isGradleDistributionLockFailure,
+  isGradleNetworkFailure,
+  isGradleWrapperBootstrapFailure
+} from './gradleFailure'
+
+describe('Gradle wrapper failure classification', () => {
+  it('recognizes wrapper distribution lock timeouts on Windows', () => {
+    const log = 'Timeout of 120000 reached waiting for exclusive access to file: C:\\Users\\me\\cache\\wrapper\\dists\\gradle-9.5.1-bin\\key\\gradle-9.5.1-bin.zip'
+
+    expect(isGradleDistributionLockFailure(log)).toBe(true)
+    expect(isGradleWrapperBootstrapFailure(log)).toBe(true)
+  })
+
+  it('recognizes wrapper distribution lock timeouts on Unix', () => {
+    const log = 'Timeout of 120000 reached waiting for exclusive access to file: /home/me/.gradle/wrapper/dists/gradle-9.5.1-bin/key/gradle-9.5.1-bin.zip'
+
+    expect(isGradleDistributionLockFailure(log)).toBe(true)
+  })
+
+  it('keeps compiler failures out of bootstrap recovery', () => {
+    const log = '/project/src/Main.java:12: error: cannot find symbol\nBUILD FAILED'
+
+    expect(isGradleNetworkFailure(log)).toBe(false)
+    expect(isGradleDistributionLockFailure(log)).toBe(false)
+    expect(isGradleWrapperBootstrapFailure(log)).toBe(false)
+  })
+})

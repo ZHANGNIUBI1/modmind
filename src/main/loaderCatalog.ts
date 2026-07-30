@@ -2,6 +2,9 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { XMLParser } from 'fast-xml-parser'
 import type { LoaderKind, LoaderVersionOption } from '../shared/types'
+import { javaVersionForMinecraft, supportsProjectCreation } from './loaderCompatibility'
+
+export { javaVersionForMinecraft } from './loaderCompatibility'
 
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000
 const REQUEST_TIMEOUT_MS = 30_000
@@ -12,6 +15,19 @@ interface CatalogCache {
   options: LoaderVersionOption[]
 }
 
+function supportedOptions(options: LoaderVersionOption[]): LoaderVersionOption[] {
+  const seen = new Set<string>()
+  return options.filter((option) => {
+    if (!option || !['fabric', 'quilt', 'forge', 'neoforge'].includes(option.loader)) return false
+    if (!supportsProjectCreation(option.loader, option.minecraftVersion)) return false
+    if (!option.loaderVersion || !Number.isInteger(option.javaVersion) || !Array.isArray(option.notes)) return false
+    const key = `${option.loader}:${option.minecraftVersion}`
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
+}
+
 function completeCatalog(options: LoaderVersionOption[]): boolean {
   return (['fabric', 'quilt', 'forge', 'neoforge'] as const).every((loader) => options.some((option) => option.loader === loader))
 }
@@ -20,9 +36,9 @@ const fallbackOptions: LoaderVersionOption[] = [
   { loader: 'fabric', minecraftVersion: '1.20.1', loaderVersion: '0.16.10', apiVersion: '0.92.9+1.20.1', javaVersion: 17, channel: 'release', supportTier: 'stable', notes: [] },
   { loader: 'fabric', minecraftVersion: '1.20.6', loaderVersion: '0.16.10', apiVersion: '0.100.8+1.20.6', javaVersion: 21, channel: 'release', supportTier: 'stable', notes: [] },
   { loader: 'fabric', minecraftVersion: '1.21.1', loaderVersion: '0.16.10', apiVersion: '0.116.13+1.21.1', javaVersion: 21, channel: 'release', supportTier: 'stable', notes: [] },
-  { loader: 'quilt', minecraftVersion: '1.20.1', loaderVersion: '0.27.1', apiVersion: '7.7.0+0.92.2-1.20.1', javaVersion: 17, channel: 'release', supportTier: 'experimental', notes: ['Quilt 与 Quilted Fabric API 支持处于兼容验证阶段'] },
+  { loader: 'quilt', minecraftVersion: '1.20.1', loaderVersion: '0.27.1', apiVersion: '7.7.0+0.92.2-1.20.1', qslVersion: '6.3.0+1.20.1', javaVersion: 17, channel: 'release', supportTier: 'experimental', notes: ['Quilt 与 Quilted Fabric API 支持处于兼容验证阶段'] },
   { loader: 'forge', minecraftVersion: '1.20.1', loaderVersion: '1.20.1-47.4.0', javaVersion: 17, channel: 'release', supportTier: 'stable', notes: ['离线兼容目录，联网后会刷新 Forge 版本'] },
-  { loader: 'neoforge', minecraftVersion: '1.20.1', loaderVersion: '1.20.1-47.1.106', javaVersion: 17, channel: 'release', supportTier: 'experimental', notes: ['NeoForge 过渡版本'] },
+  { loader: 'neoforge', minecraftVersion: '1.20.4', loaderVersion: '20.4.251', javaVersion: 17, channel: 'release', supportTier: 'stable', notes: [] },
   { loader: 'neoforge', minecraftVersion: '1.21.1', loaderVersion: '21.1.244', javaVersion: 21, channel: 'release', supportTier: 'stable', notes: [] }
 ]
 
@@ -48,16 +64,6 @@ function compareVersions(left: string, right: string): number {
     return a.localeCompare(b)
   }
   return 0
-}
-
-export function javaVersionForMinecraft(version: string): number {
-  const normalized = version.startsWith('1.') ? version.slice(2) : version
-  const [major = 0, minor = 0] = normalized.split('.').map((part) => Number.parseInt(part, 10) || 0)
-  if (!version.startsWith('1.')) return 21
-  if (major <= 16) return 8
-  if (major === 17) return 16
-  if (major < 20 || (major === 20 && minor <= 4)) return 17
-  return 21
 }
 
 async function fetchText(url: string, productVersion = 'development'): Promise<string> {
@@ -103,7 +109,7 @@ function minecraftSort(left: LoaderVersionOption, right: LoaderVersionOption): n
 }
 
 export async function downloadLoaderCatalog(productVersion = 'development'): Promise<LoaderVersionOption[]> {
-  const [manifestText, fabricGamesText, fabricLoadersText, fabricApiXml, quiltGamesText, quiltLoadersText, quiltedFabricApiXml, forgeXml, neoForgeXml, neoTransitionXml] = await Promise.all([
+  const [manifestText, fabricGamesText, fabricLoadersText, fabricApiXml, quiltGamesText, quiltLoadersText, quiltedFabricApiXml, qslXml, forgeXml, neoForgeXml, neoTransitionXml] = await Promise.all([
     fetchText('https://piston-meta.mojang.com/mc/game/version_manifest_v2.json', productVersion),
     fetchOptionalText('https://meta.fabricmc.net/v2/versions/game', '[]', productVersion),
     fetchOptionalText('https://meta.fabricmc.net/v2/versions/loader', '[]', productVersion),
@@ -111,6 +117,7 @@ export async function downloadLoaderCatalog(productVersion = 'development'): Pro
     fetchOptionalText('https://meta.quiltmc.org/v3/versions/game', '[]', productVersion),
     fetchOptionalText('https://meta.quiltmc.org/v3/versions/loader', '[]', productVersion),
     fetchOptionalText('https://maven.quiltmc.org/repository/release/org/quiltmc/quilted-fabric-api/quilted-fabric-api/maven-metadata.xml', '<metadata/>', productVersion),
+    fetchOptionalText('https://maven.quiltmc.org/repository/release/org/quiltmc/qsl/maven-metadata.xml', '<metadata/>', productVersion),
     fetchOptionalText('https://maven.minecraftforge.net/net/minecraftforge/forge/maven-metadata.xml', '<metadata/>', productVersion),
     fetchOptionalText('https://maven.neoforged.net/releases/net/neoforged/neoforge/maven-metadata.xml', '<metadata/>', productVersion),
     fetchOptionalText('https://maven.neoforged.net/releases/net/neoforged/forge/maven-metadata.xml', '<metadata/>', productVersion)
@@ -152,12 +159,20 @@ export async function downloadLoaderCatalog(productVersion = 'development'): Pro
     const game = releases.find((candidate) => version.endsWith(`-${candidate}`))
     if (game) quiltedFabricApiByGame.set(game, version)
   }
+  const qslByGame = new Map<string, string>()
+  for (const version of metadataVersions(qslXml)) {
+    const game = releases.find((candidate) => version.endsWith(`+${candidate}`))
+    if (!game) continue
+    const existing = qslByGame.get(game)
+    if (!existing || compareVersions(version, existing) > 0) qslByGame.set(game, version)
+  }
   if (quiltLoaderVersion) {
     for (const game of quiltGames.map((entry) => entry.version).filter((version) => releases.includes(version))) {
       const apiVersion = quiltedFabricApiByGame.get(game)
-      if (!apiVersion) continue
+      const qslVersion = qslByGame.get(game)
+      if (!apiVersion || !qslVersion) continue
       options.push({
-        loader: 'quilt', minecraftVersion: game, loaderVersion: quiltLoaderVersion, apiVersion,
+        loader: 'quilt', minecraftVersion: game, loaderVersion: quiltLoaderVersion, apiVersion, qslVersion,
         javaVersion: javaVersionForMinecraft(game), channel: 'release', supportTier: 'experimental',
         notes: ['Quilt 与 Quilted Fabric API 支持处于兼容验证阶段']
       })
@@ -211,8 +226,9 @@ export async function downloadLoaderCatalog(productVersion = 'development'): Pro
       notes: ['NeoForge 1.20.1 过渡构件使用 net.neoforged:forge']
     })
   }
-  if (!options.length) throw new Error('所有 Loader 元数据源均不可用')
-  return options.sort(minecraftSort)
+  const supported = supportedOptions(options).sort(minecraftSort)
+  if (!completeCatalog(supported)) throw new Error('上游 Loader 元数据未提供完整的受支持模板目录')
+  return supported
 }
 
 export class LoaderCatalog {
@@ -225,9 +241,10 @@ export class LoaderCatalog {
     if (!refresh) {
       try {
         const cached = JSON.parse(await fs.readFile(this.cachePath, 'utf8')) as CatalogCache
-        if (Date.now() - Date.parse(cached.updatedAt) < CACHE_TTL_MS && completeCatalog(cached.options)) {
-          this.memory = cached.options
-          return structuredClone(cached.options)
+        const options = supportedOptions(cached.options)
+        if (Date.now() - Date.parse(cached.updatedAt) < CACHE_TTL_MS && completeCatalog(options)) {
+          this.memory = options
+          return structuredClone(options)
         }
       } catch {
         // A stale or missing cache is refreshed below.
@@ -242,14 +259,15 @@ export class LoaderCatalog {
     } catch (error) {
       try {
         const cached = JSON.parse(await fs.readFile(this.cachePath, 'utf8')) as CatalogCache
-        if (completeCatalog(cached.options)) {
-          this.memory = cached.options
-          return structuredClone(cached.options)
+        const options = supportedOptions(cached.options)
+        if (completeCatalog(options)) {
+          this.memory = options
+          return structuredClone(options)
         }
       } catch {
         // The bundled fallback keeps project creation available offline.
       }
-      this.memory = fallbackOptions.map((option) => ({
+      this.memory = supportedOptions(fallbackOptions).map((option) => ({
         ...option,
         notes: [...option.notes, `兼容目录刷新失败：${error instanceof Error ? error.message : String(error)}`]
       }))

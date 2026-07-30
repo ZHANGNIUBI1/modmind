@@ -291,6 +291,7 @@ button { color: inherit; }
 .adopt-files code { display: block; max-height: 84px; overflow: auto; padding: 8px; border-radius: 5px; background: #f2f2f4; color: #5f6066; font-size: 9px; line-height: 1.55; white-space: pre-wrap; }
 
 .inspiration-page { height: 100%; display: flex; flex-direction: column; overflow: hidden; }
+.inspiration-page[hidden] { display: none; }
 .inspiration-model-state { display: inline-flex; align-items: center; gap: 5px; color: #6d5c1d; font-size: 10px; }
 .inspiration-toolbar { display: flex; align-items: center; gap: 12px; }
 .inspiration-layout { min-height: 0; flex: 1; display: grid; grid-template-columns: 255px minmax(0, 1fr); }

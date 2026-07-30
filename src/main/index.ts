@@ -15,6 +15,12 @@ import { DependencyService } from './dependencyService'
 import { GitService } from './gitService'
 import { ReleaseService, type ReleaseSecrets } from './releaseService'
 import { generateGithubWorkflow } from './workflowService'
+import { buildScriptFingerprint } from './buildTrust'
+import { detectedProjectVersion, migrateProjectVersion112 } from './projectVersionMigration'
+import { CURRENT_PROJECT_VERSION, MIGRATABLE_PROJECT_VERSION } from './projectVersion'
+import { inspectProjectPreflight } from './projectPreflight'
+import { recordZipExpansion } from './archiveImportPolicy'
+import { sameProjectPath } from './projectPath'
 import { detectExternalAgents, externalAgentDocsUrl, installExternalAgent, launchExternalAgent, readExternalAgentHistory, runExternalAgent, type ExternalAgentKind } from './externalAgents'
 import {
   extractJson,
@@ -62,6 +68,16 @@ let gitService: GitService | null = null
 let contentService: ContentService | null = null
 let releaseService: ReleaseService | null = null
 const pendingBuildTrust = new Map<string, (allow: boolean) => void>()
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+
+if (!hasSingleInstanceLock) app.quit()
+
+app.on('second-instance', () => {
+  if (!mainWindow || mainWindow.isDestroyed()) return
+  if (mainWindow.isMinimized()) mainWindow.restore()
+  mainWindow.show()
+  mainWindow.focus()
+})
 
 const ignoredDirectories = new Set(['node_modules', '.git', 'build', '.gradle'])
 const currentProjectManifest = 'modmind.project.json'
@@ -201,7 +217,15 @@ function createWindow(): void {
     getProject: () => currentProject,
     onState: (state) => mainWindow?.webContents.send('minecraft:state', state),
     onEvent: (event) => mainWindow?.webContents.send('minecraft:event', event),
-    authorizeBuild: ensureProjectBuildTrusted
+    authorizeBuild: ensureProjectBuildTrusted,
+    getGradlePreference: async () => {
+      const settings = await readSettings()
+      return {
+        preferLocalGradle: settings.preferLocalGradle,
+        executable: settings.gradleExecutable,
+        downloadSource: settings.gradleDownloadSource
+      }
+    }
   })
   blockbenchBridge.onStatus((status) => {
     if (is.dev) console.info(`[Blockbench] ${status.phase}${status.version ? ` v${status.version}` : ''}: ${status.message ?? ''}`)
@@ -239,8 +263,21 @@ function createWindow(): void {
 }
 
 function slugify(value: string): string {
-  const normalized = value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '')
-  return normalized || 'my_mod'
+  let normalized = value.trim().toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_+|_+$/g, '')
+  if (!normalized) normalized = 'my_mod'
+  if (!/^[a-z]/.test(normalized)) normalized = `mod_${normalized}`
+  normalized = normalized.slice(0, 64).replace(/_+$/g, '')
+  if (normalized.length < 2) normalized = `${normalized}_mod`
+  return normalized
+}
+
+function normalizeProjectName(value: unknown): string {
+  if (typeof value !== 'string') throw new Error('项目名称无效')
+  const name = value.trim()
+  if (!name) throw new Error('项目名称不能为空')
+  if (name.length > 100) throw new Error('项目名称不能超过 100 个字符')
+  if (/[\\x00-\\x1f\\x7f]/.test(name)) throw new Error('项目名称不能包含控制字符或换行')
+  return name
 }
 
 function requireProject(): ProjectInfo {
@@ -277,6 +314,27 @@ async function pathExists(target: string): Promise<boolean> {
   }
 }
 
+async function copyBundledGradleWrapper(projectRoot: string): Promise<void> {
+  const wrapperRoot = app.isPackaged
+    ? path.join(process.resourcesPath, 'gradle-wrapper')
+    : path.join(app.getAppPath(), 'vendor', 'gradle-wrapper')
+  const wrapperFiles = [
+    { source: 'gradlew', target: 'gradlew', sha256: 'b2fe376b143a459ba5d0bd290dc89beed5399fc6d159cd1214bd642ea94bcf07' },
+    { source: 'gradlew.bat', target: 'gradlew.bat', sha256: '9386e790d58b9368ca8e034536a5baa688643d51cb37bfa462503d36fd0291a6' },
+    { source: 'gradle-wrapper.jar', target: 'gradle/wrapper/gradle-wrapper.jar', sha256: '423cb469ccc0ecc31f0e4e1c309976198ccb734cdcbb7029d4bda0f18f57e8d9' }
+  ]
+  for (const entry of wrapperFiles) {
+    const bytes = await fs.readFile(path.join(wrapperRoot, entry.source))
+    if (createHash('sha256').update(bytes).digest('hex') !== entry.sha256) {
+      throw new Error(`Bundled Gradle Wrapper asset failed verification: ${entry.source}`)
+    }
+    const target = path.join(projectRoot, ...entry.target.split('/'))
+    await fs.mkdir(path.dirname(target), { recursive: true })
+    await fs.writeFile(target, bytes)
+  }
+  if (process.platform !== 'win32') await fs.chmod(path.join(projectRoot, 'gradlew'), 0o755)
+}
+
 async function writeProjectTemplate(project: ProjectInfo): Promise<void> {
   const files = projectTemplateFiles(project)
 
@@ -287,6 +345,7 @@ async function writeProjectTemplate(project: ProjectInfo): Promise<void> {
       await fs.writeFile(target, content, 'utf8')
     })
   )
+  await copyBundledGradleWrapper(project.path)
 }
 
 async function readProjectInfo(root: string): Promise<ProjectInfo | null> {
@@ -298,6 +357,35 @@ async function readProjectInfo(root: string): Promise<ProjectInfo | null> {
   const parsed = JSON.parse(content) as ProjectInfo
   const toolDataDirectory = manifestPath === legacyPath ? '.modtool' : '.modmind'
   return { ...parsed, path: root, toolDataDirectory }
+}
+
+async function offerProjectVersionMigration(project: ProjectInfo): Promise<ProjectInfo> {
+  if (await detectedProjectVersion(project) !== MIGRATABLE_PROJECT_VERSION) return project
+  const choice = await dialog.showMessageBox(mainWindow!, {
+    type: 'warning',
+    title: '项目模板需要迁移',
+    message: `检测到 ModMind ${MIGRATABLE_PROJECT_VERSION} 项目`,
+    detail: `旧版 Gradle 和 Loader 模板可能无法构建。可以自动备份原配置并迁移到 ${CURRENT_PROJECT_VERSION}；源码和自定义入口不会被覆盖。`,
+    buttons: [`自动迁移到 ${CURRENT_PROJECT_VERSION}`, '暂不迁移'],
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true
+  })
+  if (choice.response !== 0) return project
+  let migrationProject = project
+  if (project.loader === 'quilt' && !project.qslVersion) {
+    const compatibility = await requireLoaderCatalog().resolve(project.loader, project.minecraftVersion)
+    migrationProject = { ...project, qslVersion: compatibility.qslVersion }
+  }
+  const result = await migrateProjectVersion112(migrationProject, copyBundledGradleWrapper)
+  await dialog.showMessageBox(mainWindow!, {
+    type: 'info',
+    title: '项目迁移完成',
+    message: `项目已迁移到 ModMind ${CURRENT_PROJECT_VERSION}`,
+    detail: `旧配置已备份到 ${path.relative(project.path, result.backupDirectory)}`,
+    buttons: ['确定']
+  })
+  return result.project
 }
 
 const externalProjectIgnoredDirectories = new Set(['node_modules', '.git', '.gradle', '.idea', '.vscode', 'build', 'out', 'run', 'logs', 'target'])
@@ -468,20 +556,12 @@ async function resolveExistingProjectSource(inputPath: string): Promise<string> 
   if (!stat.isFile() || path.extname(resolved).toLowerCase() !== '.zip') {
     throw new Error('Please select a project folder or a ZIP archive')
   }
-  if (stat.size > 512 * 1024 * 1024) throw new Error('ZIP archive exceeds the 512 MB import limit')
   const extractionRoot = await fs.mkdtemp(path.join(app.getPath('temp'), 'modmind-import-'))
-  let entryCount = 0
-  let expandedBytes = 0
+  const expansion = { entryCount: 0, expandedBytes: 0 }
   try {
     await extractZip(resolved, {
       dir: extractionRoot,
-      onEntry: (entry) => {
-        entryCount += 1
-        expandedBytes += entry.uncompressedSize
-        if (entryCount > 20_000) throw new Error('ZIP archive contains more than 20,000 entries')
-        if (entry.uncompressedSize > 256 * 1024 * 1024) throw new Error(`ZIP entry is too large: ${entry.fileName}`)
-        if (expandedBytes > 2 * 1024 * 1024 * 1024) throw new Error('ZIP expanded size exceeds the 2 GB import limit')
-      }
+      onEntry: (entry) => recordZipExpansion(expansion, entry)
     })
   } catch (error) {
     await fs.rm(extractionRoot, { recursive: true, force: true })
@@ -583,22 +663,10 @@ function trustedBuildsFile(): string {
   return path.join(app.getPath('userData'), 'trusted-builds.json')
 }
 
-async function buildScriptFingerprint(project: ProjectInfo): Promise<string> {
-  const hash = createHash('sha256')
-  const names = ['build.gradle', 'build.gradle.kts', 'settings.gradle', 'settings.gradle.kts', 'gradle.properties']
-  for (const name of names) {
-    const target = path.join(project.path, name)
-    const content = await fs.readFile(target).catch(() => null)
-    hash.update(name)
-    if (content) hash.update(content)
-  }
-  return hash.digest('hex')
-}
-
 async function ensureProjectBuildTrusted(project: ProjectInfo): Promise<void> {
   if ((process.env.MODMIND_E2E ?? process.env.MODTOOL_E2E) === '1') return
   const key = path.resolve(project.path).toLowerCase()
-  const fingerprint = await buildScriptFingerprint(project)
+  const fingerprint = await buildScriptFingerprint(project.path)
   const trusted = await fs.readFile(trustedBuildsFile(), 'utf8')
     .then((value) => JSON.parse(value) as Record<string, string>)
     .catch(() => ({} as Record<string, string>))
@@ -733,6 +801,9 @@ async function readSettings(): Promise<AiSettings> {
     agentMaxSteps: 0,
     maxBuilds: 0,
     allowBuildScriptChanges: true,
+    preferLocalGradle: false,
+    gradleExecutable: '',
+    gradleDownloadSource: 'auto',
     darkMode: false
   }
   try {
@@ -754,6 +825,11 @@ async function readSettings(): Promise<AiSettings> {
       agentMaxSteps,
       maxBuilds,
       allowBuildScriptChanges: true,
+      preferLocalGradle: Boolean(stored.preferLocalGradle),
+      gradleExecutable: typeof stored.gradleExecutable === 'string' ? stored.gradleExecutable.slice(0, 4096) : '',
+      gradleDownloadSource: stored.gradleDownloadSource === 'china' || stored.gradleDownloadSource === 'official'
+        ? stored.gradleDownloadSource
+        : 'auto',
       darkMode: Boolean(stored.darkMode),
       apiKey,
       hasStoredKey: Boolean(stored.encryptedKey)
@@ -898,9 +974,9 @@ interface GeneratedChangeSet {
 const codingExtensions = new Set(['.java', '.kt', '.kts', '.json', '.gradle', '.properties', '.md', '.txt', '.toml', '.mcmeta', '.html', '.htm', '.yaml', '.yml', '.xml'])
 const codingRootFiles = new Set(['build.gradle', 'settings.gradle', 'gradle.properties', 'README.md', 'gradle/wrapper/gradle-wrapper.properties'])
 const executableBuildFiles = new Set(['build.gradle', 'settings.gradle', 'gradle.properties', 'gradle/wrapper/gradle-wrapper.properties'])
-const safeBuildRepairFiles = new Set(['gradle.properties', 'gradle/wrapper/gradle-wrapper.properties'])
+const safeBuildRepairFiles = new Set(['gradle.properties'])
 
-function normalizeCodingPath(value: string, allowBuildScriptChanges = false): string {
+function normalizeCodingPath(value: string, allowBuildScriptChanges = false, allowWrapperConfiguration = false): string {
   const normalized = value.trim().replaceAll('\\', '/').replace(/^\.\/+/, '')
   if (!normalized || path.win32.isAbsolute(value) || path.posix.isAbsolute(normalized) || normalized.includes('../')) {
     throw new Error(`AI returned an unsafe path: ${value}`)
@@ -916,6 +992,9 @@ function normalizeCodingPath(value: string, allowBuildScriptChanges = false): st
   }
   if (normalized === 'docs/last-ai-response.txt' || normalized === 'docs/last-ai-change.json' || normalized === 'docs/ai-tasks.md') {
     throw new Error(`AI cannot modify its own audit record: ${value}`)
+  }
+  if (normalized === 'gradle/wrapper/gradle-wrapper.properties' && !allowWrapperConfiguration) {
+    throw new Error('AI cannot modify Gradle Wrapper distribution settings; ModMind manages verified Gradle recovery')
   }
   const allowedRoot = normalized.startsWith('src/') || normalized.startsWith('docs/') || codingRootFiles.has(normalized)
   if (!allowedRoot || !codingExtensions.has(path.posix.extname(normalized))) {
@@ -1146,10 +1225,33 @@ async function migrateProject(input: ProjectMigrationInput): Promise<ProjectMigr
     minecraftVersion: preview.target.minecraftVersion,
     loaderVersion: preview.target.loaderVersion,
     apiVersion: preview.target.apiVersion,
+    qslVersion: preview.target.qslVersion,
     javaVersion: preview.target.javaVersion,
+    projectVersion: CURRENT_PROJECT_VERSION,
     createdAt: new Date().toISOString(),
     toolDataDirectory: '.modmind'
   }
+
+  const migrationBackupRoot = path.join(destination, 'docs', 'migration-source-build')
+  const sourceBuildFiles = [
+    'build.gradle', 'build.gradle.kts', 'settings.gradle', 'settings.gradle.kts', 'gradle.properties',
+    'gradlew', 'gradlew.bat'
+  ]
+  for (const relative of sourceBuildFiles) {
+    const sourceFile = path.join(destination, ...relative.split('/'))
+    if (!(await pathExists(sourceFile))) continue
+    const backup = path.join(migrationBackupRoot, ...relative.split('/'))
+    await fs.mkdir(path.dirname(backup), { recursive: true })
+    await fs.copyFile(sourceFile, backup)
+  }
+  for (const relative of ['gradle', 'buildSrc', 'build-logic']) {
+    const sourceDirectory = path.join(destination, relative)
+    if (!(await fs.stat(sourceDirectory).then((stat) => stat.isDirectory()).catch(() => false))) continue
+    await fs.cp(sourceDirectory, path.join(migrationBackupRoot, relative), { recursive: true })
+  }
+  const warnings = [...preview.warnings, '原始 Gradle 配置和 Wrapper 已备份到 docs/migration-source-build；请按目标 Loader 检查自定义依赖和任务']
+  const sourceDescriptor = descriptorPath(source.loader, source.minecraftVersion)
+  const originalDescriptorContent = await fs.readFile(path.join(destination, ...sourceDescriptor.split('/')), 'utf8').catch(() => '')
 
   const obsoleteDescriptors = [
     'src/main/resources/fabric.mod.json',
@@ -1161,6 +1263,33 @@ async function migrateProject(input: ProjectMigrationInput): Promise<ProjectMigr
   await Promise.all(obsoleteDescriptors.map((relative) => fs.rm(path.join(destination, relative), { force: true })))
   const templateFiles = projectTemplateFiles(targetProject, false)
   delete templateFiles['README.md']
+  const targetDescriptor = descriptorPath(targetProject.loader, targetProject.minecraftVersion)
+  if (source.loader === targetProject.loader && ['fabric', 'quilt'].includes(source.loader) && sourceDescriptor === targetDescriptor) {
+    try {
+      const original = JSON.parse(originalDescriptorContent) as Record<string, unknown>
+      const generated = JSON.parse(templateFiles[targetDescriptor]) as Record<string, unknown>
+      if (source.loader === 'fabric') {
+        if (original.entrypoints) generated.entrypoints = original.entrypoints
+        const depends = generated.depends as Record<string, unknown>
+        depends.minecraft = targetProject.minecraftVersion
+        depends.java = `>=${targetProject.javaVersion}`
+        depends.fabricloader = `>=${targetProject.loaderVersion}`
+      } else {
+        const quilt = generated.quilt_loader as Record<string, unknown>
+        const originalQuilt = original.quilt_loader as Record<string, unknown> | undefined
+        if (originalQuilt?.entrypoints) quilt.entrypoints = originalQuilt.entrypoints
+        const depends = Array.isArray(quilt.depends) ? quilt.depends as Array<Record<string, unknown>> : []
+        for (const dependency of depends) {
+          if (dependency.id === 'minecraft') dependency.versions = targetProject.minecraftVersion
+          if (dependency.id === 'java') dependency.versions = `>=${targetProject.javaVersion}`
+          if (dependency.id === 'quilt_loader') dependency.versions = `>=${targetProject.loaderVersion}`
+        }
+      }
+      templateFiles[targetDescriptor] = JSON.stringify(generated, null, 2)
+    } catch {
+      warnings.push('无法解析原始 Loader 描述文件，已保留原文件到迁移备份目录')
+    }
+  }
   const changedFiles: string[] = []
   for (const [relative, content] of Object.entries(templateFiles)) {
     const target = path.join(destination, relative)
@@ -1168,8 +1297,9 @@ async function migrateProject(input: ProjectMigrationInput): Promise<ProjectMigr
     await fs.writeFile(target, content, 'utf8')
     changedFiles.push(relative)
   }
+  await copyBundledGradleWrapper(destination)
+  changedFiles.push('gradlew', 'gradlew.bat', 'gradle/wrapper/gradle-wrapper.jar')
 
-  const warnings = [...preview.warnings]
   if ((source.loader === 'forge' && targetProject.loader === 'neoforge') || (source.loader === 'neoforge' && targetProject.loader === 'forge')) {
     const from = source.loader === 'forge' ? 'net.minecraftforge' : 'net.neoforged'
     const to = targetProject.loader === 'forge' ? 'net.minecraftforge' : 'net.neoforged'
@@ -2479,10 +2609,61 @@ async function managedCodingHashesAt(root: string): Promise<Map<string, string>>
   const files = await listManagedFiles(root, (name) => ignoredDirectories.has(name) || isToolDataDirectory(name))
   const hashes = new Map<string, string>()
   for (const relative of files) {
-    const content = await fs.readFile(path.join(root, relative), 'utf8').catch(() => '')
+    const content = await fs.readFile(path.join(root, relative)).catch(() => Buffer.alloc(0))
     hashes.set(relative, createHash('sha256').update(content).digest('hex'))
   }
   return hashes
+}
+
+const externalAgentProtectedFiles = [
+  'gradlew',
+  'gradlew.bat',
+  'gradle/wrapper/gradle-wrapper.jar',
+  'gradle/wrapper/gradle-wrapper.properties',
+  currentProjectManifest,
+  legacyProjectManifest
+]
+
+async function fileHash(root: string, relative: string): Promise<string | undefined> {
+  const content = await fs.readFile(path.join(root, ...relative.split('/'))).catch(() => null)
+  return content ? createHash('sha256').update(content).digest('hex') : undefined
+}
+
+async function restoreExternalAgentFiles(project: ProjectInfo, snapshotId: string, files: string[]): Promise<void> {
+  const snapshotRoot = path.join(project.path, projectDataDirectory(project), 'snapshots', snapshotId, 'files')
+  for (const relative of files) {
+    const source = path.join(snapshotRoot, ...relative.split('/'))
+    const target = path.join(project.path, ...relative.split('/'))
+    if (await pathExists(source)) {
+      await fs.mkdir(path.dirname(target), { recursive: true })
+      await fs.copyFile(source, target)
+    } else {
+      await fs.rm(target, { force: true })
+    }
+  }
+}
+
+async function assertExternalAgentProtectedFiles(
+  project: ProjectInfo,
+  snapshotId: string,
+  baseline: Map<string, string>
+): Promise<void> {
+  const wrapperRoot = path.join(project.path, 'gradle', 'wrapper')
+  const currentWrapperFiles = await pathExists(wrapperRoot)
+    ? (await listManagedFiles(wrapperRoot, () => false)).map((relative) => `gradle/wrapper/${relative}`)
+    : []
+  const protectedFiles = [...new Set([
+    ...externalAgentProtectedFiles,
+    ...[...baseline.keys()].filter((relative) => relative.startsWith('gradle/wrapper/')),
+    ...currentWrapperFiles
+  ])]
+  const changed: string[] = []
+  for (const relative of protectedFiles) {
+    if (baseline.get(relative) !== await fileHash(project.path, relative)) changed.push(relative)
+  }
+  if (!changed.length) return
+  await restoreExternalAgentFiles(project, snapshotId, changed)
+  throw new Error(`External agent attempted to modify protected project infrastructure: ${changed.join(', ')}. ModMind restored the task snapshot copies.`)
 }
 
 function codingHashesEqual(left: Map<string, string> | null, right: Map<string, string>): boolean {
@@ -2707,6 +2888,7 @@ WINDOWS EDITING: For engineering source changes, call modmind_apply_edits with e
         },
         contentValidate: () => requireContentService().validate(),
         testMatrix: async (targets) => {
+          await assertExternalAgentProtectedFiles(project, snapshot.id, before)
           if (declaredIntent !== 'engineering') throw new Error('咨询任务不允许运行测试矩阵')
           if (!activeTask.state.todo?.length || activeTask.state.todo.some((todo) => todo.status !== 'completed')) {
             throw new Error('Todo 尚未全部完成，ModMind 已阻止提前运行测试矩阵')
@@ -2727,6 +2909,7 @@ WINDOWS EDITING: For engineering source changes, call modmind_apply_edits with e
         },
         releasePreflight: () => requireReleaseService().preflight(),
         build: async () => {
+          await assertExternalAgentProtectedFiles(project, snapshot.id, before)
           if (declaredIntent !== 'engineering') throw new Error('咨询任务不允许构建')
           if (!activeTask.state.todo?.length || activeTask.state.todo.some((todo) => todo.status !== 'completed')) {
             throw new Error('Todo 尚未全部完成，ModMind 已阻止提前构建')
@@ -2744,6 +2927,7 @@ WINDOWS EDITING: For engineering source changes, call modmind_apply_edits with e
           return { success: true, artifact }
         },
         testMinecraft: async () => {
+          await assertExternalAgentProtectedFiles(project, snapshot.id, before)
           if (declaredIntent !== 'engineering') throw new Error('咨询任务不允许启动 Minecraft 测试')
           if (!activeTask.state.todo?.length || activeTask.state.todo.some((todo) => todo.status !== 'completed')) {
             throw new Error('Todo 尚未全部完成，ModMind 已阻止提前启动 Minecraft 测试')
@@ -2775,6 +2959,7 @@ WINDOWS EDITING: For engineering source changes, call modmind_apply_edits with e
         runtimeState: async () => runtime.getState()
       }
     })
+    await assertExternalAgentProtectedFiles(project, snapshot.id, before)
     const after = await managedCodingHashes(project)
     const changedFiles = [...new Set([...before.keys(), ...after.keys()])].filter((file) => before.get(file) !== after.get(file))
     if (!declaredIntent) throw new Error('外部代理没有先声明任务意图；任务已停止')
@@ -3834,10 +4019,9 @@ function registerIpc(): void {
     assertProjectSwitchAllowed()
     if (!input || typeof input.sourcePath !== 'string') throw new Error('导入参数无效')
     const { analysis, files } = await analyzeExistingProject(input.sourcePath)
-    const name = input.name.trim()
+    const name = normalizeProjectName(input.name)
     const namespace = slugify(input.namespace)
     const minecraftVersion = input.minecraftVersion.trim()
-    if (!name) throw new Error('项目名称不能为空')
     if (!/^\d{1,2}\.\d{1,2}(?:\.\d{1,2})?$/.test(minecraftVersion)) throw new Error('Minecraft 版本格式无效')
     const compatibility = await requireLoaderCatalog().resolve(input.loader, minecraftVersion)
 
@@ -3860,7 +4044,9 @@ function registerIpc(): void {
       createdAt: new Date().toISOString(),
       loaderVersion: compatibility.loaderVersion,
       apiVersion: compatibility.apiVersion,
+      qslVersion: compatibility.qslVersion,
       javaVersion: compatibility.javaVersion,
+      projectVersion: CURRENT_PROJECT_VERSION,
       toolDataDirectory: '.modmind'
     }
     if (analysis.kind === 'complete') {
@@ -3870,21 +4056,26 @@ function registerIpc(): void {
       await fs.writeFile(path.join(projectPath, currentProjectManifest), JSON.stringify(project, null, 2), 'utf8')
       await fs.mkdir(path.join(projectPath, '.modmind'), { recursive: true })
     } else {
-      await fs.mkdir(projectPath, { recursive: true })
-      await writeProjectTemplate(project)
-      const importedFolder = analysis.kind === 'partial' ? 'imported-source' : 'imported-api'
-      const destination = path.join(projectPath, 'docs', importedFolder, slugify(analysis.sourceName))
-      const copied = await copyImportedReferences(analysis.sourcePath, destination, files)
-      const summary = [
-        '# Imported reference',
-        '',
-        `Source: ${analysis.sourcePath}`,
-        `Detected type: ${analysis.kind}`,
-        `Copied files: ${copied}`,
-        '',
-        ...analysis.reasons.map((reason) => `- ${reason}`)
-      ].join('\n')
-      await fs.writeFile(path.join(projectPath, 'docs', 'import-summary.md'), summary, 'utf8')
+      await fs.mkdir(projectPath)
+      try {
+        await writeProjectTemplate(project)
+        const importedFolder = analysis.kind === 'partial' ? 'imported-source' : 'imported-api'
+        const destination = path.join(projectPath, 'docs', importedFolder, slugify(analysis.sourceName))
+        const copied = await copyImportedReferences(analysis.sourcePath, destination, files)
+        const summary = [
+          '# Imported reference',
+          '',
+          `Source: ${analysis.sourcePath}`,
+          `Detected type: ${analysis.kind}`,
+          `Copied files: ${copied}`,
+          '',
+          ...analysis.reasons.map((reason) => `- ${reason}`)
+        ].join('\n')
+        await fs.writeFile(path.join(projectPath, 'docs', 'import-summary.md'), summary, 'utf8')
+      } catch (error) {
+        await fs.rm(projectPath, { recursive: true, force: true })
+        throw error
+      }
     }
     currentProject = project
     await rememberRecentProject(project)
@@ -3894,8 +4085,7 @@ function registerIpc(): void {
   ipcMain.handle('project:create', async (_event, input: ProjectCreateInput) => {
     assertProjectSwitchAllowed()
     if (!input || !['fabric', 'quilt', 'forge', 'neoforge'].includes(input.loader)) throw new Error('不支持的 Mod 加载器')
-    const name = input.name.trim()
-    if (!name) throw new Error('项目名称不能为空')
+    const name = normalizeProjectName(input.name)
     const minecraftVersion = input.minecraftVersion.trim()
     const compatibility = await requireLoaderCatalog().resolve(input.loader, minecraftVersion)
     const result = await dialog.showOpenDialog(mainWindow!, { properties: ['openDirectory', 'createDirectory'] })
@@ -3903,7 +4093,7 @@ function registerIpc(): void {
     const namespace = slugify(name)
     const projectPath = path.join(result.filePaths[0], namespace)
     if (await pathExists(projectPath)) throw new Error('项目目录已经存在，请修改项目名称或选择其他位置')
-    currentProject = {
+    const project: ProjectInfo = {
       ...input,
       name,
       minecraftVersion,
@@ -3912,13 +4102,22 @@ function registerIpc(): void {
       createdAt: new Date().toISOString(),
       loaderVersion: compatibility.loaderVersion,
       apiVersion: compatibility.apiVersion,
+      qslVersion: compatibility.qslVersion,
       javaVersion: compatibility.javaVersion,
+      projectVersion: CURRENT_PROJECT_VERSION,
       toolDataDirectory: '.modmind'
     }
-    await fs.mkdir(projectPath, { recursive: true })
-    await writeProjectTemplate(currentProject)
-    await rememberRecentProject(currentProject)
-    return currentProject
+    await fs.mkdir(projectPath)
+    try {
+      await writeProjectTemplate(project)
+      await fs.mkdir(path.join(projectPath, '.modmind'), { recursive: true })
+    } catch (error) {
+      await fs.rm(projectPath, { recursive: true, force: true })
+      throw error
+    }
+    currentProject = project
+    await rememberRecentProject(project)
+    return project
   })
 
   ipcMain.handle('project:open', async () => {
@@ -3927,19 +4126,21 @@ function registerIpc(): void {
     if (result.canceled || !result.filePaths[0]) return null
     const info = await readProjectInfo(result.filePaths[0])
     if (!info) throw new Error('所选目录不是 ModMind 项目，缺少 modmind.project.json 或 modtool.project.json')
-    currentProject = info
+    currentProject = await offerProjectVersionMigration(info)
     await rememberRecentProject(currentProject)
     return currentProject
   })
 
   ipcMain.handle('project:openRecent', async (_event, projectPath: string) => {
-    assertProjectSwitchAllowed()
     if (typeof projectPath !== 'string' || !projectPath.trim()) throw new Error('项目路径无效')
-    const info = await readProjectInfo(path.resolve(projectPath))
+    const resolvedProjectPath = path.resolve(projectPath)
+    if (activeAiRun && currentProject && sameProjectPath(currentProject.path, resolvedProjectPath)) return currentProject
+    assertProjectSwitchAllowed()
+    const info = await readProjectInfo(resolvedProjectPath)
     if (!info) throw new Error('最近项目不存在或已经不再是有效的 ModMind 项目')
-    currentProject = info
-    await rememberRecentProject(info)
-    return info
+    currentProject = await offerProjectVersionMigration(info)
+    await rememberRecentProject(currentProject)
+    return currentProject
   })
 
   ipcMain.handle('project:listRecent', () => readRecentProjects())
@@ -3962,7 +4163,7 @@ function registerIpc(): void {
   })
   ipcMain.handle('project:writeFile', async (_event, relativePath: string, content: string) => {
     if (typeof content !== 'string' || content.length > 2 * 1024 * 1024) throw new Error('文件内容超过 2 MB 编辑上限')
-    const normalized = normalizeCodingPath(relativePath, true)
+    const normalized = normalizeCodingPath(relativePath, true, true)
     const target = await resolveSafeCodingTarget(normalized)
     await fs.mkdir(path.dirname(target), { recursive: true })
     await fs.writeFile(target, content, 'utf8')
@@ -4016,6 +4217,27 @@ function registerIpc(): void {
     const normalized = relativePath ? normalizeReadablePath(relativePath) : ''
     shell.showItemInFolder(resolveProjectPath(normalized))
   })
+  ipcMain.handle('project:exportArtifact', async () => {
+    const project = requireProject()
+    const buildDirectory = path.join(project.path, 'build', 'libs')
+    const entries = await fs.readdir(buildDirectory, { withFileTypes: true }).catch(() => [])
+    const candidates = await Promise.all(entries
+      .filter((entry) => entry.isFile() && entry.name.toLowerCase().endsWith('.jar') && !/(sources|javadoc|dev|shadow)/i.test(entry.name))
+      .map(async (entry) => {
+        const source = path.join(buildDirectory, entry.name)
+        return { source, stat: await fs.stat(source) }
+      }))
+    const latest = candidates.sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs)[0]
+    if (!latest || latest.stat.size <= 0) throw new Error('尚未找到可导出的 Mod JAR，请先成功构建项目')
+    const result = await dialog.showSaveDialog(mainWindow!, {
+      title: '导出 Mod JAR',
+      defaultPath: path.join(app.getPath('downloads'), path.basename(latest.source)),
+      filters: [{ name: 'Minecraft Mod JAR', extensions: ['jar'] }]
+    })
+    if (result.canceled || !result.filePath) return null
+    if (path.resolve(result.filePath) !== path.resolve(latest.source)) await fs.copyFile(latest.source, result.filePath)
+    return result.filePath
+  })
   ipcMain.handle('project:prepareIde', () => prepareProjectIde(requireProject()))
   ipcMain.handle('project:openIde', async () => {
     const project = requireProject()
@@ -4033,24 +4255,9 @@ function registerIpc(): void {
 
   ipcMain.handle('build:preflight', async (event): Promise<PreflightResult> => {
     const project = requireProject()
-    const logs: string[] = []
     await sendBuildProgress(event, pipelineEvent('checking', '读取项目清单', '正在验证 ModMind 项目元数据', 'running'))
-    const descriptor = descriptorPath(project.loader, project.minecraftVersion)
-    const required = [projectManifest(project), 'build.gradle', 'settings.gradle', descriptor]
-    for (const file of required) {
-      const exists = await pathExists(path.join(project.path, file))
-      logs.push(`${exists ? 'PASS' : 'FAIL'}  ${file}`)
-    }
-    await sendBuildProgress(event, pipelineEvent('checking', '检查资源描述', `正在解析 ${path.basename(descriptor)}`, 'running'))
-    try {
-      const descriptorContent = await fs.readFile(path.join(project.path, descriptor), 'utf8')
-      if (project.loader === 'fabric' || descriptor.endsWith('mcmod.info')) JSON.parse(descriptorContent)
-      else if (!/modId\s*=\s*["'][a-z0-9_-]+["']/i.test(descriptorContent)) throw new Error('missing modId')
-      logs.push(`PASS  ${path.basename(descriptor)} syntax`)
-    } catch (error) {
-      logs.push(`FAIL  ${path.basename(descriptor)}: ${error instanceof Error ? error.message : String(error)}`)
-    }
-    const success = logs.every((line) => line.startsWith('PASS'))
+    await sendBuildProgress(event, pipelineEvent('checking', '检查资源描述', '正在解析 Loader 描述文件', 'running'))
+    const { success, logs } = await inspectProjectPreflight(project, projectManifest(project))
     const reportDirectory = path.join(project.path, projectDataDirectory(project), 'builds')
     await fs.mkdir(reportDirectory, { recursive: true })
     const reportPath = path.join(reportDirectory, `preflight-${Date.now()}.log`)
@@ -4060,7 +4267,7 @@ function registerIpc(): void {
       pipelineEvent(
         success ? 'complete' : 'error',
         success ? '项目预检通过' : '项目预检失败',
-        success ? '工程结构有效，可使用托管 Gradle 构建' : '请根据报告修复缺失或无效文件',
+        success ? '工程结构有效；仍需执行 Gradle 构建验证依赖和源码' : '请根据报告修复缺失或无效文件',
         success ? 'success' : 'error'
       ),
       0
@@ -4164,6 +4371,11 @@ function registerIpc(): void {
         ? Math.min(settings.maxBuilds, 100)
         : 0,
       allowBuildScriptChanges: true,
+      preferLocalGradle: Boolean(settings.preferLocalGradle),
+      gradleExecutable: typeof settings.gradleExecutable === 'string' ? settings.gradleExecutable.trim().slice(0, 4096) : '',
+      gradleDownloadSource: settings.gradleDownloadSource === 'china' || settings.gradleDownloadSource === 'official'
+        ? settings.gradleDownloadSource
+        : 'auto',
       darkMode: Boolean(settings.darkMode)
     }
     let existingEncryptedKey = ''
@@ -4258,6 +4470,7 @@ function registerIpc(): void {
 }
 
 app.whenReady().then(async () => {
+  if (!hasSingleInstanceLock) return
   await migrateLegacyUserData()
   electronApp.setAppUserModelId('dev.modmind.desktop')
   app.on('browser-window-created', (_, window) => optimizer.watchWindowShortcuts(window))

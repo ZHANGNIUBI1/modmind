@@ -54,9 +54,19 @@ on:
     paths:
       - 'src/**'
       - 'src/main/projectTemplates.ts'
+      - 'src/main/loaderCompatibility.ts'
       - 'src/main/loaderCatalog.ts'
       - 'src/main/minecraftRuntime.ts'
-      - '.github/workflows/mod-loader-matrix.yml'
+      - 'scripts/generate-loader-fixture.ts'
+      - '.github/workflows/loader-matrix.yml'
+  pull_request:
+    paths:
+      - 'src/main/projectTemplates.ts'
+      - 'src/main/loaderCompatibility.ts'
+      - 'src/main/loaderCatalog.ts'
+      - 'src/main/minecraftRuntime.ts'
+      - 'scripts/generate-loader-fixture.ts'
+      - '.github/workflows/loader-matrix.yml'
 
 permissions:
   contents: read
@@ -68,27 +78,34 @@ jobs:
       matrix:
         include:
           - loader: fabric
-            minecraft: '1.21.1'
-            loaderVersion: '0.16.10'
-            apiVersion: '0.116.13+1.21.1'
+            minecraft: '1.21.11'
+            loaderVersion: '0.19.3'
+            apiVersion: '0.141.6+1.21.11'
             java: 21
-            gradle: '8.12.1'
+            gradle: '9.5.1'
+          - loader: fabric
+            minecraft: '26.2'
+            loaderVersion: '0.19.3'
+            apiVersion: '0.156.0+26.2'
+            java: 25
+            gradle: '9.5.1'
           - loader: quilt
-            minecraft: '1.20.1'
-            loaderVersion: '0.27.1'
-            apiVersion: '7.7.0+0.92.2-1.20.1'
-            java: 17
-            gradle: '8.4'
-          - loader: forge
-            minecraft: '1.20.1'
-            loaderVersion: '1.20.1-47.4.0'
-            java: 17
-            gradle: '8.12.1'
-          - loader: neoforge
-            minecraft: '1.21.1'
-            loaderVersion: '21.1.244'
+            minecraft: '1.21'
+            loaderVersion: '0.30.0'
+            apiVersion: '11.0.0-alpha.3+0.102.0-1.21'
+            qslVersion: '10.0.0-alpha.1+1.21'
             java: 21
-            gradle: '8.12.1'
+            gradle: '8.9'
+          - loader: forge
+            minecraft: '1.21.11'
+            loaderVersion: '1.21.11-61.1.14'
+            java: 21
+            gradle: '9.5.0'
+          - loader: neoforge
+            minecraft: '1.21.11'
+            loaderVersion: '21.11.44'
+            java: 21
+            gradle: '9.2.1'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -105,6 +122,7 @@ jobs:
           MINECRAFT: \${{ matrix.minecraft }}
           LOADER_VERSION: \${{ matrix.loaderVersion }}
           API_VERSION: \${{ matrix.apiVersion }}
+          QSL_VERSION: \${{ matrix.qslVersion }}
           JAVA_VERSION: \${{ matrix.java }}
         run: npx vite-node scripts/generate-loader-fixture.ts matrix-project
       - uses: actions/setup-java@v4

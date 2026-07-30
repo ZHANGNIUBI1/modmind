@@ -1,7 +1,7 @@
 import { app } from 'electron'
 import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
-import type { ChildProcess } from 'node:child_process'
+import type { ChildProcess, ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createReadStream, createWriteStream, promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
@@ -36,6 +36,9 @@ import type {
   MinecraftRuntimeState
 } from '../shared/minecraft'
 import type { LoaderKind, ProjectInfo } from '../shared/types'
+import { gradleDistributionSources, type GradleDistributionSource, type GradleDownloadSourcePreference } from './gradleDownload'
+import { isGradleDistributionLockFailure, isGradleNetworkFailure, isGradleWrapperBootstrapFailure } from './gradleFailure'
+import { gradleChecksumForVersion, gradleVersionForProject, javaRuntimeTargetForMinecraft } from './loaderCompatibility'
 
 interface RuntimeMetadata {
   minecraftVersion: string
@@ -53,18 +56,84 @@ interface MinecraftRuntimeOptions {
   onState: (state: MinecraftRuntimeState) => void
   onEvent: (event: MinecraftRuntimeEvent) => void
   authorizeBuild?: (project: ProjectInfo) => Promise<void>
+  getGradlePreference?: () => Promise<{
+    preferLocalGradle: boolean
+    executable?: string
+    downloadSource?: GradleDownloadSourcePreference
+  }>
 }
 
 export function gradleVersionFor(project: ProjectInfo): string {
-  if (project.loader === 'fabric' && compareVersion(project.minecraftVersion, 1, 18) < 0) return '7.6.4'
-  if (project.loader === 'quilt' && compareVersion(project.minecraftVersion, 1, 20, 2) < 0) return '8.4'
-  if (project.loader === 'forge') {
-    if (compareVersion(project.minecraftVersion, 1, 8) < 0) return '2.14.1'
-    if (compareVersion(project.minecraftVersion, 1, 13) < 0) return '4.10.3'
-    if (compareVersion(project.minecraftVersion, 1, 17) < 0) return '6.9.4'
-    if (compareVersion(project.minecraftVersion, 1, 18) < 0) return '7.3.3'
+  return gradleVersionForProject(project)
+}
+
+interface GradleRuntimeSelection {
+  executable: string
+  javaHome: string
+  usesWrapper: boolean
+  source: 'wrapper' | 'managed' | 'local'
+  version?: string
+}
+
+async function probeGradleExecutable(configured: string | undefined): Promise<{ executable: string; version?: string } | null> {
+  let executable = configured?.trim() || 'gradle'
+  if (/["\r\n&|<>^]/.test(executable)) return null
+  if (configured?.trim()) {
+    const stat = await fs.stat(executable).catch(() => null)
+    if (stat?.isDirectory()) executable = path.join(executable, 'bin', process.platform === 'win32' ? 'gradle.bat' : 'gradle')
+    if (!(await exists(executable))) return null
   }
-  return '8.12.1'
+  return await new Promise((resolve) => {
+    const child = spawn(executable, ['--version'], { windowsHide: true, shell: process.platform === 'win32' })
+    let output = ''
+    let settled = false
+    const finish = (value: { executable: string; version?: string } | null): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      resolve(value)
+    }
+    const timer = setTimeout(() => {
+      if (child.pid) {
+        if (process.platform === 'win32') spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, shell: false })
+        else child.kill('SIGTERM')
+      }
+      finish(null)
+    }, 10_000)
+    child.stdout.on('data', (chunk: Buffer) => { output += chunk.toString('utf8') })
+    child.stderr.on('data', (chunk: Buffer) => { output += chunk.toString('utf8') })
+    child.once('error', () => finish(null))
+    child.once('exit', (code) => {
+      const version = output.match(/^Gradle\s+([^\s]+)$/m)?.[1]
+      finish(code === 0 ? { executable, ...(version ? { version } : {}) } : null)
+    })
+  })
+}
+
+async function probeGradleDistributionSource(source: GradleDistributionSource): Promise<number> {
+  const sampleBytes = 2 * 1024 * 1024
+  const started = Date.now()
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+  let downloaded = 0
+  try {
+    const response = await fetch(source.url, {
+      headers: { Range: `bytes=0-${sampleBytes - 1}` },
+      signal: AbortSignal.timeout(10_000)
+    })
+    if (!response.ok || !response.body) return 0
+    reader = response.body.getReader()
+    while (downloaded < sampleBytes) {
+      const result = await reader.read()
+      if (result.done) break
+      downloaded += result.value.byteLength
+    }
+    const elapsedMs = Math.max(Date.now() - started, 1)
+    return downloaded >= 64 * 1024 ? downloaded / elapsedMs : 0
+  } catch {
+    return 0
+  } finally {
+    await reader?.cancel().catch(() => undefined)
+  }
 }
 
 function projectDataDirectory(project: ProjectInfo): '.modmind' | '.modtool' {
@@ -82,6 +151,9 @@ function managedLoaderApiName(project: ProjectInfo): string {
 
 function summarizeGradleFailure(logText: string): string {
   const lines = logText.split(/\r?\n/)
+  if (isGradleNetworkFailure(logText)) {
+    return '无法下载 Gradle 分发包。请检查网络/代理，或在设置中启用“优先使用本机 Gradle”并指定与模板兼容的版本；迁移本身不受影响。'
+  }
   const compilerErrors: string[] = []
   for (let index = 0; index < lines.length && compilerErrors.length < 12; index += 1) {
     if (!/\.java:\d+:\s*(?:error|错误):/i.test(lines[index])) continue
@@ -177,7 +249,7 @@ async function replaceModArtifact(source: string, target: string, loader: Loader
   }
 }
 
-async function fetchCompatibleJavaRuntimeManifest(target: JavaRuntimeTargetType) {
+async function fetchCompatibleJavaRuntimeManifest(target: string) {
   const agent = new Agent({ connections: 4 })
   const dispatcher = agent.compose((dispatch) => (options, handler) => {
     const compatibleOptions = { ...options }
@@ -185,7 +257,7 @@ async function fetchCompatibleJavaRuntimeManifest(target: JavaRuntimeTargetType)
     return dispatch(compatibleOptions, handler)
   })
   try {
-    return await fetchJavaRuntimeManifest({ target, dispatcher })
+    return await fetchJavaRuntimeManifest({ target: target as JavaRuntimeTargetType, dispatcher })
   } finally {
     await dispatcher.close()
   }
@@ -196,22 +268,6 @@ function offlineUuid(username: string): string {
   bytes[6] = (bytes[6] & 0x0f) | 0x30
   bytes[8] = (bytes[8] & 0x3f) | 0x80
   return bytes.toString('hex')
-}
-
-function compareVersion(version: string, major: number, minor: number, patch = 0): number {
-  const parts = version.split('.').map((value) => Number.parseInt(value, 10) || 0)
-  const target = [major, minor, patch]
-  for (let index = 0; index < 3; index += 1) {
-    if ((parts[index] ?? 0) !== target[index]) return (parts[index] ?? 0) - target[index]
-  }
-  return 0
-}
-
-function javaTargetFor(version: string): JavaRuntimeTargetType {
-  if (compareVersion(version, 1, 20, 5) >= 0) return JavaRuntimeTargetType.Delta
-  if (compareVersion(version, 1, 18) >= 0) return JavaRuntimeTargetType.Gamma
-  if (compareVersion(version, 1, 17) >= 0) return JavaRuntimeTargetType.Alpha
-  return JavaRuntimeTargetType.Legacy
 }
 
 async function exists(target: string): Promise<boolean> {
@@ -275,8 +331,8 @@ async function readConfiguredLoaderVersion(project: ProjectInfo): Promise<string
 
 async function readConfiguredLoaderApiVersion(project: ProjectInfo): Promise<string | undefined> {
   const content = await fs.readFile(path.join(project.path, 'gradle.properties'), 'utf8').catch(() => '')
-  const property = project.loader === 'quilt' ? 'qfapi_version' : 'fabric_version'
-  const value = content.match(new RegExp(`^${property}\\s*=\\s*([^\\s#]+)\\s*$`, 'm'))?.[1]
+  const properties = project.loader === 'quilt' ? ['qfapi_version'] : ['fabric_api_version', 'fabric_version']
+  const value = properties.map((property) => content.match(new RegExp(`^${property}\\s*=\\s*([^\\s#]+)\\s*$`, 'm'))?.[1]).find(Boolean)
   return value && /^[0-9A-Za-z.+_-]+$/.test(value) ? value : undefined
 }
 
@@ -285,9 +341,11 @@ export class MinecraftRuntimeManager {
   private readonly onState: (state: MinecraftRuntimeState) => void
   private readonly onEvent: (event: MinecraftRuntimeEvent) => void
   private readonly authorizeBuild?: (project: ProjectInfo) => Promise<void>
+  private readonly getGradlePreference?: MinecraftRuntimeOptions['getGradlePreference']
   private process: ChildProcess | null = null
   private preparePromise: Promise<MinecraftRuntimeState> | null = null
   private buildPromise: Promise<MinecraftManagedMod> | null = null
+  private buildProcess: ChildProcess | null = null
   private verificationProcess: ChildProcess | null = null
   private lastProgressAt = 0
   private lastProgressStage: MinecraftRuntimeStage | '' = ''
@@ -305,6 +363,7 @@ export class MinecraftRuntimeManager {
     this.onState = options.onState
     this.onEvent = options.onEvent
     this.authorizeBuild = options.authorizeBuild
+    this.getGradlePreference = options.getGradlePreference
   }
 
   getState(): MinecraftRuntimeState {
@@ -534,6 +593,7 @@ export class MinecraftRuntimeManager {
   async stop(): Promise<MinecraftRuntimeState> {
     const active = this.process
     if (active && !active.killed) this.killProcessTree(active)
+    if (this.buildProcess && !this.buildProcess.killed) this.killProcessTree(this.buildProcess)
     if (this.verificationProcess && !this.verificationProcess.killed) this.killProcessTree(this.verificationProcess)
     const deadline = Date.now() + 5_000
     while (active && this.process === active && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100))
@@ -546,12 +606,64 @@ export class MinecraftRuntimeManager {
     else child.kill('SIGTERM')
   }
 
-  private async gradleRuntime(project: ProjectInfo): Promise<{ executable: string; javaHome: string }> {
+  private spawnGradle(
+    runtime: GradleRuntimeSelection,
+    project: ProjectInfo,
+    args: string[],
+    env: NodeJS.ProcessEnv
+  ): ChildProcessWithoutNullStreams {
+    if (process.platform === 'win32' && runtime.usesWrapper) {
+      return spawn(
+        path.join(runtime.javaHome, 'bin', 'java.exe'),
+        [
+          '-Dfile.encoding=UTF-8',
+          '-Xmx64m',
+          '-Xms64m',
+          '-Dorg.gradle.appname=gradlew',
+          '-jar',
+          path.join(project.path, 'gradle', 'wrapper', 'gradle-wrapper.jar'),
+          ...args
+        ],
+        { cwd: project.path, windowsHide: true, shell: false, env }
+      )
+    }
+    return spawn(runtime.executable, args, {
+      cwd: project.path,
+      windowsHide: true,
+      shell: process.platform === 'win32',
+      env
+    })
+  }
+
+  private async gradleRuntime(project: ProjectInfo, forceManaged = false): Promise<GradleRuntimeSelection> {
     const { javaPath } = await this.ensureJava(project)
+    const requiredVersion = gradleVersionFor(project)
+    const preference = await this.getGradlePreference?.().catch(() => ({
+      preferLocalGradle: false,
+      executable: undefined,
+      downloadSource: 'auto' as const
+    }))
+    const downloadSource = preference?.downloadSource ?? 'auto'
+    if (!forceManaged && preference?.preferLocalGradle) {
+      const local = await probeGradleExecutable(preference.executable)
+      if (local) {
+        if (local.version && local.version !== requiredVersion) {
+          this.emit('building-mod', `本机 Gradle ${local.version} 与模板推荐的 ${requiredVersion} 不同，按用户设置继续`, 'warning')
+        }
+        return { ...local, javaHome: path.dirname(path.dirname(javaPath)), usesWrapper: false, source: 'local' }
+      }
+      this.emit('building-mod', '未找到可用的本机 Gradle，已回退项目 Wrapper', 'warning')
+    }
     const wrapperPath = path.join(project.path, process.platform === 'win32' ? 'gradlew.bat' : 'gradlew')
+    if (!forceManaged && downloadSource === 'official' && await exists(wrapperPath)) {
+      return { executable: wrapperPath, javaHome: path.dirname(path.dirname(javaPath)), usesWrapper: true, source: 'wrapper' }
+    }
     return {
-      executable: await exists(wrapperPath) ? wrapperPath : await this.ensureGradle(gradleVersionFor(project)),
-      javaHome: path.dirname(path.dirname(javaPath))
+      executable: await this.ensureGradle(requiredVersion, downloadSource),
+      javaHome: path.dirname(path.dirname(javaPath)),
+      usesWrapper: false,
+      source: 'managed',
+      version: requiredVersion
     }
   }
 
@@ -565,9 +677,7 @@ export class MinecraftRuntimeManager {
       JAVA_HOME: runtime.javaHome,
       GRADLE_USER_HOME: path.join(app.getPath('userData'), 'gradle-runtime', 'cache')
     }
-    const taskList = spawn(runtime.executable, ['tasks', '--all', '--console=plain', '--no-daemon'], {
-      cwd: project.path, windowsHide: true, shell: process.platform === 'win32', env
-    })
+    const taskList = this.spawnGradle(runtime, project, ['tasks', '--all', '--console=plain', '--no-daemon'], env)
     let taskOutput = ''
     taskList.stdout.on('data', (chunk: Buffer) => { if (taskOutput.length < 2_000_000) taskOutput += chunk.toString('utf8') })
     taskList.stderr.on('data', (chunk: Buffer) => { if (taskOutput.length < 2_000_000) taskOutput += chunk.toString('utf8') })
@@ -586,9 +696,7 @@ export class MinecraftRuntimeManager {
     const logPath = path.join(logDirectory, `${task}-${Date.now()}.log`)
     const log = createWriteStream(logPath, { flags: 'w' })
     this.emit('testing-server', `正在执行 Gradle ${task}`)
-    const child = spawn(runtime.executable, [task, '--console=plain', '--no-daemon', '--stacktrace'], {
-      cwd: project.path, windowsHide: true, shell: process.platform === 'win32', env
-    })
+    const child = this.spawnGradle(runtime, project, [task, '--console=plain', '--no-daemon', '--stacktrace'], env)
     this.verificationProcess = child
     let output = ''
     let readyAt = 0
@@ -675,35 +783,32 @@ export class MinecraftRuntimeManager {
     return this.buildPromise
   }
 
-  private async buildProjectInternal(signal?: AbortSignal): Promise<MinecraftManagedMod> {
+  private async buildProjectInternal(signal?: AbortSignal, forceManaged = false): Promise<MinecraftManagedMod> {
     const project = this.requireProject()
     if (this.process && this.state.running) {
       throw new Error('Minecraft 测试实例正在运行。请先停止测试再构建，避免覆盖正在加载的项目 JAR。')
     }
     if (signal?.aborted) throw Object.assign(new Error('构建已取消'), { name: 'AbortError' })
     await this.authorizeBuild?.(project)
-    const { javaPath } = await this.ensureJava(project)
     const gradleVersion = gradleVersionFor(project)
-    const wrapperPath = path.join(project.path, process.platform === 'win32' ? 'gradlew.bat' : 'gradlew')
-    const usesWrapper = await exists(wrapperPath)
-    const gradlePath = usesWrapper ? wrapperPath : await this.ensureGradle(gradleVersion)
+    const runtime = await this.gradleRuntime(project, forceManaged)
+    const usesWrapper = runtime.usesWrapper
     const logDirectory = path.join(project.path, projectDataDirectory(project), 'builds')
     const logPath = path.join(logDirectory, 'minecraft-test-build.log')
     await fs.mkdir(logDirectory, { recursive: true })
     const log = createWriteStream(logPath, { flags: 'w' })
-    const javaHome = path.dirname(path.dirname(javaPath))
-    this.emit('building-mod', `正在使用${usesWrapper ? '项目 Gradle Wrapper' : ` Gradle ${gradleVersion}`}构建项目`)
+    const javaHome = runtime.javaHome
+    const gradleLabel = runtime.source === 'local'
+      ? `本机 Gradle${runtime.version ? ` ${runtime.version}` : ''}`
+      : usesWrapper ? '项目 Gradle Wrapper' : `Gradle ${gradleVersion}`
+    this.emit('building-mod', `正在使用 ${gradleLabel} 构建项目`)
 
-    const child = spawn(gradlePath, ['build', '--no-daemon', '--stacktrace'], {
-      cwd: project.path,
-      windowsHide: true,
-      shell: process.platform === 'win32',
-      env: {
-        ...process.env,
-        JAVA_HOME: javaHome,
-        GRADLE_USER_HOME: path.join(app.getPath('userData'), 'gradle-runtime', 'cache')
-      }
+    const child = this.spawnGradle(runtime, project, ['build', '--no-daemon', '--stacktrace'], {
+      ...process.env,
+      JAVA_HOME: javaHome,
+      GRADLE_USER_HOME: path.join(app.getPath('userData'), 'gradle-runtime', 'cache')
     })
+    this.buildProcess = child
     let aborted = false
     const abortBuild = (): void => {
       aborted = true
@@ -727,15 +832,21 @@ export class MinecraftRuntimeManager {
     }
     child.stdout.on('data', (chunk: Buffer) => capture(chunk, 'info'))
     child.stderr.on('data', (chunk: Buffer) => capture(chunk, 'warning'))
-    const exitCode = await new Promise<number>((resolve, reject) => {
-      child.once('error', reject)
+    const exitCode = await new Promise<number>((resolve) => {
+      child.once('error', () => resolve(1))
       child.once('exit', (code) => resolve(code ?? 1))
     })
+    this.buildProcess = null
     signal?.removeEventListener('abort', abortBuild)
     await new Promise<void>((resolve) => log.end(resolve))
     if (aborted) throw Object.assign(new Error('构建已取消'), { name: 'AbortError' })
     if (exitCode !== 0) {
       const fullLog = await fs.readFile(logPath, 'utf8').catch(() => recentLines.join('\n'))
+      if (!forceManaged && usesWrapper && isGradleWrapperBootstrapFailure(fullLog)) {
+        const reason = isGradleDistributionLockFailure(fullLog) ? 'Wrapper 分发缓存被占用' : '项目 Wrapper 下载失败'
+        this.emit('building-mod', `${reason}，正在使用 ModMind 的跨平台 Gradle 下载器重试`, 'warning')
+        return this.buildProjectInternal(signal, true)
+      }
       const detail = summarizeGradleFailure(fullLog)
       throw new Error(`Gradle 构建失败（退出代码 ${exitCode}）${detail ? `\n${detail}` : ''}\n完整日志：${logPath}`)
     }
@@ -799,8 +910,10 @@ export class MinecraftRuntimeManager {
 
   destroy(): void {
     if (this.process && !this.process.killed) this.process.kill()
+    if (this.buildProcess && !this.buildProcess.killed) this.killProcessTree(this.buildProcess)
     if (this.verificationProcess && !this.verificationProcess.killed) this.killProcessTree(this.verificationProcess)
     this.process = null
+    this.buildProcess = null
     this.verificationProcess = null
   }
 
@@ -946,8 +1059,8 @@ export class MinecraftRuntimeManager {
     return path.join(app.getPath('userData'), 'minecraft-runtime', 'java')
   }
 
-  private async ensureJava(project: ProjectInfo): Promise<{ target: JavaRuntimeTargetType; javaPath: string }> {
-    const target = javaTargetFor(project.minecraftVersion)
+  private async ensureJava(project: ProjectInfo): Promise<{ target: string; javaPath: string }> {
+    const target = javaRuntimeTargetForMinecraft(project.minecraftVersion)
     const javaHome = path.join(this.runtimeRoot(), target)
     const javaPath = path.join(javaHome, 'bin', process.platform === 'win32' ? 'java.exe' : 'java')
     if (!(await exists(javaPath))) {
@@ -1008,7 +1121,10 @@ export class MinecraftRuntimeManager {
     }
   }
 
-  private async ensureGradle(gradleVersion: string): Promise<string> {
+  private async ensureGradle(
+    gradleVersion: string,
+    preference: GradleDownloadSourcePreference = 'auto'
+  ): Promise<string> {
     const root = path.join(app.getPath('userData'), 'gradle-runtime')
     const home = path.join(root, `gradle-${gradleVersion}`)
     const executable = path.join(home, 'bin', process.platform === 'win32' ? 'gradle.bat' : 'gradle')
@@ -1016,47 +1132,87 @@ export class MinecraftRuntimeManager {
 
     await fs.mkdir(root, { recursive: true })
     const archive = path.join(root, `gradle-${gradleVersion}-bin.zip`)
-    const temporary = `${archive}.download`
-    this.emit('building-mod', `正在下载托管 Gradle ${gradleVersion}`)
+    const temporary = `${archive}.${process.pid}.download`
+    const staging = path.join(root, `.gradle-${gradleVersion}-${process.pid}.extracting`)
+    let expectedChecksum = gradleChecksumForVersion(gradleVersion)
+    if (!expectedChecksum) {
+      const checksumResponse = await fetch(`https://services.gradle.org/distributions/gradle-${gradleVersion}-bin.zip.sha256`, {
+        signal: AbortSignal.timeout(30_000)
+      })
+      if (!checksumResponse.ok) throw new Error(`Gradle 校验文件下载失败：HTTP ${checksumResponse.status}`)
+      expectedChecksum = (await checksumResponse.text()).trim().split(/\s+/)[0]?.toLowerCase()
+    }
+    if (!expectedChecksum || !/^[a-f0-9]{64}$/.test(expectedChecksum)) throw new Error('Gradle 官方校验值格式无效')
+
+    let sources = gradleDistributionSources(gradleVersion, preference)
+    if (preference === 'auto') {
+      this.emit('building-mod', '正在测速 Gradle 下载源')
+      const probes = await Promise.all(sources.map(async (source) => ({
+        source,
+        throughput: await probeGradleDistributionSource(source)
+      })))
+      sources = probes.sort((left, right) => right.throughput - left.throughput).map((probe) => probe.source)
+      const fastest = probes[0]
+      if (fastest?.throughput) {
+        this.emit('building-mod', `已选择${fastest.source.label}（测速 ${((fastest.throughput * 1000) / 1024 / 1024).toFixed(1)} MiB/s）`)
+      }
+    }
+    const attempts: GradleDistributionSource[] = preference === 'official'
+      ? [...sources, ...sources, ...sources]
+      : sources
+    const failures: string[] = []
     let downloadedGradle = false
-    for (let attempt = 1; attempt <= 3 && !downloadedGradle; attempt += 1) {
+    for (let index = 0; index < attempts.length && !downloadedGradle; index += 1) {
+      const source = attempts[index]
       try {
-        const response = await fetch(`https://services.gradle.org/distributions/gradle-${gradleVersion}-bin.zip`)
+        await fs.rm(temporary, { force: true })
+        this.emit('building-mod', `正在从${source.label}下载 Gradle ${gradleVersion}`)
+        const response = await fetch(source.url, {
+          signal: AbortSignal.timeout(5 * 60_000)
+        })
         if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`)
         const total = Number(response.headers.get('content-length')) || 0
         let downloaded = 0
         const progress = new Transform({
           transform: (chunk: Buffer, _encoding, callback) => {
             downloaded += chunk.length
-            this.emitProgress('building-mod', `正在下载 Gradle ${gradleVersion}`, downloaded, total)
+            this.emitProgress('building-mod', `${source.label} · Gradle ${gradleVersion}`, downloaded, total)
             callback(null, chunk)
           }
         })
         await pipeline(Readable.fromWeb(response.body as never), progress, createWriteStream(temporary))
+        const hasher = createHash('sha256')
+        await pipeline(createReadStream(temporary), hasher)
+        if (hasher.digest('hex') !== expectedChecksum) {
+          throw new Error('SHA-256 与模板固定校验值不一致')
+        }
         downloadedGradle = true
       } catch (error) {
         await fs.rm(temporary, { force: true })
         const reason = error instanceof Error ? error.message : String(error)
-        if (attempt === 3) throw new Error(`Gradle 下载失败，已重试 3 次：${reason}`)
-        this.emit('building-mod', `Gradle 下载中断，正在进行第 ${attempt + 1}/3 次尝试`, 'warning')
+        failures.push(`${source.label}: ${reason}`)
+        if (index + 1 < attempts.length) {
+          this.emit('building-mod', `${source.label}不可用，正在自动切换下载源`, 'warning')
+        }
       }
     }
-    const checksumResponse = await fetch(`https://services.gradle.org/distributions/gradle-${gradleVersion}-bin.zip.sha256`)
-    if (!checksumResponse.ok) throw new Error(`Gradle 校验文件下载失败：HTTP ${checksumResponse.status}`)
-    const expectedChecksum = (await checksumResponse.text()).trim().split(/\s+/)[0]?.toLowerCase()
-    if (!expectedChecksum || !/^[a-f0-9]{64}$/.test(expectedChecksum)) throw new Error('Gradle 官方校验值格式无效')
-    const hasher = createHash('sha256')
-    await pipeline(createReadStream(temporary), hasher)
-    const actualChecksum = hasher.digest('hex')
-    if (actualChecksum !== expectedChecksum) {
-      await fs.rm(temporary, { force: true })
-      throw new Error('Gradle 下载文件 SHA-256 校验失败')
-    }
+    if (!downloadedGradle) throw new Error(`Gradle 下载失败：${failures.join('；')}`)
+    await fs.rm(archive, { force: true })
     await fs.rename(temporary, archive)
     this.emit('building-mod', '正在解压 Gradle')
-    await extractZip(archive, { dir: root })
-    await fs.rm(archive, { force: true })
-    if (!(await exists(executable))) throw new Error('Gradle 解压完成，但未找到启动程序')
+    try {
+      await fs.rm(staging, { recursive: true, force: true })
+      await fs.mkdir(staging, { recursive: true })
+      await extractZip(archive, { dir: staging })
+      const stagedHome = path.join(staging, `gradle-${gradleVersion}`)
+      const stagedExecutable = path.join(stagedHome, 'bin', process.platform === 'win32' ? 'gradle.bat' : 'gradle')
+      if (!(await exists(stagedExecutable))) throw new Error('Gradle 解压完成，但未找到启动程序')
+      if (!(await exists(home))) await fs.rename(stagedHome, home)
+    } finally {
+      await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined)
+      await fs.rm(archive, { force: true }).catch(() => undefined)
+    }
+    if (!(await exists(executable))) throw new Error('Gradle 运行时安装未完成')
     return executable
   }
 

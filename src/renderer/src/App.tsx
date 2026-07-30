@@ -67,7 +67,7 @@ import type {
   SnapshotInfo
 } from '../../shared/types'
 import type { MappingClassDetail, MappingClassResult } from '../../shared/mappings'
-import type { MinecraftRuntimeEvent } from '../../shared/minecraft'
+import { appendMinecraftRuntimeEvent, type MinecraftRuntimeEvent } from '../../shared/minecraft'
 import BlockbenchWorkspace from './components/BlockbenchWorkspace'
 import GitWorkspace from './components/GitWorkspace'
 import MinecraftTestWorkspace from './components/MinecraftTestWorkspace'
@@ -130,6 +130,9 @@ const initialSettings: AiSettings = {
   agentMaxSteps: 0,
   maxBuilds: 0,
   allowBuildScriptChanges: true,
+  preferLocalGradle: false,
+  gradleExecutable: '',
+  gradleDownloadSource: 'auto',
   darkMode: false
 }
 
@@ -385,7 +388,7 @@ function ExistingImportPicker({ onClose, onSelect }: { onClose: () => void; onSe
   )
 }
 
-function InspirationWorkspace({ project, onSendToCoding }: { project: ProjectInfo; onSendToCoding: (prompt: string) => void }): React.JSX.Element {
+function InspirationWorkspace({ project, visible, onSendToCoding }: { project: ProjectInfo; visible: boolean; onSendToCoding: (prompt: string) => void }): React.JSX.Element {
   const [messages, setMessages] = useState<InspirationChatMessage[]>([])
   const [conversations, setConversations] = useState<InspirationConversation[]>([])
   const [activeConversationId, setActiveConversationId] = useState('')
@@ -464,7 +467,7 @@ function InspirationWorkspace({ project, onSendToCoding }: { project: ProjectInf
   }
 
   return (
-    <div className="inspiration-page">
+    <div className="inspiration-page" hidden={!visible}>
       <div className="content-toolbar">
         <div><h1>灵感台</h1><p>只读分析与创意讨论，不执行编程</p></div>
         <div className="inspiration-toolbar"><span className="inspiration-model-state"><Lightbulb size={15} />项目顾问</span><button className="secondary-button compact" type="button" onClick={startNewConversation}><Plus size={14} />新对话</button></div>
@@ -813,7 +816,7 @@ export default function App(): React.JSX.Element {
       if (event.kind === 'error') setAiOutputStatus('error')
     })
     const removeMinecraftListener = window.modmind.minecraft.onEvent((event) => {
-      setMinecraftEvents((current) => [...current, event].slice(-500))
+      setMinecraftEvents((current) => appendMinecraftRuntimeEvent(current, event, 500))
     })
     return () => {
       removeBuildListener()
@@ -1089,6 +1092,23 @@ export default function App(): React.JSX.Element {
       result.logs.unshift(`PASS  Gradle artifact: ${artifact.name}`)
       result.summary = result.success ? 'Gradle 构建成功，项目预检通过。' : result.summary
       setBuildResult(result)
+      if (!result.success) {
+        const detail = 'Gradle 已生成有效 JAR，但项目预检未通过；本次构建不标记为成功。'
+        setBuildError(detail)
+        setEvents((current) => [
+          {
+            id: `build-preflight-error-${Date.now()}`,
+            stage: 'error',
+            title: '项目构建未通过',
+            detail,
+            status: 'error',
+            time: new Date().toISOString()
+          },
+          ...current
+        ])
+        if (showBuildView) setView('build')
+        return { success: false, error: detail }
+      }
       setEvents((current) => [
         {
           id: `build-success-${Date.now()}`,
@@ -1208,6 +1228,15 @@ export default function App(): React.JSX.Element {
     const result = await performBuild(true)
     if (!result.success) {
       setNotice('项目构建失败，错误已保留在构建输出中')
+    }
+  }
+
+  const exportArtifact = async (): Promise<void> => {
+    try {
+      const target = await window.modmind.project.exportArtifact()
+      if (target) setNotice(`Mod JAR 已导出到 ${target}`)
+    } catch (error) {
+      setNotice(`导出失败：${errorMessage(error)}`)
     }
   }
 
@@ -1355,7 +1384,7 @@ export default function App(): React.JSX.Element {
     try {
       const saved = await window.modmind.settings.saveAi(settings)
       setSettings(saved)
-      setNotice('AI 配置已安全保存')
+      setNotice('设置已保存')
     } catch (error) {
       setNotice(`配置保存失败：${errorMessage(error)}`)
     }
@@ -1611,7 +1640,7 @@ export default function App(): React.JSX.Element {
               </>
             ) : null}
 
-            {view === 'inspiration' && project ? <InspirationWorkspace project={project} onSendToCoding={(codingPrompt) => { setPrompt(codingPrompt); setView('workspace'); setNotice('已发送到工作台，请确认后开始开发') }} /> : null}
+            {project ? <InspirationWorkspace key={project.path} project={project} visible={view === 'inspiration'} onSendToCoding={(codingPrompt) => { setPrompt(codingPrompt); setView('workspace'); setNotice('已发送到工作台，请确认后开始开发') }} /> : null}
 
             {view === 'blockbench' && project ? (
               <div className="blockbench-page">
@@ -1728,10 +1757,11 @@ export default function App(): React.JSX.Element {
 
             {view === 'build' && project ? (
               <div className="standard-page">
-                <div className="content-toolbar">
-                  <div><h1>构建与测试</h1><p>使用托管 Java 与 Gradle 生成可运行的 Mod JAR。</p></div>
-                  <div className="toolbar-actions">
-                    {buildError ? (
+                  <div className="content-toolbar">
+                    <div><h1>构建与测试</h1><p>使用托管 Java 与 Gradle 生成可运行的 Mod JAR。</p></div>
+                    <div className="toolbar-actions">
+                      <button className="secondary-button" disabled={building || planning || !buildResult?.success} onClick={() => void exportArtifact()}><Download size={16} />导出 Mod JAR</button>
+                      {buildError ? (
                       <button className="secondary-button" disabled={planning || building} onClick={() => void repairBuildWithAi()}>
                         {planning ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}AI 修复
                       </button>
@@ -1744,7 +1774,7 @@ export default function App(): React.JSX.Element {
                 <section className="build-status-band">
                   <div className={`build-state ${buildResult?.success ? 'success' : buildError || buildResult ? 'error' : ''}`}>
                     {building ? <LoaderCircle className="spin" size={22} /> : buildResult?.success ? <Check size={22} /> : buildError || buildResult ? <X size={22} /> : <Hammer size={22} />}
-                    <div><strong>{building ? minecraftEvents.at(-1)?.message || '正在准备构建环境' : buildError ? '构建失败' : buildResult?.summary || '等待运行'}</strong><span>{buildError ? '错误详情已保留在下方输出中' : buildResult?.reportPath || '尚未生成预检报告'}</span></div>
+                    <div><strong>{building ? minecraftEvents.at(-1)?.message || '正在准备构建环境' : buildError ? buildResult && !buildResult.success ? '构建未通过' : '构建失败' : buildResult?.summary || '等待运行'}</strong><span>{buildError ? '错误详情已保留在下方输出中' : buildResult?.reportPath || '尚未生成预检报告'}</span></div>
                   </div>
                   <div className="build-metrics"><span><strong>{buildResult?.logs.filter((line) => line.startsWith('PASS')).length ?? 0}</strong>通过</span><span><strong>{buildResult?.logs.filter((line) => line.startsWith('FAIL')).length ?? 0}</strong>失败</span></div>
                 </section>
@@ -1865,6 +1895,13 @@ export default function App(): React.JSX.Element {
                     </div>
                   </div>
                   <div className="settings-actions"><span><ShieldCheck size={15} />API Key 使用系统级加密存储</span><button className="primary-button" onClick={() => void saveSettings()}><Save size={16} />保存设置</button></div>
+                </section>
+                <section className="settings-section">
+                  <div className="settings-heading"><h2>构建工具</h2><p>新项目仍保留官方 Gradle Wrapper；开启后，构建优先使用你机器上的 Gradle。</p></div>
+                  <label className="field-label">Gradle 下载源<select value={settings.gradleDownloadSource} onChange={(event) => setSettings({ ...settings, gradleDownloadSource: event.target.value as AiSettings['gradleDownloadSource'] })}><option value="auto">自动择优（推荐）</option><option value="china">国内镜像优先</option><option value="official">仅官方源</option></select><small>自动模式会探测华为云、腾讯云和官方源，下载后仍按官方 SHA-256 校验。</small></label>
+                  <div className="appearance-row"><div><strong>优先使用本机 Gradle</strong><p>允许使用 PATH 或下方路径中的任意版本，版本兼容性由你自行确认。</p></div><button className={`toggle ${settings.preferLocalGradle ? 'on' : ''}`} type="button" role="switch" aria-checked={settings.preferLocalGradle} onClick={() => setSettings({ ...settings, preferLocalGradle: !settings.preferLocalGradle })}><span /></button></div>
+                  <label className="field-label">Gradle 可执行文件路径<input value={settings.gradleExecutable ?? ''} onChange={(event) => setSettings({ ...settings, gradleExecutable: event.target.value })} placeholder="留空则从 PATH 查找 gradle" /></label>
+                  <div className="settings-actions"><span>关闭开关时始终优先使用项目 Wrapper 或 ModMind 托管版本</span><button className="primary-button" onClick={() => void saveSettings()}><Save size={16} />保存设置</button></div>
                 </section>
                 <section className="settings-section">
                   <div className="settings-heading"><h2>外观</h2><p>调整 ModMind 的显示方式。</p></div>

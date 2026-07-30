@@ -12,6 +12,7 @@ export interface LoaderVersionOption {
   minecraftVersion: string
   loaderVersion: string
   apiVersion?: string
+  qslVersion?: string
   javaVersion: number
   channel: 'release' | 'beta'
   supportTier: LoaderSupportTier
@@ -27,7 +28,9 @@ export interface ProjectInfo {
   createdAt: string
   loaderVersion?: string
   apiVersion?: string
+  qslVersion?: string
   javaVersion?: number
+  projectVersion?: string
   toolDataDirectory?: '.modmind' | '.modtool'
 }
 
@@ -140,6 +143,9 @@ export interface AiSettings {
   agentMaxSteps: number
   maxBuilds: number
   allowBuildScriptChanges: boolean
+  preferLocalGradle: boolean
+  gradleExecutable?: string
+  gradleDownloadSource: 'auto' | 'china' | 'official'
   darkMode: boolean
 }
 
@@ -208,6 +214,7 @@ export interface ModMindApi {
     renamePath: (from: string, to: string) => Promise<ProjectFileMutationResult>
     deletePath: (relativePath: string) => Promise<void>
     reveal: (relativePath?: string) => Promise<void>
+    exportArtifact: () => Promise<string | null>
     prepareIde: () => Promise<string[]>
     openIde: () => Promise<void>
     captureIdea: (prompt: string) => Promise<void>
