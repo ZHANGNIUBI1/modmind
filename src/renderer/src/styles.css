@@ -1545,6 +1545,17 @@ button { color: inherit; }
 .agent-message-row time { height: 22px; margin-top: 4px; color: var(--agent-text-3); font-size: 11px; opacity: 0; transition: opacity .15s ease; }
 .agent-message-row.user time { text-align: right; }
 .agent-message-row:hover time { opacity: 1; }
+.agent-message-actions { display: flex; gap: 2px; margin-top: 4px; opacity: 0; transition: opacity .15s ease; }
+.agent-message-row:hover .agent-message-actions { opacity: 1; }
+.agent-message-actions button { display: inline-flex; align-items: center; justify-content: center; width: 22px; height: 22px; padding: 0; border: 0; border-radius: 4px; color: var(--agent-text-3); background: transparent; cursor: pointer; }
+.agent-message-actions button:hover { color: var(--agent-text-1); background: var(--agent-fill-2); }
+.agent-message-edit { display: flex; flex-direction: column; gap: 6px; width: 100%; }
+.agent-message-edit textarea { width: 100%; min-height: 60px; padding: 6px 8px; border: 1px solid var(--agent-fill-2); border-radius: 6px; background: var(--agent-fill-1); color: var(--agent-text-1); font: inherit; font-size: 14px; line-height: 1.5; resize: vertical; }
+.agent-message-edit textarea:focus { outline: none; border-color: var(--agent-primary); }
+.agent-message-edit-actions { display: flex; gap: 6px; }
+.agent-message-edit-confirm, .agent-message-edit-cancel { padding: 2px 10px; border: 0; border-radius: 4px; font-size: 12px; cursor: pointer; }
+.agent-message-edit-confirm { color: #fff; background: var(--agent-primary); }
+.agent-message-edit-cancel { color: var(--agent-text-2); background: var(--agent-fill-2); }
 .agent-markdown p { margin: 0 0 9px; }
 .agent-markdown p:last-child { margin-bottom: 0; }
 .agent-markdown ul, .agent-markdown ol { padding-left: 22px; }

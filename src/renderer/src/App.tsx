@@ -1508,6 +1508,19 @@ export default function App(): React.JSX.Element {
   const setAiTimeline = (value: SetStateAction<AiTimelineItem[]>): void => setWorkbenchValue('timeline', value)
   const setAiOutputStatus = (value: SetStateAction<WorkbenchUiState['outputStatus']>): void => setWorkbenchValue('outputStatus', value)
   const setAiRecovery = (value: SetStateAction<AiRecoveryInfo | null>): void => setWorkbenchValue('recovery', value)
+  const handleEditTimelineItem = (id: string, content: string): void => {
+    setAiTimeline((current) => current.map((item) => item.id === id ? { ...item, content } : item))
+  }
+  const handleDeleteTimelineItem = (id: string): void => {
+    setAiTimeline((current) => current.filter((item) => item.id !== id))
+  }
+  const handleRewindTimelineTo = (id: string): void => {
+    setAiTimeline((current) => {
+      const index = current.findIndex((item) => item.id === id)
+      if (index < 0) return current
+      return current.slice(0, index)
+    })
+  }
   const [events, setEvents] = useState<PipelineEvent[]>([])
   const [buildResult, setBuildResult] = useState<PreflightResult | null>(null)
   const [buildError, setBuildError] = useState('')
@@ -4641,6 +4654,9 @@ export default function App(): React.JSX.Element {
               onFastModeChange={(fastMode) => void saveBeginnerAiPreference({ fastMode })}
               placeholder={workspacePromptPlaceholder}
               humanizeActivity={humanizeActivity}
+              onEditTimelineItem={handleEditTimelineItem}
+              onDeleteTimelineItem={handleDeleteTimelineItem}
+              onRewindTimelineTo={handleRewindTimelineTo}
             /> : null}
 
             {[...new Map([...(project ? [project] : []), ...recentProjects].map((entry) => [normalizeProjectPath(entry.path), entry])).values()].map((inspirationProject) => (
