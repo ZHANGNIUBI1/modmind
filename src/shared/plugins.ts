@@ -58,6 +58,17 @@ export interface PluginManifest {
   panel?: {
     entry: string
   }
+  /** 跨页面悬浮界面；可在应用内停靠，也可弹出为透明桌面窗口。 */
+  overlay?: {
+    entry: string
+    mode?: 'floating' | 'pet'
+    width?: number
+    height?: number
+    minWidth?: number
+    minHeight?: number
+    resizable?: boolean
+    alwaysOnTop?: boolean
+  }
 }
 
 export type PluginScope = 'global' | 'project'
@@ -76,6 +87,35 @@ export interface PluginRecord {
 
 export interface PluginSnapshot {
   plugins: PluginRecord[]
+}
+
+export type PluginRuntimeStatus = 'idle' | 'starting' | 'running' | 'stopped' | 'failed'
+
+export type PluginLogSource = 'host' | 'backend' | 'panel' | 'overlay'
+
+export interface PluginLogEntry {
+  id: string
+  time: string
+  level: 'info' | 'warn' | 'error'
+  source: PluginLogSource
+  message: string
+}
+
+export interface PluginDiagnostics {
+  pluginId: string
+  status: PluginRuntimeStatus
+  pid?: number
+  startedAt?: string
+  exitCode?: number
+  error?: string
+  logs: PluginLogEntry[]
+}
+
+export interface PluginOverlayWindowState {
+  pluginId: string
+  open: boolean
+  alwaysOnTop: boolean
+  bounds?: { x: number; y: number; width: number; height: number }
 }
 
 export interface PluginToolDescriptor {
@@ -120,6 +160,7 @@ export interface PluginPanelHostInfo {
   pluginId: string
   panelVersion: number
   theme: 'light' | 'dark'
+  surface?: 'panel' | 'overlay'
   project?: {
     name: string
     path: string
@@ -279,8 +320,50 @@ export function validatePluginManifest(input: unknown): ManifestValidationResult
     }
   }
 
-  if (!backend && !panel) {
-    errors.push('插件必须声明 backend 或 panel 至少其一')
+  let overlay: PluginManifest['overlay']
+  if (raw.overlay !== undefined && raw.overlay !== null) {
+    if (typeof raw.overlay !== 'object' || Array.isArray(raw.overlay)) {
+      errors.push('overlay 必须是对象')
+    } else {
+      const rawOverlay = raw.overlay as Record<string, unknown>
+      const entry = validateRelativePath(rawOverlay.entry, 'overlay.entry', errors)
+      const mode = rawOverlay.mode === undefined || rawOverlay.mode === 'floating' || rawOverlay.mode === 'pet'
+        ? rawOverlay.mode as 'floating' | 'pet' | undefined
+        : undefined
+      if (rawOverlay.mode !== undefined && mode === undefined) errors.push('overlay.mode 必须是 floating 或 pet')
+
+      const dimension = (key: 'width' | 'height' | 'minWidth' | 'minHeight', minimum: number, maximum: number): number | undefined => {
+        const value = rawOverlay[key]
+        if (value === undefined) return undefined
+        if (!Number.isInteger(value) || (value as number) < minimum || (value as number) > maximum) {
+          errors.push(`overlay.${key} 必须是 ${minimum}-${maximum} 的整数`)
+          return undefined
+        }
+        return value as number
+      }
+      const width = dimension('width', 120, 1200)
+      const height = dimension('height', 100, 1000)
+      const minWidth = dimension('minWidth', 100, 1200)
+      const minHeight = dimension('minHeight', 80, 1000)
+      if (rawOverlay.resizable !== undefined && typeof rawOverlay.resizable !== 'boolean') errors.push('overlay.resizable 必须是布尔值')
+      if (rawOverlay.alwaysOnTop !== undefined && typeof rawOverlay.alwaysOnTop !== 'boolean') errors.push('overlay.alwaysOnTop 必须是布尔值')
+      if (entry) {
+        overlay = {
+          entry,
+          ...(mode ? { mode } : {}),
+          ...(width ? { width } : {}),
+          ...(height ? { height } : {}),
+          ...(minWidth ? { minWidth } : {}),
+          ...(minHeight ? { minHeight } : {}),
+          ...(typeof rawOverlay.resizable === 'boolean' ? { resizable: rawOverlay.resizable } : {}),
+          ...(typeof rawOverlay.alwaysOnTop === 'boolean' ? { alwaysOnTop: rawOverlay.alwaysOnTop } : {})
+        }
+      }
+    }
+  }
+
+  if (!backend && !panel && !overlay) {
+    errors.push('插件必须声明 backend、panel 或 overlay 至少其一')
   }
   if (backend && permissions.includes('clipboard.write')) {
     // 允许：后端也可写剪贴板
@@ -301,7 +384,8 @@ export function validatePluginManifest(input: unknown): ManifestValidationResult
       ...(icon ? { icon } : {}),
       permissions,
       ...(backend ? { backend } : {}),
-      ...(panel ? { panel } : {})
+      ...(panel ? { panel } : {}),
+      ...(overlay ? { overlay } : {})
     },
     errors: []
   }

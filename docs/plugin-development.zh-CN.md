@@ -1,6 +1,6 @@
 # ModMind 插件开发指南
 
-ModMind 插件是放在约定目录下的一组文件：一个 `plugin.json` 清单，加上可选的**侧边栏面板**（网页）与**后端工具**（Node 脚本）。面板让插件出现在侧边栏；后端工具会自动注册进 ModMind 内置的 MCP server，供 Codex / Claude Code 等外部 AI Agent 调用。
+ModMind 插件是放在约定目录下的一组文件：一个 `plugin.json` 清单，加上可选的**侧边栏面板**、**跨页面悬浮界面**与**后端工具**（Node 脚本）。面板和悬浮界面运行在沙箱网页中；后端工具会自动注册进 ModMind 内置的 MCP server，供 Codex / Claude Code 等外部 AI Agent 调用。
 
 ## 快速开始
 
@@ -8,6 +8,7 @@ ModMind 插件是放在约定目录下的一组文件：一个 `plugin.json` 清
    - `resources/plugin-templates/panel-only/` — 只要一个侧边栏网页面板
    - `resources/plugin-templates/tools-only/` — 只给 AI Agent 提供工具
    - `resources/plugin-templates/panel-and-tools/` — 两者都要
+   - `resources/plugin-templates/overlay-pet/` — 跨页面悬浮界面，可弹出到系统桌面
 2. 把模板目录复制到插件目录（见下），重命名 `plugin.json` 里的 `id`
 3. 保存任意文件，ModMind 自动重启后端并刷新已打开的面板；侧边栏立即出现你的插件
 4. 在「插件」管理页可以打包 `.zip` 分享给别人，对方确认完全信任后即可安装
@@ -45,11 +46,27 @@ ModMind 插件是放在约定目录下的一组文件：一个 `plugin.json` 清
   },
   "panel": {                      // 可选：侧边栏面板
     "entry": "panel/index.html"
+  },
+  "overlay": {                    // 可选：跨页面悬浮界面
+    "entry": "overlay/index.html",
+    "mode": "pet",               // floating 或 pet
+    "width": 220,
+    "height": 260,
+    "minWidth": 160,
+    "minHeight": 180,
+    "resizable": true,
+    "alwaysOnTop": true
   }
 }
 ```
 
-`backend` 与 `panel` 至少声明其一。
+`backend`、`panel` 与 `overlay` 至少声明其一。
+
+## 跨页面悬浮界面
+
+声明 `overlay` 后，插件界面会在 ModMind 主窗口内跨页面常驻。管理页或悬浮界面右上角的弹出按钮可把它转移到独立透明窗口；该窗口可以拖到 ModMind 外、跨显示器、调整大小和置顶。独立窗口的“收回”按钮会把界面重新停靠到主窗口。
+
+`mode: "floating"` 使用普通悬浮工具窗口外观；`mode: "pet"` 使用透明背景，并只在悬停时显示宿主控制条。插件页面仍处于 sandbox iframe，不能访问外层窗口或 Electron API。拖动、关闭、置顶与收回都由宿主控制。
 
 ## 信任与宿主桥能力
 
@@ -141,6 +158,8 @@ modmindPlugin.registerTools({
 
 ## 调试
 
+- 管理页每个插件都有开发者控制台。打开后会主动启动懒加载后端，并显示运行状态、PID、入口、权限、启动错误、退出码与最近 500 条日志。
+- 开发者控制台可以启动、重启后端和清空日志；`console.log/warn/error`、`ctx.log`、工具调用结果、未捕获异常、面板及悬浮界面的 `log` 消息都会进入同一日志流。
 - 管理页列出每个插件的加载错误（manifest 不合法、入口缺失等）
 - 面板 `log` 消息与后端 `ctx.log` 输出进入应用诊断输出；后端启动错误同时显示在管理页
 - 改动任何插件文件都会触发自动重载；宿主进程崩溃会懒重启

@@ -75,6 +75,7 @@ async function verifyEntries(manifest: PluginManifest, directory: string): Promi
   const targets: Array<[string | undefined, string]> = [
     [manifest.backend?.entry, 'backend.entry'],
     [manifest.panel?.entry, 'panel.entry'],
+    [manifest.overlay?.entry, 'overlay.entry'],
     [manifest.icon, 'icon']
   ]
   for (const [entry, field] of targets) {
@@ -266,7 +267,8 @@ export class PluginService {
       const files = [
         path.join(pluginDirectory, PLUGIN_MANIFEST_FILENAME),
         ...(record?.manifest.backend?.entry ? [path.join(pluginDirectory, record.manifest.backend.entry)] : []),
-        ...(record?.manifest.panel?.entry ? [path.join(pluginDirectory, record.manifest.panel.entry)] : [])
+        ...(record?.manifest.panel?.entry ? [path.join(pluginDirectory, record.manifest.panel.entry)] : []),
+        ...(record?.manifest.overlay?.entry ? [path.join(pluginDirectory, record.manifest.overlay.entry)] : [])
       ]
       const stats = await Promise.all(files.map(async (file) => {
         const stat = await fs.stat(file).catch(() => null)

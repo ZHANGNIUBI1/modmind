@@ -59,8 +59,8 @@ export function registerPluginProtocol(deps: PluginProtocolDeps): void {
         return new Response(`插件不存在或已停用：${pluginId}`, { status: 404 })
       }
       let relativePath = url.pathname.replace(/^\/+/, '')
-      if (!relativePath && record.manifest.panel) relativePath = record.manifest.panel.entry
-      if (!relativePath || (!record.manifest.panel && relativePath !== record.manifest.icon)) {
+      if (!relativePath) relativePath = record.manifest.panel?.entry ?? record.manifest.overlay?.entry ?? ''
+      if (!relativePath || (!record.manifest.panel && !record.manifest.overlay && relativePath !== record.manifest.icon)) {
         return new Response('插件没有可用面板资源', { status: 404 })
       }
 

@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>悬浮伙伴</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; background: transparent; }
+    body { display: grid; place-items: end center; padding: 36px 16px 12px; font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif; color: var(--mm-text, #303137); }
+    .pet { width: 150px; display: grid; justify-items: center; filter: drop-shadow(0 8px 12px rgba(0,0,0,.18)); }
+    .head { width: 112px; height: 96px; position: relative; border: 3px solid #303137; border-radius: 8px; background: #f4c542; }
+    .head::before, .head::after { content: ''; position: absolute; top: 34px; width: 12px; height: 15px; border-radius: 4px; background: #303137; }
+    .head::before { left: 24px; }
+    .head::after { right: 24px; }
+    .mouth { position: absolute; left: 50%; bottom: 20px; width: 28px; height: 9px; transform: translateX(-50%); border: solid #303137; border-width: 0 0 3px; border-radius: 50%; }
+    .body { width: 82px; height: 70px; margin-top: -2px; display: grid; place-items: center; border: 3px solid #303137; border-radius: 7px; background: #4c8ed9; color: #fff; font-size: 20px; font-weight: 700; }
+    .message { max-width: 190px; margin-bottom: 8px; padding: 6px 9px; border: 1px solid rgba(48,49,55,.2); border-radius: 7px; background: rgba(255,255,255,.92); font-size: 11px; text-align: center; opacity: 0; transform: translateY(4px); transition: opacity .15s ease, transform .15s ease; }
+    @media (hover: hover) and (pointer: fine) { body:hover .message { opacity: 1; transform: translateY(0); } }
+    @media (prefers-reduced-motion: reduce) { .message { transform: none; transition: opacity .15s ease; } }
+  </style>
+</head>
+<body>
+  <div>
+    <div class="message" id="message">我会一直留在这里</div>
+    <div class="pet" aria-label="ModMind 悬浮伙伴">
+      <div class="head"><span class="mouth"></span></div>
+      <div class="body">MM</div>
+    </div>
+  </div>
+  <script>
+    window.addEventListener('message', (event) => {
+      const info = event.data?.type === 'hostInfo' ? event.data.hostInfo : null
+      if (!info) return
+      const dark = info.theme === 'dark'
+      document.documentElement.style.setProperty('--mm-text', dark ? '#f0f1f3' : '#303137')
+      document.getElementById('message').textContent = info.surface === 'overlay' ? '可以把我弹到桌面' : '悬浮界面已连接'
+      window.parent.postMessage({ type: 'log', level: 'info', message: '悬浮伙伴已连接宿主' }, '*')
+    })
+    window.parent.postMessage({ type: 'ready' }, '*')
+  </script>
+</body>
+</html>

@@ -116,6 +116,12 @@ describe('PluginRuntime tool descriptors', () => {
     expect(child.callId).not.toBe('')
     expect(child.sent[0]).toMatchObject({ id: child.callId, kind: 'call', tool: 'list_things', input: { value: 1 } })
     expect(child.sent[1]).toMatchObject({ id: 'ctx-1', kind: 'ctx', ok: true })
+    expect(runtime.getDiagnostics('demo')).toMatchObject({ status: 'running' })
+    expect(runtime.getDiagnostics('demo').logs.map((entry) => entry.message)).toEqual(expect.arrayContaining([
+      '调用工具 list_things',
+      expect.stringContaining('工具 list_things 完成')
+    ]))
+    expect(runtime.clearDiagnostics('demo').logs).toEqual([])
     runtime.syncRecords(new Map([['demo', record({ revision: 1 })]]))
     expect(child.killed).toBe(true)
   })

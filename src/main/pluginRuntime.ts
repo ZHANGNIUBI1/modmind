@@ -5,6 +5,8 @@ import { UtilityProcess, utilityProcess } from 'electron'
 import {
   isReadOnlySafeTool,
   pluginMcpToolName,
+  type PluginDiagnostics,
+  type PluginLogSource,
   type PluginRecord,
   type PluginToolDescriptor
 } from '../shared/plugins'
@@ -26,6 +28,8 @@ export interface PluginRuntimeOptions {
   onRuntimeError?: (pluginId: string, error: string | null) => void
   /** 日志钩子（接入诊断体系）。 */
   log?: (level: 'info' | 'warn' | 'error', message: string, data?: unknown) => void
+  /** 插件运行状态或日志变化。 */
+  onDiagnostics?: (diagnostics: PluginDiagnostics) => void
 }
 
 interface HostProcess {
@@ -33,15 +37,19 @@ interface HostProcess {
   pending: Map<string, { resolve: (value: unknown) => void; reject: (error: Error) => void }>
   ready: Promise<void>
   crashed: boolean
+  stopping: boolean
 }
 
 const TOOL_CALL_TIMEOUT_MS = 30_000
 const MAX_FETCH_RESPONSE_BYTES = 2 * 1024 * 1024
+const MAX_DIAGNOSTIC_LOGS = 500
+const MAX_LOG_MESSAGE_LENGTH = 10_000
 
 export class PluginRuntime {
   private readonly options: PluginRuntimeOptions
   private readonly hosts = new Map<string, HostProcess>()
   private readonly storageWriteTails = new Map<string, Promise<void>>()
+  private readonly diagnostics = new Map<string, PluginDiagnostics>()
   private records: Map<string, PluginRecord> = new Map()
 
   constructor(options: PluginRuntimeOptions) {
@@ -52,6 +60,7 @@ export class PluginRuntime {
   syncRecords(records: Map<string, PluginRecord>): void {
     const previous = this.records
     this.records = new Map(records)
+    for (const pluginId of records.keys()) this.ensureDiagnostics(pluginId)
     // 卸载、禁用、报错或内容修订变化都会使旧宿主失效。
     for (const [pluginId] of this.hosts) {
       const record = records.get(pluginId)
@@ -60,6 +69,50 @@ export class PluginRuntime {
         this.terminate(pluginId)
       }
     }
+  }
+
+  getDiagnostics(pluginId: string): PluginDiagnostics {
+    const diagnostics = this.ensureDiagnostics(pluginId)
+    return { ...diagnostics, logs: [...diagnostics.logs] }
+  }
+
+  clearDiagnostics(pluginId: string): PluginDiagnostics {
+    const diagnostics = this.ensureDiagnostics(pluginId)
+    diagnostics.logs = []
+    this.emitDiagnostics(pluginId)
+    return this.getDiagnostics(pluginId)
+  }
+
+  recordLog(pluginId: string, source: PluginLogSource, level: 'info' | 'warn' | 'error', message: string): void {
+    const diagnostics = this.ensureDiagnostics(pluginId)
+    diagnostics.logs.push({
+      id: randomUUID(),
+      time: new Date().toISOString(),
+      source,
+      level,
+      message: String(message).slice(0, MAX_LOG_MESSAGE_LENGTH)
+    })
+    if (diagnostics.logs.length > MAX_DIAGNOSTIC_LOGS) diagnostics.logs.splice(0, diagnostics.logs.length - MAX_DIAGNOSTIC_LOGS)
+    this.options.log?.(level, `[${pluginId}] ${message}`)
+    this.emitDiagnostics(pluginId)
+  }
+
+  async activate(pluginId: string): Promise<PluginDiagnostics> {
+    const record = this.records.get(pluginId)
+    if (!record) throw new Error(`未找到插件：${pluginId}`)
+    if (!record.enabled || record.error) throw new Error(`插件不可用：${pluginId}`)
+    if (!record.manifest.backend) return this.getDiagnostics(pluginId)
+    if (record.runtimeError) {
+      delete record.runtimeError
+      this.options.onRuntimeError?.(pluginId, null)
+    }
+    await this.ensureHost(record)
+    return this.getDiagnostics(pluginId)
+  }
+
+  async restart(pluginId: string): Promise<PluginDiagnostics> {
+    this.terminate(pluginId)
+    return this.activate(pluginId)
   }
 
   listToolDescriptors(): PluginToolDescriptor[] {
@@ -99,18 +152,28 @@ export class PluginRuntime {
     const declaration = record.manifest.backend?.tools.find((tool) => tool.name === toolName)
     if (!declaration || !record.manifest.backend) throw new Error(`插件 ${pluginId} 未声明工具 ${toolName}`)
 
-    const host = await this.ensureHost(record)
-    return this.request(host, {
-      kind: 'call',
-      tool: toolName,
-      input: input ?? {}
-    }, TOOL_CALL_TIMEOUT_MS)
+    const startedAt = Date.now()
+    this.recordLog(pluginId, 'host', 'info', `调用工具 ${toolName}`)
+    try {
+      const host = await this.ensureHost(record)
+      const result = await this.request(host, {
+        kind: 'call',
+        tool: toolName,
+        input: input ?? {}
+      }, TOOL_CALL_TIMEOUT_MS)
+      this.recordLog(pluginId, 'host', 'info', `工具 ${toolName} 完成（${Date.now() - startedAt}ms）`)
+      return result
+    } catch (error) {
+      this.recordLog(pluginId, 'host', 'error', `工具 ${toolName} 失败：${error instanceof Error ? error.message : String(error)}`)
+      throw error
+    }
   }
 
   terminate(pluginId: string): void {
     const host = this.hosts.get(pluginId)
     if (!host) return
     this.hosts.delete(pluginId)
+    host.stopping = true
     try {
       host.child.kill()
     } catch {
@@ -118,6 +181,10 @@ export class PluginRuntime {
     }
     for (const [, entry] of host.pending) entry.reject(new Error('插件宿主已停止'))
     host.pending.clear()
+    const diagnostics = this.ensureDiagnostics(pluginId)
+    if (diagnostics.status !== 'failed') diagnostics.status = 'stopped'
+    diagnostics.pid = undefined
+    this.emitDiagnostics(pluginId)
   }
 
   terminateAll(): void {
@@ -142,7 +209,14 @@ export class PluginRuntime {
       storageDirectory
     }
 
-    const forkOptions = { serviceName: `modmind-plugin-${manifest.id}`, stdio: 'ignore' as const }
+    const diagnostics = this.ensureDiagnostics(manifest.id)
+    diagnostics.status = 'starting'
+    diagnostics.startedAt = new Date().toISOString()
+    diagnostics.exitCode = undefined
+    diagnostics.error = undefined
+    this.emitDiagnostics(manifest.id)
+
+    const forkOptions = { serviceName: `modmind-plugin-${manifest.id}`, stdio: ['ignore', 'pipe', 'pipe'] as Array<'ignore' | 'pipe'> }
     const child = this.options.forkHost
       ? this.options.forkHost(this.options.hostScriptPath, [entryPath, JSON.stringify(bootstrap)], forkOptions)
       : utilityProcess.fork(this.options.hostScriptPath, [entryPath, JSON.stringify(bootstrap)], forkOptions)
@@ -155,7 +229,7 @@ export class PluginRuntime {
       rejectReady = reject
     })
 
-    const host: HostProcess = { child, pending, ready, crashed: false }
+    const host: HostProcess = { child, pending, ready, crashed: false, stopping: false }
     let readySettled = false
 
     const failStartup = (error: Error): void => {
@@ -163,6 +237,9 @@ export class PluginRuntime {
       readySettled = true
       host.crashed = true
       rejectReady?.(error)
+      diagnostics.status = 'failed'
+      diagnostics.error = error.message
+      this.recordLog(manifest.id, 'host', 'error', error.message)
       this.options.onRuntimeError?.(manifest.id, error.message)
       try { child.kill() } catch { /* 进程可能已经退出 */ }
     }
@@ -179,6 +256,10 @@ export class PluginRuntime {
           return
         }
         readySettled = true
+        diagnostics.status = 'running'
+        diagnostics.pid = child.pid
+        diagnostics.error = undefined
+        this.recordLog(manifest.id, 'host', 'info', '插件后端已启动')
         this.options.onRuntimeError?.(manifest.id, null)
         resolveReady?.()
         return
@@ -188,7 +269,7 @@ export class PluginRuntime {
         return
       }
       if (data.kind === 'log') {
-        this.options.log?.(data.level ?? 'info', `[${manifest.id}] ${data.message ?? ''}`)
+        this.recordLog(manifest.id, 'backend', data.level ?? 'info', data.message ?? '')
         return
       }
       if (data.kind === 'ctx' && typeof data.id === 'string') {
@@ -209,8 +290,17 @@ export class PluginRuntime {
       }
     })
 
-    child.on('exit', () => {
+    child.on('spawn', () => {
+      diagnostics.pid = child.pid
+      this.emitDiagnostics(manifest.id)
+    })
+
+    this.captureOutput(manifest.id, child.stdout, 'info')
+    this.captureOutput(manifest.id, child.stderr, 'error')
+
+    child.on('exit', (code) => {
       host.crashed = true
+      const startupFailed = diagnostics.status === 'failed'
       if (!readySettled) {
         readySettled = true
         const error = new Error('插件宿主进程在就绪前退出')
@@ -219,6 +309,11 @@ export class PluginRuntime {
       }
       for (const [, entry] of host.pending) entry.reject(new Error('插件宿主进程已退出'))
       host.pending.clear()
+      diagnostics.pid = undefined
+      diagnostics.exitCode = code
+      diagnostics.status = startupFailed ? 'failed' : host.stopping || code === 0 ? 'stopped' : 'failed'
+      if (!host.stopping && code !== 0) diagnostics.error = `插件宿主进程退出，代码 ${code}`
+      this.recordLog(manifest.id, 'host', startupFailed || (!host.stopping && code !== 0) ? 'error' : 'info', startupFailed ? `启动失败后宿主退出（代码 ${code}）` : host.stopping ? '插件后端已停止' : `插件宿主进程已退出（代码 ${code}）`)
     })
 
     this.hosts.set(manifest.id, host)
@@ -358,6 +453,35 @@ export class PluginRuntime {
     } finally {
       if (this.storageWriteTails.get(pluginId) === current) this.storageWriteTails.delete(pluginId)
     }
+  }
+
+  private ensureDiagnostics(pluginId: string): PluginDiagnostics {
+    const existing = this.diagnostics.get(pluginId)
+    if (existing) return existing
+    const created: PluginDiagnostics = { pluginId, status: 'idle', logs: [] }
+    this.diagnostics.set(pluginId, created)
+    return created
+  }
+
+  private emitDiagnostics(pluginId: string): void {
+    this.options.onDiagnostics?.(this.getDiagnostics(pluginId))
+  }
+
+  private captureOutput(pluginId: string, stream: NodeJS.ReadableStream | null, level: 'info' | 'error'): void {
+    if (!stream) return
+    let buffered = ''
+    stream.on('data', (chunk: Buffer | string) => {
+      buffered += chunk.toString()
+      const lines = buffered.split(/\r?\n/)
+      buffered = lines.pop() ?? ''
+      for (const line of lines) {
+        if (line.trim()) this.recordLog(pluginId, 'backend', level, line)
+      }
+    })
+    stream.on('end', () => {
+      if (buffered.trim()) this.recordLog(pluginId, 'backend', level, buffered)
+      buffered = ''
+    })
   }
 
   private recordSignature(record: PluginRecord): string {

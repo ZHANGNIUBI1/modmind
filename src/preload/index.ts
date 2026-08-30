@@ -493,16 +493,35 @@ const api: ModMindApi = {
     reload: () => invoke('plugins:reload'),
     openDirectory: () => invoke('plugins:openDirectory'),
     invokeTool: (pluginId: string, toolName: string, input?: unknown) => invoke('plugins:invokeTool', pluginId, toolName, input),
+    activate: (pluginId: string) => invoke('plugins:activate', pluginId),
+    restart: (pluginId: string) => invoke('plugins:restart', pluginId),
+    diagnostics: (pluginId: string) => invoke('plugins:diagnostics', pluginId),
+    clearDiagnostics: (pluginId: string) => invoke('plugins:clearDiagnostics', pluginId),
+    recordLog: (pluginId: string, source: import('../shared/plugins').PluginLogSource, level: 'info' | 'warn' | 'error', message: string) => invoke('plugins:recordLog', pluginId, source, level, message),
     handleContextOp: (pluginId: string, op: string, args?: Record<string, unknown>) => invoke('plugins:handleContextOp', pluginId, op, args),
     getProjectInfo: (pluginId: string) => invoke('plugins:getProjectInfo', pluginId),
     copyToClipboard: (pluginId: string, text: string) => invoke('plugins:copyToClipboard', pluginId, text),
     export: (pluginId: string) => invoke('plugins:export', pluginId),
     exportDoc: (content: string) => invoke('plugins:exportDoc', content),
     delete: (pluginId: string) => invoke('plugins:delete', pluginId),
+    getOverlayWindows: () => invoke('plugins:getOverlayWindows'),
+    openOverlayWindow: (pluginId: string) => invoke('plugins:openOverlayWindow', pluginId),
+    closeOverlayWindow: (pluginId: string) => invoke('plugins:closeOverlayWindow', pluginId),
+    setOverlayAlwaysOnTop: (pluginId: string, alwaysOnTop: boolean) => invoke('plugins:setOverlayAlwaysOnTop', pluginId, alwaysOnTop),
     onChanged: (listener: (snapshot: import('../shared/plugins').PluginSnapshot) => void) => {
       const handler = (_event: Electron.IpcRendererEvent, snapshot: import('../shared/plugins').PluginSnapshot): void => listener(snapshot)
       ipcRenderer.on('plugins:changed', handler)
       return () => ipcRenderer.removeListener('plugins:changed', handler)
+    },
+    onDiagnosticsChanged: (listener: (diagnostics: import('../shared/plugins').PluginDiagnostics) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, diagnostics: import('../shared/plugins').PluginDiagnostics): void => listener(diagnostics)
+      ipcRenderer.on('plugins:diagnostics', handler)
+      return () => ipcRenderer.removeListener('plugins:diagnostics', handler)
+    },
+    onOverlayWindowsChanged: (listener: (states: import('../shared/plugins').PluginOverlayWindowState[]) => void) => {
+      const handler = (_event: Electron.IpcRendererEvent, states: import('../shared/plugins').PluginOverlayWindowState[]): void => listener(states)
+      ipcRenderer.on('plugins:overlayWindowsChanged', handler)
+      return () => ipcRenderer.removeListener('plugins:overlayWindowsChanged', handler)
     }
   }
 }

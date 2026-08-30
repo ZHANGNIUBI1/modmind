@@ -1,5 +1,5 @@
 import { app, net } from 'electron'
-import { createHash } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import type { ChildProcess, ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createReadStream, createWriteStream, promises as fs } from 'node:fs'
@@ -466,6 +466,15 @@ interface JavaProbeResult {
   major: number
 }
 
+async function isNonEmptyFile(filePath: string): Promise<boolean> {
+  try {
+    const stat = await fs.stat(filePath)
+    return stat.isFile() && stat.size > 0
+  } catch {
+    return false
+  }
+}
+
 async function probeJavaHome(home: string, minimumMajor: number, requireJavac: boolean, maximumMajor = Number.POSITIVE_INFINITY): Promise<JavaProbeResult | null> {
   let normalizedHome = home.trim().replace(/^"|"$/g, '')
   if (path.basename(normalizedHome).toLowerCase() === (process.platform === 'win32' ? 'java.exe' : 'java')) {
@@ -473,43 +482,53 @@ async function probeJavaHome(home: string, minimumMajor: number, requireJavac: b
   }
   if (!normalizedHome) return null
   const javaPath = path.join(normalizedHome, 'bin', process.platform === 'win32' ? 'java.exe' : 'java')
-  if (!(await exists(javaPath))) return null
-  const output = await new Promise<{code: number; text: string}>((resolve) => {
-    let text = ''
-    const child = spawn(javaPath, ['-version'], { cwd: normalizedHome, windowsHide: true, shell: false })
-    const finish = (code: number): void => resolve({ code, text: text.slice(-8_000) })
-    const timer = setTimeout(() => {
-      if (child.pid) {
-        if (process.platform === 'win32') spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, shell: false })
-        else child.kill('SIGTERM')
-      }
-      finish(124)
-    }, 10_000)
-    const capture = (chunk: Buffer): void => { text += chunk.toString('utf8') }
-    child.stdout.on('data', capture)
-    child.stderr.on('data', capture)
-    child.once('error', () => { clearTimeout(timer); finish(1) })
-    child.once('exit', (code) => { clearTimeout(timer); finish(code ?? 1) })
-  })
+  if (!(await isNonEmptyFile(javaPath))) return null
+  let output: {code: number; text: string}
+  try {
+    output = await new Promise<{code: number; text: string}>((resolve) => {
+      let text = ''
+      const child = spawn(javaPath, ['-version'], { cwd: normalizedHome, windowsHide: true, shell: false })
+      const finish = (code: number): void => resolve({ code, text: text.slice(-8_000) })
+      const timer = setTimeout(() => {
+        if (child.pid) {
+          if (process.platform === 'win32') spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, shell: false })
+          else child.kill('SIGTERM')
+        }
+        finish(124)
+      }, 10_000)
+      const capture = (chunk: Buffer): void => { text += chunk.toString('utf8') }
+      child.stdout.on('data', capture)
+      child.stderr.on('data', capture)
+      child.once('error', () => { clearTimeout(timer); finish(1) })
+      child.once('exit', (code) => { clearTimeout(timer); finish(code ?? 1) })
+    })
+  } catch {
+    return null
+  }
   if (output.code !== 0) return null
   const rawVersion = output.text.match(/version\s+["'](?:1\.)?(\d+)/i)?.[1]
   const major = rawVersion ? Number(rawVersion) : 0
   if (!major || major < minimumMajor || major > maximumMajor) return null
   if (!requireJavac) return { javaPath, major }
   const javacPath = path.join(normalizedHome, 'bin', process.platform === 'win32' ? 'javac.exe' : 'javac')
-  if (!(await exists(javacPath))) return null
-  const compiler = await new Promise<boolean>((resolve) => {
-    const child = spawn(javacPath, ['-version'], { cwd: normalizedHome, windowsHide: true, shell: false })
-    const timer = setTimeout(() => {
-      if (child.pid) {
-        if (process.platform === 'win32') spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, shell: false })
-        else child.kill('SIGTERM')
-      }
-      resolve(false)
-    }, 10_000)
-    child.once('error', () => { clearTimeout(timer); resolve(false) })
-    child.once('exit', (code) => { clearTimeout(timer); resolve(code === 0) })
-  })
+  if (!(await isNonEmptyFile(javacPath))) return null
+  let compiler = false
+  try {
+    compiler = await new Promise<boolean>((resolve) => {
+      const child = spawn(javacPath, ['-version'], { cwd: normalizedHome, windowsHide: true, shell: false })
+      const timer = setTimeout(() => {
+        if (child.pid) {
+          if (process.platform === 'win32') spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, shell: false })
+          else child.kill('SIGTERM')
+        }
+        resolve(false)
+      }, 10_000)
+      child.once('error', () => { clearTimeout(timer); resolve(false) })
+      child.once('exit', (code) => { clearTimeout(timer); resolve(code === 0) })
+    })
+  } catch {
+    return null
+  }
   return compiler ? { javaPath, major } : null
 }
 
@@ -642,7 +661,7 @@ export async function detectInstalledJavaHomes(): Promise<DetectedJavaHome[]> {
     const candidateKey = path.resolve(candidate).toLowerCase()
     if (queued.has(candidateKey)) continue
     queued.add(candidateKey)
-    const probed = await probeJavaHome(candidate, 8, false)
+    const probed = await probeJavaHome(candidate, 8, false).catch(() => null)
     if (!probed) continue
     const home = path.dirname(path.dirname(probed.javaPath))
     const homeKey = path.resolve(home).toLowerCase()
@@ -2164,18 +2183,29 @@ export class MinecraftRuntimeManager {
     const target = requestedTarget ?? javaRuntimeTargetForJavaVersion(minimumMajor)
     const javaHome = path.join(this.runtimeRoot(), target)
     const javaPath = managedJavaExecutable(this.runtimeRoot(), target)
-    if (!(await probeJavaHome(javaHome, minimumMajor, false))) {
-      await fs.rm(javaHome, { recursive: true, force: true })
+    if (!(await probeJavaHome(javaHome, minimumMajor, false).catch(() => null))) {
+      const stagingHome = `${javaHome}.staging-${randomUUID()}`
       this.emit('downloading-java', `正在下载托管 Java：${target}`)
       const manifest = await fetchCompatibleJavaRuntimeManifest(target)
-      await runMinecraftTaskWithRecovery({
-        signal,
-        createTask: () => installJavaRuntimeTask({ destination: javaHome, manifest }),
-        onUpdate: (task) => this.emitProgress('downloading-java', '正在下载 Java Runtime', task.progress, task.total, generation),
-        onRetry: (attempt, error) => this.emit('downloading-java', `${error.message}，正在重新下载 Java Runtime（${attempt}/3）`, 'warning')
-      })
+      await fs.rm(stagingHome, { recursive: true, force: true })
+      try {
+        await runMinecraftTaskWithRecovery({
+          signal,
+          createTask: () => installJavaRuntimeTask({ destination: stagingHome, manifest }),
+          onUpdate: (task) => this.emitProgress('downloading-java', '正在下载 Java Runtime', task.progress, task.total, generation),
+          onRetry: (attempt, error) => this.emit('downloading-java', `${error.message}，正在重新下载 Java Runtime（${attempt}/3）`, 'warning')
+        })
+        if (signal?.aborted) throw abortError()
+        if (!(await probeJavaHome(stagingHome, minimumMajor, false).catch(() => null))) {
+          throw new Error(`下载的托管 Java 验证失败：${managedJavaExecutable(path.dirname(stagingHome), path.basename(stagingHome))}`)
+        }
+        await fs.rm(javaHome, { recursive: true, force: true })
+        await fs.rename(stagingHome, javaHome)
+      } finally {
+        await fs.rm(stagingHome, { recursive: true, force: true }).catch(() => undefined)
+      }
     }
-    if (!(await probeJavaHome(javaHome, minimumMajor, false))) {
+    if (!(await probeJavaHome(javaHome, minimumMajor, false).catch(() => null))) {
       throw new Error(`托管 Java 安装后仍无法运行：${javaPath}。缓存可能损坏、架构不匹配或被安全软件拦截`)
     }
     return { target, javaPath }

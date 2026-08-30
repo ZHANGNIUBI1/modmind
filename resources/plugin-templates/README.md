@@ -1,12 +1,13 @@
 # ModMind 插件模板
 
-三个模板目录：
+四个模板目录：
 
 | 目录 | 形态 | 演示内容 |
 |---|---|---|
 | `panel-only/` | 仅侧边栏面板 | 沙箱 iframe、ready 握手、getProjectInfo、日志 |
 | `tools-only/` | 仅后端工具 | registerTools、storage 键值存储、MCP 注册 |
 | `panel-and-tools/` | 面板 + 后端工具 | 面板经宿主中转 invokeTool 调用本插件后端 |
+| `overlay-pet/` | 跨页面悬浮界面 | 应用内常驻、透明桌面窗口、主题与开发日志 |
 
 制作插件时，把对应模板复制为 `<id>/` 目录（id 用小写字母数字连字符），修改
 `plugin.json` 的 id/name/description，再按需编辑 panel 与 backend 代码。

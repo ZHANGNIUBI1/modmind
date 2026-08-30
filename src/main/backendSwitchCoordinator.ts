@@ -22,6 +22,7 @@ export class BackendSwitchCoordinator<T, M> {
   }
 
   accept(ticket: BackendSwitchTicket, currentValue: T, target: M): BackendSwitchTransition<T, M> | null {
+    if ((this.requestSequences.get(ticket.projectKey) ?? 0) > ticket.sequence) return null
     const active = this.transitions.get(ticket.projectKey)
     if (active && active.sequence > ticket.sequence) return null
     const transition: BackendSwitchTransition<T, M> = {
@@ -38,12 +39,27 @@ export class BackendSwitchCoordinator<T, M> {
     return this.transitions.get(projectKey)
   }
 
+  invalidatePending(projectKey: string): void {
+    this.requestSequences.set(projectKey, (this.requestSequences.get(projectKey) ?? 0) + 1)
+  }
+
+  isLatestRequest(ticket: BackendSwitchTicket): boolean {
+    return (this.requestSequences.get(ticket.projectKey) ?? 0) === ticket.sequence
+  }
+
   isCurrent(transition: BackendSwitchTransition<T, M>): boolean {
     return this.transitions.get(transition.projectKey) === transition
   }
 
   markReady(transition: BackendSwitchTransition<T, M>): boolean {
+    if (!this.isCurrent(transition)) return false
     transition.ready = true
-    return this.isCurrent(transition)
+    return true
+  }
+
+  fail(transition: BackendSwitchTransition<T, M>): boolean {
+    if (!this.isCurrent(transition)) return false
+    this.transitions.delete(transition.projectKey)
+    return true
   }
 }

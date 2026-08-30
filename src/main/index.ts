@@ -1,4 +1,4 @@
-import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, Notification, safeStorage, shell, Tray } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, Menu, nativeImage, Notification, safeStorage, screen, shell, Tray } from 'electron'
 import { electronApp, is, optimizer } from '@electron-toolkit/utils'
 import { promises as fs, readFileSync } from 'node:fs'
 import { AsyncLocalStorage } from 'node:async_hooks'
@@ -38,11 +38,13 @@ import { requireManagedRuntimePreparation } from './managedRuntimePreparation'
 import { isAddonPlatform, isJavaLoader, platformLabel, PROJECT_PLATFORMS } from '../shared/projectPlatform'
 import { normalizeProjectName, validateProjectNameInput } from '../shared/projectName'
 import { buildBedrockAddon, buildNeteaseArchive, createStoredZip } from './bedrockAddon'
-import { detectExternalAgent, detectExternalAgents, externalAgentDocsUrl, externalAgentLabel, externalAgentSupportsHostedConfiguration, installExternalAgent, launchExternalAgent, ModMindBridge, readExternalAgentHistory, refreshExternalAgentContext, runExternalAgent, type ExternalAgentAttemptAudit, type ExternalAgentBridgeHandlers, type ExternalAgentKind, type ExternalAgentRunOptions } from './externalAgents'
-import { createPluginBridgeTarget, getPluginService, getPluginRuntime, importPluginZipInteractive, initializePlugins, refreshPluginRegistry, registerPluginProtocolSchemeEarly, shutdownPlugins } from './pluginBridgeIntegration'
+import { detectExternalAgent, detectExternalAgents, externalAgentDocsUrl, externalAgentLabel, externalAgentSupportsHostedConfiguration, installExternalAgent, launchExternalAgent, ModMindBridge, readExternalAgentHistory, refreshExternalAgentContext, runExternalAgent, type ExternalAgentAttemptAudit, type ExternalAgentBridgeHandlers, type ExternalAgentKind, type ExternalAgentRetryState, type ExternalAgentRunOptions } from './externalAgents'
+import { createPluginBridgeTarget, getPluginService, getPluginRuntime, importPluginZipInteractive, initializePlugins, refreshPluginRegistry, registerPluginProtocolSchemeEarly, shutdownPlugins, waitForPluginRegistry } from './pluginBridgeIntegration'
+import type { PluginDiagnostics, PluginOverlayWindowState, PluginSnapshot } from '../shared/plugins'
 import { clearPreparedCodexCredentials, ensureManagedCodexRuntime, isManagedCodexVersion, managedCodexExecutablePath, prepareCodex, type CodexServerConfig, type CodexSetupProgress } from './codexSetup'
 import { ChatCompletionsAdapter } from './chatCompletionsAdapter'
 import { BackendSwitchCoordinator } from './backendSwitchCoordinator'
+import { awaitWithAbort, throwIfAborted, waitForCondition } from './asyncControl'
 import {
   activeQuotaModelPreferences,
   normalizeQuotaModelPreferences,
@@ -54,9 +56,11 @@ import {
 } from './quotaModelPreferences'
 import { GiteeBuildService } from './giteeBuildService'
 import { beginnerReasoningEffort } from '../shared/aiPreferences'
+import { inspirationReasoningEffort, selectInspirationModel } from '../shared/inspirationPerformance'
 import { isAiAbandonmentRequest, isAiContinuationRequest } from '../shared/aiPrompt'
 import { aiConversationIdForSession, aiRecoveryMatchesSessionScope, aiRecoverySessionScope, normalizeAiSessionScope } from '../shared/aiSession'
 import { describeAiFailureForUser } from '../shared/aiFailure'
+import { selectFinalAiAnswer } from '../shared/aiOutput'
 import { WorkbenchDataStore } from './workbenchDataStore'
 import {
   checkAppVersion,
@@ -97,6 +101,7 @@ import type {
   AiBackendSwitchResult,
   AiOutputEvent,
   AiCreateCodeOptions,
+  AiCancellationResult,
   AiProjectTaskState,
   AiRecoveryInfo,
   AiSurface,
@@ -199,6 +204,7 @@ let appUpdateService: AppUpdateService | null = null
 let currentProject: ProjectInfo | null = null
 const aiProjectContext = new AsyncLocalStorage<ProjectInfo>()
 const detachedWindows = new Map<DetachedWindowTarget, BrowserWindow>()
+const pluginOverlayWindows = new Map<string, BrowserWindow>()
 
 diagnosticJournal.configure(app.getPath('logs'), () => currentProject ? {
   name: currentProject.name,
@@ -676,6 +682,7 @@ let transientDeviceState: DeviceConnectionState | null = null
 const QUOTA_USAGE_MAX_AGE_MS = 2 * 60_000
 const QUOTA_MODEL_MAX_AGE_MS = 5 * 60_000
 const quotaModelAvailabilityCache = new Map<string, { checkedAt: number; models: string[] }>()
+const externalModelAvailabilityCache = new Map<string, { checkedAt: number; models: AiModelInfo[] }>()
 
 function quotaModelCacheKey(credentials: Pick<DeviceCredentials, 'baseUrl' | 'apiKey'>): string {
   return quotaPreferenceKey(credentials.baseUrl, credentials.apiKey)
@@ -1419,6 +1426,12 @@ async function remoteQuotaConfig(): Promise<RemoteQuotaConfig> {
   }
 }
 
+function broadcastPluginDiagnostics(diagnostics: PluginDiagnostics): void {
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('plugins:diagnostics', diagnostics)
+  }
+}
+
 function remoteEndpoint(): string | null {
   const configured = process.env.MODMIND_REMOTE_URL?.trim()
   if (configured) return configured
@@ -1541,7 +1554,8 @@ async function prepareManagedCodex(
   serverConfig: CodexServerConfig,
   configSource: 'device' | 'local-settings',
   existingExecutable?: string,
-  onProgress?: (progress: CodexSetupProgress) => void
+  onProgress?: (progress: CodexSetupProgress) => void,
+  signal?: AbortSignal
 ): ReturnType<typeof prepareCodex> {
   const home = managedCodexHome(project, sessionScope, serverConfig)
   const key = process.platform === 'win32' ? home.toLowerCase() : home
@@ -1583,7 +1597,8 @@ async function prepareManagedCodex(
     void preparation.then(release, release)
   }
   const activePreparation = managedCodexPreparations.get(key)!
-  return activePreparation.finally(() => {
+  const observedPreparation = signal ? awaitWithAbort(activePreparation, signal, 'Codex 准备已停止') : activePreparation
+  return observedPreparation.finally(() => {
     if (onProgress) listeners.delete(onProgress)
     if (!listeners.size && !managedCodexPreparations.has(key)) managedCodexPreparationListeners.delete(key)
   })
@@ -1593,7 +1608,8 @@ async function prepareConfiguredCodex(
   project: ProjectInfo,
   sessionScope: string,
   configuration: ExternalAgentConfiguration,
-  onProgress?: (progress: CodexSetupProgress) => void
+  onProgress?: (progress: CodexSetupProgress) => void,
+  signal?: AbortSignal
 ): ReturnType<typeof prepareCodex> {
   return prepareManagedCodex(
     project,
@@ -1601,12 +1617,16 @@ async function prepareConfiguredCodex(
     configuredCodexServerConfig(configuration),
     'local-settings',
     undefined,
-    onProgress
+    onProgress,
+    signal
   )
 }
 
-async function prepareQuotaCodex(project: ProjectInfo, sessionScope: string, onProgress?: (progress: CodexSetupProgress) => void): ReturnType<typeof prepareCodex> {
-  return prepareManagedCodex(project, sessionScope, await readBeginnerAgentServerConfig(), 'device', undefined, onProgress)
+async function prepareQuotaCodex(project: ProjectInfo, sessionScope: string, onProgress?: (progress: CodexSetupProgress) => void, signal?: AbortSignal, override?: CodexServerConfig): ReturnType<typeof prepareCodex> {
+  const serverConfig = override ?? (signal
+    ? await awaitWithAbort(readBeginnerAgentServerConfig(), signal, 'Codex 准备已停止')
+    : await readBeginnerAgentServerConfig())
+  return prepareManagedCodex(project, sessionScope, serverConfig, 'device', undefined, onProgress, signal)
 }
 
 function externalAgentEnvironment(kind: ExternalAgentKind, configuration: ExternalAgentConfiguration, codexHome?: string): NodeJS.ProcessEnv {
@@ -1804,6 +1824,115 @@ function loadDetachedRenderer(window: BrowserWindow, target: DetachedWindowTarge
   void window.loadFile(path.join(__dirname, '../renderer/index.html'), { query: { detached: '1', ...(target.startsWith('group:') ? { group: target.slice('group:'.length) } : { view: target }) } })
 }
 
+function pluginOverlayWindowState(pluginId: string): PluginOverlayWindowState {
+  const window = pluginOverlayWindows.get(pluginId)
+  if (!window || window.isDestroyed()) return { pluginId, open: false, alwaysOnTop: false }
+  return { pluginId, open: true, alwaysOnTop: window.isAlwaysOnTop(), bounds: window.getBounds() }
+}
+
+function pluginOverlayWindowStates(): PluginOverlayWindowState[] {
+  return [...pluginOverlayWindows.keys()].map(pluginOverlayWindowState).filter((state) => state.open)
+}
+
+function broadcastPluginOverlayWindows(): void {
+  const states = pluginOverlayWindowStates()
+  for (const window of BrowserWindow.getAllWindows()) {
+    if (!window.isDestroyed() && !window.webContents.isDestroyed()) window.webContents.send('plugins:overlayWindowsChanged', states)
+  }
+}
+
+function loadPluginOverlayRenderer(window: BrowserWindow, pluginId: string): void {
+  if (is.dev && process.env.ELECTRON_RENDERER_URL) {
+    const url = new URL(process.env.ELECTRON_RENDERER_URL)
+    url.searchParams.set('pluginOverlay', pluginId)
+    void window.loadURL(url.toString())
+    return
+  }
+  void window.loadFile(path.join(__dirname, '../renderer/index.html'), { query: { pluginOverlay: pluginId } })
+}
+
+function createPluginOverlayWindow(pluginId: string): BrowserWindow {
+  const existing = pluginOverlayWindows.get(pluginId)
+  if (existing && !existing.isDestroyed()) {
+    existing.show()
+    existing.focus()
+    return existing
+  }
+
+  const record = getPluginService()?.getEnabledPlugin(pluginId)
+  const overlay = record?.manifest.overlay
+  if (!record || !overlay) throw new Error(`插件 ${pluginId} 没有可用悬浮界面`)
+
+  const width = overlay.width ?? (overlay.mode === 'pet' ? 220 : 360)
+  const height = overlay.height ?? (overlay.mode === 'pet' ? 280 : 300)
+  const workArea = screen.getDisplayNearestPoint(screen.getCursorScreenPoint()).workArea
+  const window = new BrowserWindow({
+    x: workArea.x + Math.max(0, workArea.width - width - 24),
+    y: workArea.y + Math.max(0, workArea.height - height - 24),
+    width,
+    height,
+    minWidth: overlay.minWidth ?? 120,
+    minHeight: overlay.minHeight ?? 100,
+    show: false,
+    frame: false,
+    transparent: true,
+    backgroundColor: '#00000000',
+    resizable: overlay.resizable !== false,
+    maximizable: false,
+    minimizable: false,
+    fullscreenable: false,
+    skipTaskbar: true,
+    hasShadow: overlay.mode !== 'pet',
+    alwaysOnTop: overlay.alwaysOnTop === true,
+    title: record.manifest.name,
+    webPreferences: {
+      preload: path.join(__dirname, '../preload/index.js'),
+      sandbox: true,
+      contextIsolation: true,
+      nodeIntegration: false
+    }
+  })
+  pluginOverlayWindows.set(pluginId, window)
+  window.setMenuBarVisibility(false)
+  if (overlay.alwaysOnTop) window.setAlwaysOnTop(true, 'floating')
+  window.on('ready-to-show', () => {
+    window.show()
+    broadcastPluginOverlayWindows()
+  })
+  window.on('closed', () => {
+    if (pluginOverlayWindows.get(pluginId) === window) pluginOverlayWindows.delete(pluginId)
+    broadcastPluginOverlayWindows()
+  })
+  window.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) void shell.openExternal(url)
+    return { action: 'deny' }
+  })
+  window.webContents.on('will-navigate', (event, url) => {
+    if (url === window.webContents.getURL()) return
+    event.preventDefault()
+    if (/^https?:\/\//i.test(url)) void shell.openExternal(url)
+  })
+  window.webContents.on('render-process-gone', (_event, details) => {
+    getPluginRuntime()?.recordLog(pluginId, 'overlay', 'error', `悬浮窗口进程退出：${details.reason}`)
+  })
+  window.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    if (!isMainFrame || errorCode === -3) return
+    getPluginRuntime()?.recordLog(pluginId, 'overlay', 'error', `悬浮窗口加载失败：${errorDescription} (${validatedURL})`)
+  })
+  loadPluginOverlayRenderer(window, pluginId)
+  broadcastPluginOverlayWindows()
+  return window
+}
+
+function reconcilePluginOverlayWindows(snapshot: PluginSnapshot): void {
+  const available = new Set(snapshot.plugins
+    .filter((plugin) => plugin.enabled && !plugin.error && plugin.manifest.overlay)
+    .map((plugin) => plugin.manifest.id))
+  for (const [pluginId, window] of pluginOverlayWindows) {
+    if (!available.has(pluginId) && !window.isDestroyed()) window.close()
+  }
+}
+
 function createDetachedWindow(target: DetachedWindowTarget, rawTitle: string): BrowserWindow {
   const existing = detachedWindows.get(target)
   if (existing && !existing.isDestroyed()) {
@@ -1983,6 +2112,8 @@ function createWindow(): void {
   mainWindow.on('closed', () => {
     for (const window of detachedWindows.values()) window.close()
     detachedWindows.clear()
+    for (const window of pluginOverlayWindows.values()) window.close()
+    pluginOverlayWindows.clear()
     deviceAuthorizationController?.abort()
     deviceAuthorizationController = null
     void stopRemoteClient()
@@ -3377,6 +3508,54 @@ async function listAvailableAgentModels(kind: ExternalAgentKind, input: External
   return fetchAvailableModels(baseUrl, apiKey, 'Please enter a valid Base URL and API Key')
 }
 
+async function cachedAvailableAgentModels(kind: ExternalAgentKind, input: ExternalAgentConfiguration): Promise<AiModelInfo[]> {
+  const baseUrl = normalizeApiBaseUrl(input.baseUrl ?? '')
+  const apiKey = input.apiKey?.trim() ?? ''
+  const key = createHash('sha256').update(`${kind}\n${baseUrl}\n${apiKey}`).digest('hex').slice(0, 24)
+  const cached = externalModelAvailabilityCache.get(key)
+  if (cached && Date.now() - cached.checkedAt <= QUOTA_MODEL_MAX_AGE_MS) return cached.models
+  const models = await listAvailableAgentModels(kind, input)
+  externalModelAvailabilityCache.set(key, { checkedAt: Date.now(), models })
+  return models
+}
+
+async function inspirationQuotaConfig(question: string, signal: AbortSignal): Promise<CodexServerConfig> {
+  const credentials = await awaitWithAbort(readDeviceCredentials(), signal, '灵感模型选择已停止')
+  if (!credentials) throw new Error('请先连接 ModMind 账号')
+  const configured = await awaitWithAbort(readBeginnerAgentServerConfig(), signal, '灵感模型选择已停止')
+  let models: AiModelInfo[] = []
+  try {
+    models = await awaitWithAbort(quotaModelsForCredentials(credentials), signal, '灵感模型选择已停止')
+  } catch {
+    throwIfAborted(signal, '灵感模型选择已停止')
+  }
+  return {
+    ...configured,
+    model: selectInspirationModel(models, configured.model)
+  }
+}
+
+async function inspirationExternalConfiguration(
+  kind: ExternalAgentKind,
+  configured: ExternalAgentConfiguration,
+  question: string,
+  signal: AbortSignal
+): Promise<ExternalAgentConfiguration> {
+  const canScan = Boolean(configured.baseUrl?.trim() && configured.model?.trim() && configured.apiKey?.trim())
+  let models: AiModelInfo[] = []
+  if (canScan) {
+    try {
+      models = await awaitWithAbort(cachedAvailableAgentModels(kind, configured), signal, '灵感模型选择已停止')
+    } catch {
+      throwIfAborted(signal, '灵感模型选择已停止')
+    }
+  }
+  return {
+    ...configured,
+    ...(configured.model?.trim() ? { model: selectInspirationModel(models, configured.model) } : {})
+  }
+}
+
 async function listBeginnerModels(force = false): Promise<AiModelInfo[]> {
   const credentials = await readDeviceCredentials()
   if (!credentials) throw new Error('请先连接账号后扫描模型')
@@ -3879,7 +4058,10 @@ const aiAbortControllers = new Map<string | number, AbortController>()
 const aiCancelRequests = new Set<string | number>()
 const activeAiRuns = new Map<string, ActiveAiRun>()
 const aiBackendSwitchCoordinator = new BackendSwitchCoordinator<AgentSettings, { backend: AgentSettings['codingBackend']; switchId?: number }>()
+const activeAiBackendSwitches = new Map<string, { sequence: number; controller: AbortController }>()
 const REMOTE_SENDER_ID = -1
+const AI_CANCEL_CONFIRM_TIMEOUT_MS = 15_000
+const AI_BACKEND_START_TIMEOUT_MS = 2 * 60_000
 
 function aiRunId(senderId: number, projectPath: string, sessionId?: string): string {
   const normalizedPath = process.platform === 'win32' ? path.resolve(projectPath).toLowerCase() : path.resolve(projectPath)
@@ -3895,6 +4077,10 @@ function activeWorkspaceRun(projectPath: string): ActiveAiRun | undefined {
   return runsForProject(projectPath).find((run) => run.surface === 'workspace')
 }
 
+function aiProjectKey(projectPath: string): string {
+  return process.platform === 'win32' ? path.resolve(projectPath).toLowerCase() : path.resolve(projectPath)
+}
+
 function abortWorkspaceRuns(projectPath: string): void {
   for (const run of runsForProject(projectPath)) {
     if (run.surface !== 'workspace') continue
@@ -3904,11 +4090,8 @@ function abortWorkspaceRuns(projectPath: string): void {
 }
 
 async function waitForWorkspaceRunsToStop(projectPath: string, timeoutMs = 12_000): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (activeWorkspaceRun(projectPath)) {
-    if (Date.now() >= deadline) throw new Error('旧内核未能在超时前完全停止，已保留统一恢复点')
-    await new Promise((resolve) => setTimeout(resolve, 25))
-  }
+  const stopped = await waitForCondition(() => !activeWorkspaceRun(projectPath), timeoutMs)
+  if (!stopped) throw new Error('旧 Agent 未能在超时前完全停止，已保留统一恢复点')
 }
 
 async function assertBackendSwitchTargetReady(backend: AgentSettings['codingBackend'], settings: AgentSettings): Promise<void> {
@@ -4136,6 +4319,13 @@ interface ActiveAiTask {
   nativeSessions?: Partial<Record<AgentSettings['codingBackend'], string>>
   contextRevision?: number
   executionProfile?: AiExecutionProfile
+  lifecycle?: 'running' | 'waiting_retry' | 'repairing' | 'action_required' | 'paused'
+  recovery?: {
+    category: ExternalAgentRetryState['category'] | 'action-required' | 'cancelled'
+    attempt: number
+    message: string
+    nextAttemptAt?: string
+  }
   workflow?: AiWorkflowState
   state: {
     lastBuildSucceeded: boolean
@@ -5133,13 +5323,23 @@ async function getAiRecoveryInfo(projectPath?: string): Promise<AiRecoveryInfo> 
   const snapshot = await fs.readFile(manifestPath, 'utf8').then((value) => JSON.parse(value) as SnapshotManifest).catch(() => null)
   if (!snapshot || snapshot.taskId !== active.taskId) return { pending: false, snapshot: null }
   const conversationId = aiConversationIdForSession(active)
+  const interruptedWhileRunning = active.lifecycle === 'running'
+  const lifecycle = interruptedWhileRunning ? 'repairing' : active.lifecycle
+  const retry = active.recovery ?? (interruptedWhileRunning ? {
+    category: 'process' as const,
+    attempt: 0,
+    message: 'ModMind 在任务运行期间退出，正在从持久化检查点恢复',
+    nextAttemptAt: new Date().toISOString()
+  } : undefined)
   return {
     pending: true,
     snapshot,
     ...(active.sessionId ? { sessionId: active.sessionId } : {}),
     ...(conversationId ? { conversationId } : {}),
     ...(active.backend ? { backend: active.backend } : {}),
-    contextRevision: active.contextRevision ?? 0
+    contextRevision: active.contextRevision ?? 0,
+    ...(lifecycle ? { lifecycle } : {}),
+    ...(retry ? { retry } : {})
   }
 }
 
@@ -5352,6 +5552,8 @@ async function runExternalCodingAgent(
   lifecycle: { onBackendReady?: () => void } = {}
 ): Promise<CodingResult> {
   const project = requireProject()
+  const signal = taskSignal ?? new AbortController().signal
+  throwIfAborted(signal, 'Agent 任务已停止')
   const surface: AiSurface = context.surface === 'inspiration' ? 'inspiration' : 'workspace'
   const isInspiration = surface === 'inspiration'
   const recoveryBackend = recovery?.backend
@@ -5370,34 +5572,43 @@ async function runExternalCodingAgent(
   const usesQuota = backend === 'quota'
   const externalBackend: ExternalAgentKind = backend === 'quota' ? 'codex' : backend
   const agentLabel = externalAgentLabel(externalBackend)
-  const settings = await readSettings()
+  const settings = await awaitWithAbort(readSettings(), signal, 'Agent 任务已停止')
   const sendCodingProgress = (item: PipelineEvent): void => sendAiProgress(event, item, sessionId, project.path, context.runId)
-  let reviewerConfig = await getAiReviewerConfig(usesQuota, externalBackend, settings, project.path).catch(() => null)
+  const inspirationQuestion = context.inspirationQuestion?.trim() || prompt
+  const reasoningEffort = isInspiration ? inspirationReasoningEffort(inspirationQuestion) : undefined
+  const savedExternalConfiguration = settings.externalAgents?.[externalBackend] ?? {}
+  const runExternalConfiguration = isInspiration && !usesQuota
+    ? await inspirationExternalConfiguration(externalBackend, savedExternalConfiguration, inspirationQuestion, signal)
+    : savedExternalConfiguration
+  const quotaRunConfiguration = isInspiration && usesQuota
+    ? await inspirationQuotaConfig(inspirationQuestion, signal)
+    : undefined
+  let reviewerConfig = await awaitWithAbort(getAiReviewerConfig(usesQuota, externalBackend, settings, project.path).catch(() => null), signal, 'Agent 任务已停止')
   let reviewerUnavailableNotified = false
   let reviewerFallbackNotified = false
-  const signal = taskSignal ?? new AbortController().signal
   let codexSetup: Awaited<ReturnType<typeof prepareCodex>> | undefined
   if (usesQuota) {
-    await ensureQuotaAccountReady()
+    await awaitWithAbort(ensureQuotaAccountReady(), signal, 'Agent 任务已停止')
     codexSetup = await prepareQuotaCodex(project, sessionScope, (progress) => {
       sendCodingProgress(pipelineEvent('planning', progress.title, progress.detail, progress.status))
-    })
+    }, signal, quotaRunConfiguration)
   } else if (externalBackend === 'codex') {
-    const configured = settings.externalAgents?.codex ?? {}
+    const configured = runExternalConfiguration
     if (configured.apiKey?.trim() || configured.baseUrl?.trim() || configured.model?.trim()) {
       codexSetup = await prepareConfiguredCodex(project, sessionScope, configured, (progress) => {
         sendCodingProgress(pipelineEvent('planning', progress.title, progress.detail, progress.status))
-      })
+      }, signal)
     }
   }
+  throwIfAborted(signal, 'Agent 任务已停止')
   if (reviewerConfig?.reviewMode === 'codex-auto' && codexSetup?.environment) {
     reviewerConfig = { ...reviewerConfig, codexExecutable: codexSetup.executable, environment: codexSetup.environment }
   }
-  let configuredExecutable = codexSetup?.executable ?? settings.externalAgents?.[externalBackend]?.executable
+  let configuredExecutable = codexSetup?.executable ?? runExternalConfiguration.executable
   if (!configuredExecutable) {
-    const detected = await detectExternalAgent(externalBackend, externalBackend === 'codex'
+    const detected = await awaitWithAbort(detectExternalAgent(externalBackend, externalBackend === 'codex'
       ? {executables: [managedCodexExecutablePath(app.getPath('userData'))], includeDefaults: false}
-      : {})
+      : {}), signal, 'Agent 任务已停止')
     if (!detected?.installed) {
       throw new Error(`${agentLabel} CLI 未安装或不在 PATH 中`)
     }
@@ -5407,16 +5618,16 @@ async function runExternalCodingAgent(
   const snapshot = isInspiration
     ? { id: `inspiration-${randomUUID()}`, label: `${agentLabel}: inspiration`, createdAt: new Date().toISOString(), fileCount: 0 }
     : recovery?.snapshotId
-      ? await readSnapshotInfo(project, recovery.snapshotId)
-      : await createProjectSnapshot(`${agentLabel}: ${prompt.slice(0, 36)}`, { taskId })
+      ? await awaitWithAbort(readSnapshotInfo(project, recovery.snapshotId), signal, 'Agent 任务已停止')
+      : await awaitWithAbort(createProjectSnapshot(`${agentLabel}: ${prompt.slice(0, 36)}`, { taskId }), signal, 'Agent 任务已停止')
   if (!snapshot) {
     throw new Error('无法创建外部代理任务快照')
   }
   const before = isInspiration
     ? new Map<string, string>()
     : recovery
-    ? await managedCodingHashesAt(path.join(project.path, projectDataDirectory(project), 'snapshots', snapshot.id, 'files'))
-    : await managedCodingHashes(project)
+    ? await awaitWithAbort(managedCodingHashesAt(path.join(project.path, projectDataDirectory(project), 'snapshots', snapshot.id, 'files')), signal, 'Agent 任务已停止')
+    : await awaitWithAbort(managedCodingHashes(project), signal, 'Agent 任务已停止')
   let buildUsed = Boolean(recovery?.state.lastBuildSucceeded)
   let runtimeUsed = Boolean(recovery?.workflow?.completed.includes('runtime_test'))
   let buildCount = recovery?.state.buildCount ?? 0
@@ -5441,6 +5652,7 @@ async function runExternalCodingAgent(
     nativeSessions: { ...recovery?.nativeSessions, ...(nativeSessionId ? { [backend]: nativeSessionId } : {}) },
     contextRevision: (recovery?.contextRevision ?? 0) + (recovery ? 1 : 0),
     executionProfile,
+    lifecycle: 'running',
     workflow: recovery?.workflow ?? {
       required: isInspiration ? [] : requiredWorkflowStages(project, declaredIntent),
       completed: [],
@@ -5525,22 +5737,28 @@ async function runExternalCodingAgent(
     markWorkflowStage(workflow, stage, evidence)
     workflowWrite = workflowWrite.then(writeTask).catch(() => undefined)
   }
-  await writeTask()
+  await awaitWithAbort(writeTask(), signal, 'Agent 任务已停止')
   if (activeTask.state.todo?.length) {
     sendCodingProgress(pipelineEvent('planning', '恢复外部代理 Todo', `${activeTask.state.todo.length} 个任务已恢复`, 'running', activeTask.state.todo))
   }
   sendCodingProgress(pipelineEvent('planning', `${agentLabel} 正在接管任务`, '已创建快照并启动 ModMind MCP 桥', 'running'))
   try {
-    const managedExternalEnvironment = usesQuota
+    let managedExternalEnvironment = usesQuota
       ? codexSetup?.environment
-      : codexSetup?.environment ?? await externalAgentRunEnvironment(externalBackend, settings)
+      : codexSetup?.environment ?? await awaitWithAbort(externalAgentRunEnvironment(externalBackend, {
+          ...settings,
+          externalAgents: { ...settings.externalAgents, [externalBackend]: runExternalConfiguration }
+        }), signal, 'Agent 任务已停止')
     const providerIdentity = usesQuota
-      ? await readBeginnerAgentServerConfig().then((config) => `${config.baseUrl}\n${config.model}\n${codexSetup?.version ?? ''}\n${createHash('sha256').update(config.apiKey).digest('hex')}`)
-      : `${settings.externalAgents?.[externalBackend]?.baseUrl ?? 'local'}\n${settings.externalAgents?.[externalBackend]?.model ?? 'local'}\n${configuredExecutable ?? 'detected'}\n${createHash('sha256').update(settings.externalAgents?.[externalBackend]?.apiKey ?? '').digest('hex')}`
+      ? await awaitWithAbort(Promise.resolve(quotaRunConfiguration ?? readBeginnerAgentServerConfig()), signal, 'Agent 任务已停止').then((config) => `${config.baseUrl}\n${config.model}\n${codexSetup?.version ?? ''}\n${createHash('sha256').update(config.apiKey).digest('hex')}`)
+      : `${runExternalConfiguration.baseUrl ?? 'local'}\n${runExternalConfiguration.model ?? 'local'}\n${configuredExecutable ?? 'detected'}\n${createHash('sha256').update(runExternalConfiguration.apiKey ?? '').digest('hex')}`
     const providerFingerprint = createHash('sha256').update(`${externalBackend}\n${providerIdentity}`).digest('hex').slice(0, 24)
     const savedReviewFeedback = recovery?.state.reviewFeedback?.trim()
     const addonService = createAddonRelationshipService(() => project)
-    const addonContext = await addonService.describeForAi().catch(() => null)
+    const addonContext = isInspiration
+      ? null
+      : await awaitWithAbort(addonService.describeForAi().catch(() => null), signal, 'Agent 任务已停止')
+    throwIfAborted(signal, 'Agent 任务已停止')
     const unifiedHandoff = recovery && backendChanged
       ? `\n\nUNIFIED CONTEXT HANDOFF (revision ${activeTask.contextRevision ?? 0}). The user switched the execution backend from ${recoveryBackend} to ${backend}. This is the same conversation and the same task, not a new request.\nOriginal request: ${recovery.prompt}\nLast summary: ${recovery.state.summary || '(none)'}\nTodo: ${JSON.stringify(recovery.state.todo ?? [])}\nChanged files: ${JSON.stringify(recovery.changedFiles ?? [])}\nCompleted workflow stages: ${JSON.stringify(recovery.workflow?.completed ?? [])}\nTests: ${JSON.stringify(recovery.state.tests ?? [])}\nWarnings: ${JSON.stringify(recovery.state.warnings ?? [])}\nContinue from this unified state. Inspect current project files before editing and do not repeat completed work.`
       : ''
@@ -5561,7 +5779,7 @@ async function runExternalCodingAgent(
       workflowSourceDirectory: bundledCodexSkillsDirectory(),
       pluginTarget: createPluginBridgeTarget(),
       systemPrompt: isInspiration
-        ? '你处于灵感台只读模式。只读取项目和文档，回答用户问题，不得修改文件、安装依赖、构建、测试或调用任何写入工具。需要浏览目录时，优先调用 modmind_project_files 获取项目相对文件清单；不要使用 Get-ChildItem -Force、dir 或其它宽泛目录枚举命令。读取具体文件时使用明确的项目相对路径和只读读取命令。'
+        ? `你处于灵感台快速只读模式。优先直接回答；只有答案确实依赖当前实现时才读取项目。普通问题最多做 3 次目录发现或文件读取；只有用户明确要求深入分析、完整审计或逐文件检查时才可超过。不得修改文件、安装依赖、构建、测试或调用任何写入工具。需要浏览目录时，优先调用 modmind_project_files；不要使用 Get-ChildItem -Force、dir 或其它宽泛枚举。读取具体文件时使用明确的项目相对路径。本轮推理强度为 ${reasoningEffort ?? 'low'}。`
         : codingWorkflowPrompt(project),
       sessionScope,
       // A conversation owns its native CLI thread. Inspiration may resume
@@ -5569,10 +5787,17 @@ async function runExternalCodingAgent(
       resumeSession: context.resumeSession === true || (!isInspiration && Boolean(nativeSessionId)),
       ...(context.fallbackPrompt ? { fallbackPrompt: context.fallbackPrompt } : {}),
       readOnly: isInspiration,
+      ...(reasoningEffort ? { reasoningEffort } : {}),
       ...(nativeSessionId ? { sessionId: nativeSessionId } : {}),
       prompt: platformPrompt,
       signal: signal ?? new AbortController().signal,
-      onStarted: lifecycle.onBackendReady,
+      persistentRetry: true,
+      onStarted: () => {
+        activeTask.lifecycle = 'running'
+        delete activeTask.recovery
+        workflowWrite = workflowWrite.then(writeTask).catch(() => undefined)
+        lifecycle.onBackendReady?.()
+      },
       onSessionId: (externalSessionId) => {
         activeTask.sessionId = externalSessionId
         activeTask.nativeSessions = { ...activeTask.nativeSessions, [backend]: externalSessionId }
@@ -5581,6 +5806,17 @@ async function runExternalCodingAgent(
       onAttemptAudit: (audit) => writeAiAttemptAudit(audit, sessionId, project.path),
       retryScope: providerFingerprint,
       sessionFingerprint: providerFingerprint,
+      onRetryState: (state) => {
+        activeTask.lifecycle = state.phase === 'waiting' ? 'waiting_retry' : 'repairing'
+        activeTask.recovery = {
+          category: state.category,
+          attempt: state.attempt,
+          message: state.message.slice(0, 4_000),
+          nextAttemptAt: state.nextAttemptAt
+        }
+        workflowWrite = workflowWrite.then(writeTask).catch(() => undefined)
+        return workflowWrite
+      },
       onNativeDownload: (action, command) => {
         recordCoveredNativeDownload(action)
         if (action === 'runtime_download') {
@@ -6084,7 +6320,24 @@ async function runExternalCodingAgent(
       }
     }
     const baseExternalPrompt = platformPrompt
-    let result = await runExternalAgent(externalRunOptions)
+    const completedAnswer = (candidate: Awaited<ReturnType<typeof runExternalAgent>>): string => selectFinalAiAnswer(bufferedFinalResponse, candidate.summary, deliveredResponseContents)
+    const runUntilAnswer = async (): Promise<Awaited<ReturnType<typeof runExternalAgent>>> => {
+      const requestedRunPrompt = externalRunOptions.prompt
+      let missingAnswerAttempts = 0
+      while (true) {
+        const candidate = await runExternalAgent(externalRunOptions)
+        if (completedAnswer(candidate)) return candidate
+        missingAnswerAttempts += 1
+        const message = `${agentLabel} 本轮只返回了过程或重试状态，没有有效最终回答；正在继续同一会话（第 ${missingAnswerAttempts + 1} 次）`
+        sendCodingProgress(pipelineEvent('checking', '正在等待有效回答', message, 'warning'))
+        sendAiOutput(event, 'retry', message, sessionId, project.path, context.runId)
+        bufferedFinalResponse = undefined
+        deliveredResponseContents.clear()
+        externalRunOptions.prompt = `${requestedRunPrompt}\n\nThe previous attempt ended without a substantive user-facing final answer. Continue the same request and return the complete answer now. Do not return retry notices, internal reasoning, or process narration as the answer.`
+        await awaitWithAbort(new Promise((resolve) => setTimeout(resolve, 1_000)), signal, 'Agent 任务已停止')
+      }
+    }
+    let result = await runUntilAnswer()
     updateManagedDownloadAudit(workflow, project, prompt, activeTask.changedFiles, activeTask.state.managedDownloads ?? [], activeTask.state.managedDownloadFailures ?? [], activeTask.state.nativeCoveredDownloads ?? [])
     let finalWorkflowAudit = auditWorkflow(workflow, [], buildUsed, runtimeUsed, activeTask.state.todo)
     let reviewApproved = isInspiration
@@ -6128,7 +6381,7 @@ async function runExternalCodingAgent(
       sendAiOutput(event, 'retry', `审查 Agent 反馈：${feedback}`, sessionId, project.path, context.runId)
       externalRunOptions.prompt = `${baseExternalPrompt}\n\nREVIEW AGENT FEEDBACK: ${feedback}\nResolve only this feedback and the currently missing workflow stages. Preserve completed work; do not replay completed planning, implementation, build, or runtime stages.`
       bufferedFinalResponse = undefined
-      result = await runExternalAgent(externalRunOptions)
+      result = await runUntilAnswer()
     }
     const after = isInspiration ? before : await managedCodingHashes(project)
     const changedFiles = [...new Set([...before.keys(), ...after.keys()])].filter((file) => before.get(file) !== after.get(file))
@@ -6141,7 +6394,7 @@ async function runExternalCodingAgent(
     }
     const finalIntent = declaredIntent ?? (changedFiles.length ? 'engineering' : 'informational')
     activeTask.changedFiles = changedFiles
-    const finalResponse = (bufferedFinalResponse ?? result.summary).slice(-120_000)
+    const finalResponse = completedAnswer(result).slice(-120_000)
     const summary = finalResponse.slice(0, 4_000)
     const tests = [
       ...(buildUsed ? ['已使用 ModMind 托管构建'] : []),
@@ -6194,6 +6447,15 @@ async function runExternalCodingAgent(
   } catch (error) {
     await workflowWrite.catch(() => undefined)
     if (!isInspiration) {
+      const message = error instanceof Error ? error.message : String(error)
+      const cancelled = error instanceof Error && error.name === 'AbortError'
+      const actionRequired = /(?:401|402|403|API Key|凭证|额度|余额|权限|模型.*不存在|CLI 未安装)/i.test(message)
+      activeTask.lifecycle = cancelled ? 'paused' : actionRequired ? 'action_required' : 'paused'
+      activeTask.recovery = {
+        category: cancelled ? 'cancelled' : actionRequired ? 'action-required' : 'process',
+        attempt: activeTask.recovery?.attempt ?? 0,
+        message: message.slice(0, 4_000)
+      }
       const failedHashes = await managedCodingHashes(project).catch(() => null)
       if (failedHashes) {
         activeTask.changedFiles = [...new Set([...before.keys(), ...failedHashes.keys()])]
@@ -8108,21 +8370,41 @@ function registerIpc(): void {
     }
 
   })
-  ipcMain.handle('ai:cancelCode', async (event, sessionId?: string, projectPath?: string) => {
+  ipcMain.handle('ai:cancelCode', async (event, sessionId?: string, projectPath?: string): Promise<AiCancellationResult> => {
     const inspirationCancellation = Boolean(sessionId?.startsWith('inspiration-'))
+    const switchKey = !inspirationCancellation && projectPath ? aiProjectKey(projectPath) : undefined
+    const activeSwitch = switchKey ? activeAiBackendSwitches.get(switchKey) : undefined
+    if (switchKey) aiBackendSwitchCoordinator.invalidatePending(switchKey)
+    if (activeSwitch && !activeSwitch.controller.signal.aborted) {
+      activeSwitch.controller.abort(Object.assign(new Error('Agent 切换已由用户停止'), { name: 'AbortError' }))
+    }
     const matches = [...activeAiRuns.values()].filter((run) => {
-      if (run.senderId !== event.sender.id) return false
       if (projectPath && !sameProjectPath(run.projectPath, projectPath)) return false
-      if (sessionId && run.sessionId === sessionId) return true
-      if (inspirationCancellation) return false
-      return run.surface === 'workspace'
+      if (inspirationCancellation) return run.senderId === event.sender.id && run.sessionId === sessionId
+      if (run.surface !== 'workspace') return run.senderId === event.sender.id && Boolean(sessionId && run.sessionId === sessionId)
+      // A renderer reload changes sender.id while the project-owned process
+      // remains alive. An explicit project path therefore owns cancellation.
+      return Boolean(projectPath) || run.senderId === event.sender.id
     })
+    const runIds = matches.map((run) => run.id)
     for (const run of matches) {
       aiCancelRequests.add(run.id)
       aiAbortControllers.get(run.id)?.abort()
     }
+    const switchSharesRun = Boolean(activeSwitch && matches.some((run) => aiAbortControllers.get(run.id) === activeSwitch.controller))
+    const matched = runIds.length + (activeSwitch && !switchSharesRun ? 1 : 0)
+    if (!matched) return { status: 'idle', matched: 0, remaining: 0 }
+    const stopped = await waitForCondition(
+      () => runIds.every((runId) => !activeAiRuns.has(runId))
+        && (!activeSwitch || !switchKey || activeAiBackendSwitches.get(switchKey) !== activeSwitch),
+      AI_CANCEL_CONFIRM_TIMEOUT_MS
+    )
+    const remainingRuns = runIds.filter((runId) => activeAiRuns.has(runId)).length
+    const switchRemaining = Boolean(activeSwitch && switchKey && activeAiBackendSwitches.get(switchKey) === activeSwitch)
+    const remaining = remainingRuns + (switchRemaining && (!switchSharesRun || remainingRuns === 0) ? 1 : 0)
     // Cancellation preserves the checkpoint. A later natural-language
     // "继续" resumes only the missing stages and saved review feedback.
+    return { status: stopped ? 'stopped' : 'timed_out', matched, remaining }
   })
   ipcMain.handle('ai:clearQuotaCredentials', () => clearPreparedCodexCredentials())
   ipcMain.handle('ai:getRecovery', (_event, projectPath?: string) => getAiRecoveryInfo(projectPath))
@@ -8161,12 +8443,13 @@ function registerIpc(): void {
     if (!['quota', 'codex', 'claude'].includes(requestedBackend)) throw new Error('不支持的 AI 内核')
     const project = projectPath?.trim() ? await readProjectInfo(path.resolve(projectPath)) : requireProject()
     if (!project) throw new Error('项目不存在或无效')
-    const key = process.platform === 'win32' ? path.resolve(project.path).toLowerCase() : path.resolve(project.path)
+    const key = aiProjectKey(project.path)
     const ticket = aiBackendSwitchCoordinator.request(key)
     const previousSettings = await readSettings()
     try {
       await assertBackendSwitchTargetReady(requestedBackend, previousSettings)
     } catch (error) {
+      if (!aiBackendSwitchCoordinator.isLatestRequest(ticket)) return { status: 'superseded', backend: requestedBackend }
       const activeRun = activeWorkspaceRun(project.path)
       const activeSwitch = aiBackendSwitchCoordinator.current(key)
       const matchesActiveRun = Boolean(activeRun && activeSwitch?.target.backend === activeRun.backend)
@@ -8182,45 +8465,68 @@ function registerIpc(): void {
     const switchState = aiBackendSwitchCoordinator.accept(ticket, previousSettings, { backend: requestedBackend, ...(switchId !== undefined ? { switchId } : {}) })
     if (!switchState) return { status: 'superseded', backend: requestedBackend }
     const generation = switchState.sequence
-    abortWorkspaceRuns(project.path)
-    await waitForWorkspaceRunsToStop(project.path)
-    if (!aiBackendSwitchCoordinator.isCurrent(switchState)) return { status: 'superseded', backend: requestedBackend }
-    const recovery = await readActiveAiTask(project)
-    if (previousSettings.codingBackend !== requestedBackend) {
-      await saveAgentSettings({ ...previousSettings, codingBackend: requestedBackend })
-    }
-    if (!recovery) {
-      aiBackendSwitchCoordinator.markReady(switchState)
-      return { status: 'idle', backend: requestedBackend }
-    }
-    const scope = sessionScope?.trim() || recovery.sessionScope
-    const run: ActiveAiRun = {
-      id: aiRunId(event.sender.id, project.path, recovery.sessionId ?? `switch-${generation}`),
-      senderId: event.sender.id,
-      startedAt: recovery.startedAt,
-      sessionId: recovery.sessionId,
-      sessionScope: scope,
-      projectPath: project.path,
-      executionProfile: requestedBackend === 'quota' && recovery.executionProfile === 'beginner-unlimited' ? 'beginner-unlimited' : 'standard',
-      backend: requestedBackend,
-      surface: 'workspace'
-    }
-    const controller = new AbortController()
+    let recovery: ActiveAiTask | null = null
+    let run: ActiveAiRun | null = null
+    let startupTimer: ReturnType<typeof setTimeout> | undefined
+    let startupTimedOut = false
     let backendReady = false
+    const controller = new AbortController()
+    const previousSwitch = activeAiBackendSwitches.get(key)
+    if (previousSwitch && !previousSwitch.controller.signal.aborted) {
+      previousSwitch.controller.abort(Object.assign(new Error('Agent 切换已被后续选择取代'), { name: 'AbortError' }))
+    }
+    const activeSwitch = { sequence: switchState.sequence, controller }
+    activeAiBackendSwitches.set(key, activeSwitch)
+    startupTimer = setTimeout(() => {
+      if (backendReady || controller.signal.aborted) return
+      startupTimedOut = true
+      const timeout = new Error('目标 Agent 启动准备超时；当前任务恢复点已保留，可直接重试切换')
+      timeout.name = 'BackendStartupTimeoutError'
+      controller.abort(timeout)
+    }, AI_BACKEND_START_TIMEOUT_MS)
+    startupTimer.unref?.()
     try {
-      const result = await withAiRun(run, controller, () => runExternalCodingAgent(
+      abortWorkspaceRuns(project.path)
+      await awaitWithAbort(waitForWorkspaceRunsToStop(project.path), controller.signal, 'Agent 切换已停止')
+      if (!aiBackendSwitchCoordinator.isCurrent(switchState)) return { status: 'superseded', backend: requestedBackend }
+      recovery = await awaitWithAbort(readActiveAiTask(project), controller.signal, 'Agent 切换已停止')
+      if (previousSettings.codingBackend !== requestedBackend) {
+        await awaitWithAbort(saveAgentSettings({ ...previousSettings, codingBackend: requestedBackend }), controller.signal, 'Agent 切换已停止')
+      }
+      if (!recovery) {
+        if (!aiBackendSwitchCoordinator.markReady(switchState)) return { status: 'superseded', backend: requestedBackend }
+        return { status: 'idle', backend: requestedBackend }
+      }
+      const scope = sessionScope?.trim() || recovery.sessionScope
+      run = {
+        id: aiRunId(event.sender.id, project.path, recovery.sessionId ?? `switch-${generation}`),
+        senderId: event.sender.id,
+        startedAt: recovery.startedAt,
+        sessionId: recovery.sessionId,
+        sessionScope: scope,
+        projectPath: project.path,
+        executionProfile: requestedBackend === 'quota' && recovery.executionProfile === 'beginner-unlimited' ? 'beginner-unlimited' : 'standard',
+        backend: requestedBackend,
+        surface: 'workspace'
+      }
+      if (!aiBackendSwitchCoordinator.isCurrent(switchState)) return { status: 'superseded', backend: requestedBackend }
+      const activeRecovery = recovery
+      const activeRun = run
+      const result = await withAiRun(activeRun, controller, () => runExternalCodingAgent(
         event,
-        recovery.prompt,
-        recovery.sessionId,
+        activeRecovery.prompt,
+        activeRecovery.sessionId,
         requestedBackend,
-        run.executionProfile,
-        recovery,
-        { runId: run.id, surface: 'workspace', projectPath: project.path, sessionScope: scope, resumeSession: true, fallbackPrompt: recovery.prompt },
+        activeRun.executionProfile,
+        activeRecovery,
+        { runId: activeRun.id, surface: 'workspace', projectPath: project.path, sessionScope: scope, resumeSession: true, fallbackPrompt: activeRecovery.prompt },
         controller.signal,
         {
           onBackendReady: () => {
+            if (!aiBackendSwitchCoordinator.markReady(switchState)) return
             backendReady = true
-            if (!aiBackendSwitchCoordinator.markReady(switchState) || event.sender.isDestroyed()) return
+            if (startupTimer) clearTimeout(startupTimer)
+            if (event.sender.isDestroyed()) return
             event.sender.send('ai:backendReady', { backend: requestedBackend, projectPath: project.path, ...(switchId !== undefined ? { switchId } : {}) })
           }
         }
@@ -8228,14 +8534,23 @@ function registerIpc(): void {
       return { status: 'completed', backend: requestedBackend, result }
     } catch (error) {
       if (!backendReady && aiBackendSwitchCoordinator.isCurrent(switchState)) {
-        if (switchState.rollbackValue.codingBackend !== requestedBackend) await saveAgentSettings(switchState.rollbackValue).catch(() => undefined)
-        await writeActiveAiTask(recovery, project).catch(() => undefined)
+        if (switchState.rollbackValue.codingBackend !== requestedBackend) {
+          await awaitWithAbort(saveAgentSettings(switchState.rollbackValue), AbortSignal.timeout(10_000)).catch(() => undefined)
+        }
+        if (recovery) await awaitWithAbort(writeActiveAiTask(recovery, project), AbortSignal.timeout(10_000)).catch(() => undefined)
+        aiBackendSwitchCoordinator.fail(switchState)
       }
-      const message = describeAgentRunError(error)
-      const cancellation = error instanceof Error && error.name === 'AbortError'
-      const recoverable = cancellation || isRecoverableAgentRunError(error, message)
-      sendAiOutput(event, cancellation ? 'warning' : 'error', message, recovery.sessionId, project.path, run.id, { terminal: !recoverable, recoverable, backend: run.backend })
+      const effectiveError = startupTimedOut
+        ? Object.assign(new Error('目标 Agent 启动准备超时；当前任务恢复点已保留，可直接重试切换'), { name: 'BackendStartupTimeoutError' })
+        : error
+      const message = describeAgentRunError(effectiveError)
+      const cancellation = effectiveError instanceof Error && effectiveError.name === 'AbortError'
+      const recoverable = cancellation || isRecoverableAgentRunError(effectiveError, message)
+      if (recovery && run) sendAiOutput(event, cancellation ? 'warning' : 'error', message, recovery.sessionId, project.path, run.id, { terminal: !recoverable, recoverable, backend: run.backend })
       throw new Error(message)
+    } finally {
+      if (startupTimer) clearTimeout(startupTimer)
+      if (activeAiBackendSwitches.get(key) === activeSwitch) activeAiBackendSwitches.delete(key)
     }
   })
   ipcMain.handle('ai:restoreRecovery', () => restoreAiRecovery())
@@ -8244,6 +8559,7 @@ function registerIpc(): void {
   ipcMain.handle('plugins:list', async () => {
     const service = getPluginService()
     if (!service) return { plugins: [] }
+    await waitForPluginRegistry()
     return service.getSnapshot()
   })
   ipcMain.handle('plugins:setEnabled', (_event, pluginId: string, enabled: boolean) => {
@@ -8271,6 +8587,33 @@ function registerIpc(): void {
     const runtime = getPluginRuntime()
     if (!runtime) throw new Error('插件系统未初始化')
     return runtime.callTool(String(pluginId), String(toolName), input)
+  })
+  ipcMain.handle('plugins:activate', async (_event, pluginId: string) => {
+    const runtime = getPluginRuntime()
+    if (!runtime) throw new Error('插件系统未初始化')
+    return runtime.activate(String(pluginId))
+  })
+  ipcMain.handle('plugins:restart', async (_event, pluginId: string) => {
+    const runtime = getPluginRuntime()
+    if (!runtime) throw new Error('插件系统未初始化')
+    return runtime.restart(String(pluginId))
+  })
+  ipcMain.handle('plugins:diagnostics', (_event, pluginId: string) => {
+    const runtime = getPluginRuntime()
+    if (!runtime) throw new Error('插件系统未初始化')
+    return runtime.getDiagnostics(String(pluginId))
+  })
+  ipcMain.handle('plugins:clearDiagnostics', (_event, pluginId: string) => {
+    const runtime = getPluginRuntime()
+    if (!runtime) throw new Error('插件系统未初始化')
+    return runtime.clearDiagnostics(String(pluginId))
+  })
+  ipcMain.handle('plugins:recordLog', (_event, pluginId: string, source: unknown, level: unknown, message: unknown) => {
+    const runtime = getPluginRuntime()
+    if (!runtime) throw new Error('插件系统未初始化')
+    const normalizedSource = source === 'panel' || source === 'overlay' ? source : 'host'
+    const normalizedLevel = level === 'warn' || level === 'error' ? level : 'info'
+    runtime.recordLog(String(pluginId), normalizedSource, normalizedLevel, String(message ?? '').slice(0, 10_000))
   })
   ipcMain.handle('plugins:handleContextOp', async (_event, pluginId: string, op: string, args: Record<string, unknown>) => {
     const runtime = getPluginRuntime()
@@ -8305,6 +8648,26 @@ function registerIpc(): void {
     await service.deletePlugin(String(pluginId))
     await refreshPluginRegistry()
     return service.getSnapshot()
+  })
+  ipcMain.handle('plugins:getOverlayWindows', () => pluginOverlayWindowStates())
+  ipcMain.handle('plugins:openOverlayWindow', (_event, pluginId: string) => {
+    const normalizedId = String(pluginId)
+    createPluginOverlayWindow(normalizedId)
+    return pluginOverlayWindowState(normalizedId)
+  })
+  ipcMain.handle('plugins:closeOverlayWindow', (_event, pluginId: string) => {
+    const normalizedId = String(pluginId)
+    const window = pluginOverlayWindows.get(normalizedId)
+    if (window && !window.isDestroyed()) window.close()
+    return { pluginId: normalizedId, open: false, alwaysOnTop: false } satisfies PluginOverlayWindowState
+  })
+  ipcMain.handle('plugins:setOverlayAlwaysOnTop', (_event, pluginId: string, alwaysOnTop: unknown) => {
+    const normalizedId = String(pluginId)
+    const window = pluginOverlayWindows.get(normalizedId)
+    if (!window || window.isDestroyed()) throw new Error('悬浮窗口未打开')
+    window.setAlwaysOnTop(alwaysOnTop === true, 'floating')
+    broadcastPluginOverlayWindows()
+    return pluginOverlayWindowState(normalizedId)
   })
 }
 
@@ -8341,7 +8704,6 @@ app.whenReady().then(async () => {
   electronApp.setAppUserModelId('dev.modmind.desktop')
   app.on('browser-window-created', (_, window) => optimizer.watchWindowShortcuts(window))
   registerIpc()
-  createWindow()
   // 用户插件系统初始化（零插件时无副作用）
   initializePlugins({
     userDataDirectory: app.getPath('userData'),
@@ -8349,10 +8711,17 @@ app.whenReady().then(async () => {
     projectInfo: () => currentProject ? { name: currentProject.name, path: currentProject.path, kind: currentProject.kind ?? 'mod' } : null,
     onSnapshotChanged: (snapshot) => {
       getPluginRuntime()?.syncRecords(new Map(snapshot.plugins.map((record) => [record.manifest.id, record])))
+      reconcilePluginOverlayWindows(snapshot)
       broadcastPluginSnapshot(snapshot)
-    }
+    },
+    onDiagnosticsChanged: broadcastPluginDiagnostics
   })
-  void refreshPluginRegistry().catch(() => undefined)
+  const initialPluginRegistry = refreshPluginRegistry()
+  createWindow()
+  void initialPluginRegistry.then((snapshot) => {
+    reconcilePluginOverlayWindows(snapshot)
+    broadcastPluginSnapshot(snapshot)
+  }).catch(() => undefined)
   await loadMcpBridgePreference().catch(() => undefined)
   const bridgeRequest = mcpBridgeRequest()
   if (bridgeRequest.stop) {

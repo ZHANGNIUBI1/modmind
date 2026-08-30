@@ -137,6 +137,7 @@ import ImageStudioWorkspace from './components/ImageStudioWorkspace'
 import AgentWorkbench from './components/AgentWorkbench'
 import { PluginPanelHost } from './components/PluginPanelHost'
 import { PluginsManager } from './components/PluginsManager'
+import { PluginOverlayLayer } from './components/PluginOverlayLayer'
 import type { PluginSnapshot } from '../../shared/plugins'
 import { appendUserTurn, normalizeStoredWorkbenchTimeline, reduceWorkbenchOutput, reduceWorkbenchProgress, settleWorkbenchActivity, type WorkbenchTimelineItem } from './workbenchTimeline'
 import {
@@ -152,6 +153,9 @@ import {
   workbenchSessionScope,
   type WorkbenchConversation
 } from './workbenchConversations'
+import { boundInspirationMessages, normalizeStoredInspirationMessages, persistInspirationHistory, type InspirationConversation } from './inspirationStorage'
+import { isAiOperationalStatusText, isUsableAiAnswer } from '../../shared/aiOutput'
+import { buildInspirationRows, finalInspirationReply, inspirationConversationHandoff, settleInspirationCancellation, settleInspirationFailure, settleInspirationReply, shouldResumeInspirationSession } from './inspirationOutput'
 import appLogo from './assets/logo.png'
 
 const MonacoCodeEditor = lazy(() => import('./components/MonacoCodeEditor'))
@@ -206,8 +210,6 @@ function readSidebarDragPayload(dataTransfer: DataTransfer): SidebarDragPayload 
   }
 }
 
-type InspirationTimelineRow = { id: string; kind: 'tool-group'; items: InspirationChatMessage[] }
-
 function InspirationStepGroup({ items }: { items: InspirationChatMessage[] }): React.JSX.Element {
   const [expanded, setExpanded] = useState(items.some((item) => item.status === 'streaming'))
   useEffect(() => { if (items.some((item) => item.status === 'streaming')) setExpanded(true) }, [items])
@@ -226,7 +228,6 @@ function InspirationStepGroup({ items }: { items: InspirationChatMessage[] }): R
   </section>
 }
 
-type InspirationConversation = { id: string; title: string; updatedAt: string; messages: InspirationChatMessage[] }
 type AiTimelineItem = WorkbenchTimelineItem
 
 type WorkbenchUiState = {
@@ -1003,11 +1004,14 @@ function InspirationWorkspace({ project, visible, uiMode, deviceState, codingBac
   const [attachments, setAttachments] = useState<AiAttachment[]>([])
   const [busy, setBusy] = useState(false)
   const [thinkingSeconds, setThinkingSeconds] = useState(0)
+  const [persistenceWarning, setPersistenceWarning] = useState('')
   const sendTokenRef = useRef(0)
   const inspirationSessionRef = useRef('')
   const inspirationConversationRef = useRef('')
-  const responseContentRef = useRef('')
+  const finalAnswerSessionRef = useRef('')
+  const ignoredInspirationSessionRef = useRef('')
   const thinkingStartedAtRef = useRef<number | null>(null)
+  const cancellingInspirationRef = useRef(false)
   const endRef = useRef<HTMLDivElement | null>(null)
   const quickPrompts = [
     '分析当前项目结构，指出已经实现的内容、缺口和最值得优先处理的风险',
@@ -1017,13 +1021,12 @@ function InspirationWorkspace({ project, visible, uiMode, deviceState, codingBac
   ]
   const storageKey = `modmind-inspiration:${project.path}`
   const messages = conversations.find((conversation) => conversation.id === activeConversationId)?.messages ?? []
-  const inspirationTimeline = messages.filter((message) => message.kind === 'tool')
-  const inspirationRows: InspirationTimelineRow[] = inspirationTimeline.length ? [{ id: 'inspiration-steps', kind: 'tool-group', items: inspirationTimeline }] : []
+  const inspirationRows = buildInspirationRows(messages)
 
   const updateConversationMessages = (conversationId: string, updater: (messages: InspirationChatMessage[]) => InspirationChatMessage[]): void => {
     if (!conversationId) return
     setConversations((current) => current.map((conversation) => conversation.id === conversationId
-      ? { ...conversation, messages: updater(conversation.messages).slice(-100), updatedAt: new Date().toISOString() }
+      ? { ...conversation, messages: boundInspirationMessages(updater(conversation.messages)), updatedAt: new Date().toISOString() }
       : conversation))
   }
 
@@ -1032,61 +1035,87 @@ function InspirationWorkspace({ project, visible, uiMode, deviceState, codingBac
   }
 
   useEffect(() => {
-    if (!activeConversationId) return
     return window.modmind.ai.onOutput((event) => {
       if (event.projectPath && normalizeProjectPath(event.projectPath) !== normalizeProjectPath(project.path)) return
       if (event.sessionId !== inspirationSessionRef.current || !event.content.trim()) return
+      if (event.sessionId === ignoredInspirationSessionRef.current) return
+      const conversationId = inspirationConversationRef.current
+      const sessionId = event.sessionId
+      const step = (content: string, status: 'completed' | 'error' = 'completed'): InspirationChatMessage => ({
+        role: 'assistant', kind: 'tool', id: `inspiration-step-${Date.now()}-${crypto.randomUUID()}`,
+        content, time: new Date().toISOString(), status, isFinal: false, sessionId
+      })
+      const appendUniqueStep = (items: InspirationChatMessage[], item: InspirationChatMessage): InspirationChatMessage[] => {
+        const previous = items.at(-1)
+        return previous?.kind === 'tool' && previous.content.trim() === item.content.trim() ? items : [...items, item]
+      }
+      const demoteResponseAndAppendStep = (content: string, status: 'completed' | 'error' = 'completed'): void => {
+        updateConversationMessages(conversationId, (current) => {
+          const reverseIndex = [...current].reverse().findIndex((message) => message.role === 'assistant' && message.status === 'streaming' && message.sessionId === sessionId)
+          if (reverseIndex < 0) return appendUniqueStep(current, step(content, status))
+          const target = current.length - 1 - reverseIndex
+          const streaming = current[target]
+          let before = current.slice(0, target)
+          if (streaming.content.trim()) before = appendUniqueStep(before, step(streaming.content))
+          before = appendUniqueStep(before, step(content, status))
+          return [...before, { ...streaming, content: '' }, ...current.slice(target + 1)]
+        })
+      }
       if (event.kind === 'answer') {
-        responseContentRef.current = ''
-        updateConversationMessages(inspirationConversationRef.current, (current) => {
-          const hasStreaming = current.some((message) => message.role === 'assistant' && message.status === 'streaming')
-          return hasStreaming
-            ? current.map((message) => message.role === 'assistant' && message.status === 'streaming'
-              ? { ...message, content: event.content, status: 'completed', isFinal: true }
-              : message)
-            : [...current, { role: 'assistant', content: event.content, status: 'completed', isFinal: true }]
+        if (!isUsableAiAnswer(event.content)) {
+          demoteResponseAndAppendStep(event.content, 'error')
+          return
+        }
+        finalAnswerSessionRef.current = sessionId
+        updateConversationMessages(conversationId, (current) => {
+          if (current.some((message) => message.role === 'assistant' && message.sessionId === sessionId && message.isFinal && message.content.trim() === event.content.trim())) return current
+          const reverseIndex = [...current].reverse().findIndex((message) => message.role === 'assistant' && message.status === 'streaming' && message.sessionId === sessionId)
+          const completed: InspirationChatMessage = { role: 'assistant', content: event.content, status: 'completed', isFinal: true, sessionId, time: event.time }
+          if (reverseIndex < 0) return [...current, completed]
+          const target = current.length - 1 - reverseIndex
+          return current.map((message, index) => index === target ? completed : message)
         })
         return
       }
       if (event.kind === 'response') {
-        responseContentRef.current = event.content
-        updateConversationMessages(inspirationConversationRef.current, (current) => {
-          const index = [...current].reverse().findIndex((message) => message.role === 'assistant' && message.status === 'streaming')
-          if (index < 0) return current
-          const target = current.length - 1 - index
-          const existing = current[target]
-          if (existing.content === event.content) return current
-          return current.flatMap((message, messageIndex) => messageIndex === target
-            ? [
-                ...(message.content.trim() ? [{ ...message, status: 'completed' as const, isFinal: false }] : []),
-                { role: 'assistant' as const, content: event.content, status: 'streaming' as const, isFinal: false }
-              ]
-            : [message])
+        if (isAiOperationalStatusText(event.content)) {
+          demoteResponseAndAppendStep(event.content)
+          return
+        }
+        updateConversationMessages(conversationId, (current) => {
+          const reverseIndex = [...current].reverse().findIndex((message) => message.role === 'assistant' && message.status === 'streaming' && message.sessionId === sessionId)
+          if (reverseIndex < 0) return current
+          const target = current.length - 1 - reverseIndex
+          const streaming = current[target]
+          if (streaming.content === event.content) return current
+          let before = current.slice(0, target)
+          if (streaming.content.trim()) before = appendUniqueStep(before, step(streaming.content))
+          return [...before, { ...streaming, content: event.content }, ...current.slice(target + 1)]
         })
         return
       }
-      if (event.kind === 'retry' || event.kind === 'tool' || event.kind === 'warning') {
-        updateConversationMessages(inspirationConversationRef.current, (current) => {
-          const index = [...current].reverse().findIndex((message) => message.role === 'assistant' && message.status === 'streaming')
-          const target = index < 0 ? current.length : current.length - 1 - index
-          return [...current.slice(0, target), { role: 'assistant', kind: 'tool', id: `inspiration-step-${Date.now()}-${crypto.randomUUID()}`, content: event.content, time: new Date().toISOString(), status: 'completed', isFinal: false }, ...current.slice(target)]
-        })
+      if (event.kind === 'delta') {
+        updateConversationMessages(conversationId, (current) => current.map((message) => {
+          if (message.role !== 'assistant' || message.status !== 'streaming' || message.sessionId !== sessionId) return message
+          const content = !message.content || event.content.startsWith(message.content)
+            ? event.content
+            : message.content.endsWith(event.content) ? message.content : `${message.content}${event.content}`
+          return { ...message, content }
+        }))
+        return
+      }
+      if (event.kind === 'retry' || event.kind === 'tool' || event.kind === 'warning' || event.kind === 'error' || event.kind === 'start') {
+        demoteResponseAndAppendStep(event.content, event.kind === 'warning' || event.kind === 'error' ? 'error' : 'completed')
       }
     })
-  }, [activeConversationId, project.path])
+  }, [project.path])
 
   useEffect(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as { activeId?: string; conversations?: InspirationConversation[] } | null
       const valid = Array.isArray(saved?.conversations) ? saved.conversations
         .filter((entry) => entry && typeof entry.id === 'string' && Array.isArray(entry.messages))
-        .map((entry) => ({ ...entry, messages: dedupeInspirationMessages(entry.messages.map((message, index, allMessages) => {
-          if (message.role !== 'assistant' || message.isFinal !== undefined) return message
-          const nextUser = allMessages.findIndex((candidate, candidateIndex) => candidateIndex > index && candidate.role === 'user')
-          const nextAssistant = allMessages.findIndex((candidate, candidateIndex) => candidateIndex > index && candidate.role === 'assistant')
-          const isLastAssistantInTurn = nextAssistant < 0 || (nextUser >= 0 && nextAssistant > nextUser)
-          return { ...message, isFinal: isLastAssistantInTurn && message.status === 'completed' }
-        })) })) : []
+        .map((entry) => ({ ...entry, messages: dedupeInspirationMessages(normalizeStoredInspirationMessages(entry.messages)) })) : []
       const fallback: InspirationConversation = { id: `${Date.now()}`, title: '新对话', updatedAt: new Date().toISOString(), messages: [] }
       const list = valid.length ? valid : [fallback]
       const active = list.find((entry) => entry.id === saved?.activeId) ?? list[0]
@@ -1102,7 +1131,8 @@ function InspirationWorkspace({ project, visible, uiMode, deviceState, codingBac
 
   useEffect(() => {
     if (!hydrated || !activeConversationId) return
-    localStorage.setItem(storageKey, JSON.stringify({ activeId: activeConversationId, conversations }))
+    const result = persistInspirationHistory(window.localStorage, storageKey, { activeId: activeConversationId, conversations })
+    setPersistenceWarning(result.status === 'unavailable' ? '灵感历史暂时无法保存；当前对话仍可继续使用' : '')
   }, [conversations, activeConversationId, hydrated, storageKey])
 
   useEffect(() => {
@@ -1129,16 +1159,20 @@ function InspirationWorkspace({ project, visible, uiMode, deviceState, codingBac
       return
     }
     const conversationId = activeConversationId
+    const resumeSession = shouldResumeInspirationSession(messages)
+    const handoff = !resumeSession && messages.length ? inspirationConversationHandoff(messages) : ''
+    const inspirationPrompt = `Answer the user's latest inspiration question in Simplified Chinese. Default to a direct, concrete answer. Only inspect project files when the answer genuinely depends on current implementation details. Do not modify files.\n\n${handoff ? `RECENT CONVERSATION CONTEXT\n${handoff}\n\n` : ''}LATEST QUESTION\n${content}${attachmentContext}`
     const attachmentKeys = attachments.map((attachment) => `${attachment.path}:${attachment.size}`)
     const dedupeKey = aiPromptFingerprint(content, attachmentKeys)
     const sendToken = ++sendTokenRef.current
     const sessionId = `inspiration-${conversationId}-${Date.now()}-${sendToken}-${crypto.randomUUID()}`
     inspirationConversationRef.current = conversationId
     inspirationSessionRef.current = sessionId
-    responseContentRef.current = ''
+    finalAnswerSessionRef.current = ''
+    ignoredInspirationSessionRef.current = ''
     updateActiveMessages((current) => [...current,
       { role: 'user', content: `${content}${attachments.length ? `\n\n已附 ${attachments.length} 个文件` : ''}`, status: 'completed' },
-      { role: 'assistant', content: '', status: 'streaming', isFinal: false }
+      { role: 'assistant', content: '', status: 'streaming', isFinal: false, sessionId }
     ])
     updateConversationMessages(conversationId, (current) => current.map((message, index) => index === current.length - 2 ? { ...message, dedupeKey } : message))
     setDraft('')
@@ -1151,38 +1185,29 @@ function InspirationWorkspace({ project, visible, uiMode, deviceState, codingBac
         throw new Error('当前账号暂不可用，请前往网站查看账号状态后再继续')
       }
       const result = await window.modmind.ai.createCode(
-        `Use the project context and any useful workflows or tools to answer the user's latest inspiration question in Simplified Chinese with concrete suggestions grounded in the current mod. Do not modify files for this inspiration task.\n\nLATEST QUESTION\n${content}${attachmentContext}`,
+        inspirationPrompt,
         sessionId,
         selectedBackend,
         usesQuota ? 'beginner-unlimited' : 'standard',
-        { surface: 'inspiration', sessionScope: `inspiration/${conversationId}`, resumeSession: messages.length > 0, projectPath: project.path, fallbackPrompt: `Use the project context and any useful workflows or tools to answer the user's latest inspiration question in Simplified Chinese with concrete suggestions grounded in the current mod. Do not modify files for this inspiration task.\n\nLATEST QUESTION\n${content}${attachmentContext}` }
+        { surface: 'inspiration', sessionScope: `inspiration/${conversationId}`, resumeSession, inspirationQuestion: content, projectPath: project.path, fallbackPrompt: inspirationPrompt }
       )
       if (sendToken !== sendTokenRef.current) return
-      const reply = result.finalResponse ?? result.summary ?? responseContentRef.current
-      if (reply) {
-        responseContentRef.current = ''
-        updateConversationMessages(conversationId, (current) => current.map((message) => message.status === 'streaming' && message.role === 'assistant'
-          ? { ...message, content: reply, status: 'completed', isFinal: true }
-          : message))
-      } else {
-        updateConversationMessages(conversationId, (current) => current.map((message) => message.status === 'streaming' && message.role === 'assistant'
-          ? { ...message, content: '上游模型完成了请求，但没有返回可显示的回答。请重试或切换线路。', status: 'error', isFinal: true, time: new Date().toISOString() }
-          : message))
+      const reply = finalInspirationReply(result)
+      if (reply && finalAnswerSessionRef.current !== sessionId) {
+        finalAnswerSessionRef.current = sessionId
+        updateConversationMessages(conversationId, (current) => settleInspirationReply(current, sessionId, reply, ''))
+      } else if (!reply && finalAnswerSessionRef.current !== sessionId) {
+        updateConversationMessages(conversationId, (current) => settleInspirationReply(current, sessionId, '', '上游模型完成了请求，但没有返回可显示的回答。灵感台没有把状态信息当作答案，请重试。'))
       }
       setAttachments([])
     } catch (error) {
       if (sendToken !== sendTokenRef.current) return
       const failure = aiFailureMessage(error)
-      responseContentRef.current = ''
-      updateConversationMessages(conversationId, (current) => current.flatMap((message) => {
-        if (message.role !== 'assistant' || message.status !== 'streaming') return [message]
-        if (!message.content.trim()) return [{ ...message, content: failure, status: 'error' as const, isFinal: true, time: new Date().toISOString() }]
-        return [
-          { ...message, status: 'completed' as const, isFinal: true, time: new Date().toISOString() },
-          { role: 'assistant' as const, content: failure, status: 'error' as const, isFinal: true, time: new Date().toISOString() }
-        ]
-      }))
+      updateConversationMessages(conversationId, (current) => settleInspirationFailure(current, sessionId, failure))
     } finally {
+      if (sendToken !== sendTokenRef.current) {
+        updateConversationMessages(conversationId, (current) => settleInspirationCancellation(current, sessionId))
+      }
       setBusy(false)
       thinkingStartedAtRef.current = null
       onBusyChange(false)
@@ -1190,15 +1215,34 @@ function InspirationWorkspace({ project, visible, uiMode, deviceState, codingBac
   }
 
   const cancelInspiration = (): void => {
+    if (cancellingInspirationRef.current) return
     const conversationId = inspirationConversationRef.current
+    const sessionId = inspirationSessionRef.current
     sendTokenRef.current += 1
-    updateConversationMessages(conversationId, (current) => current.map((message) => message.status === 'streaming'
-      ? { ...message, content: message.content || '请求已暂停', status: 'cancelled' }
+    ignoredInspirationSessionRef.current = sessionId
+    updateConversationMessages(conversationId, (current) => current.map((message) => message.status === 'streaming' && message.sessionId === sessionId
+      ? { ...message, content: message.content || '正在停止任务…' }
       : message))
-    setBusy(false)
-    thinkingStartedAtRef.current = null
-    onBusyChange(false)
-    void window.modmind.ai.cancelCode(inspirationSessionRef.current || undefined, project.path)
+    cancellingInspirationRef.current = true
+    void window.modmind.ai.cancelCode(sessionId || undefined, project.path)
+      .then((result) => {
+        if (result.status === 'timed_out') {
+          updateConversationMessages(conversationId, (current) => current.map((message) => message.status === 'streaming' && message.sessionId === sessionId
+            ? { ...message, content: message.content || 'Agent 进程尚未完全退出，可再次停止' }
+            : message))
+          return
+        }
+        updateConversationMessages(conversationId, (current) => settleInspirationCancellation(current, sessionId))
+        setBusy(false)
+        thinkingStartedAtRef.current = null
+        onBusyChange(false)
+      })
+      .catch((error) => {
+        updateConversationMessages(conversationId, (current) => current.map((message) => message.status === 'streaming' && message.sessionId === sessionId
+          ? { ...message, content: `停止失败：${errorMessage(error)}` }
+          : message))
+      })
+      .finally(() => { cancellingInspirationRef.current = false })
   }
 
   const startNewConversation = (): void => {
@@ -1208,7 +1252,7 @@ function InspirationWorkspace({ project, visible, uiMode, deviceState, codingBac
     setActiveConversationId(conversation.id)
     inspirationConversationRef.current = conversation.id
     inspirationSessionRef.current = ''
-    responseContentRef.current = ''
+    finalAnswerSessionRef.current = ''
     setDraft('')
   }
 
@@ -1217,7 +1261,7 @@ function InspirationWorkspace({ project, visible, uiMode, deviceState, codingBac
     if (!busy) {
       inspirationConversationRef.current = conversation.id
       inspirationSessionRef.current = ''
-      responseContentRef.current = ''
+      finalAnswerSessionRef.current = ''
     }
     setDraft('')
   }
@@ -1238,12 +1282,17 @@ function InspirationWorkspace({ project, visible, uiMode, deviceState, codingBac
         <section className="inspiration-chat">
           <div className="inspiration-messages">
             {!messages.length ? <div className="inspiration-empty"><Lightbulb size={30} /><h2>从项目本身开始思考</h2><p>询问现有实现、技术风险、API 用法或玩法灵感</p></div> : null}
-            {messages.filter((message) => message.role === 'user' || (message.role === 'assistant' && (message.isFinal || message.status === 'streaming'))).map((message, index) => (
-              <div className={`inspiration-message ${message.role}`} key={`${message.role}-${index}`}>
+            {inspirationRows.map((row) => {
+              if (row.kind === 'tool-group') return <InspirationStepGroup items={row.items} key={row.id} />
+              const { message } = row
+              const retryPrompt = message.role === 'assistant' && (message.status === 'error' || message.status === 'cancelled')
+                ? messages.slice(0, row.index).reverse().find((candidate) => candidate.role === 'user')?.content.replace(/\n\n已附 \d+ 个文件$/, '')
+                : undefined
+              return <div className={`inspiration-message ${message.role} ${message.status === 'error' || message.status === 'cancelled' ? 'error' : ''}`} key={row.id}>
                 <span>{message.role === 'assistant' ? <Bot size={16} /> : <UserRound size={16} />}</span>
-                <div><strong>{message.role === 'assistant' ? '灵感台' : '你'}</strong>{message.role === 'assistant' ? <><MarkdownMessage content={message.content} />{message.isFinal && message.status === 'completed' && !busy ? <button className="message-action" type="button" onClick={() => onSendToCoding(message.content)}><Code2 size={13} />交给工作台</button> : null}</> : <p>{message.content}</p>}</div>
+                <div><strong>{message.role === 'assistant' ? '灵感台' : '你'}</strong>{message.role === 'assistant' ? <><MarkdownMessage content={message.content} />{message.isFinal && message.status === 'completed' && !busy ? <button className="message-action" type="button" onClick={() => onSendToCoding(message.content)}><Code2 size={13} />交给工作台</button> : null}{message.isFinal && retryPrompt && !busy ? <button className="message-action" type="button" onClick={() => void send(retryPrompt)}><RotateCcw size={13} />重试</button> : null}</> : <p>{message.content}</p>}</div>
               </div>
-            ))}
+            })}
             {busy ? <div className="inspiration-thinking-status" role="status"><span>灵感台思考中</span><time>{thinkingSeconds}s</time></div> : null}
             <div ref={endRef} />
           </div>
@@ -1251,6 +1300,7 @@ function InspirationWorkspace({ project, visible, uiMode, deviceState, codingBac
             <textarea value={draft} disabled={busy} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.nativeEvent.isComposing || event.keyCode === 229) return; if (event.key === 'Enter' && !(event.shiftKey || event.ctrlKey || event.metaKey)) { event.preventDefault(); void send() } }} placeholder="询问项目结构、API 用法或玩法灵感" />
              <div className="inspiration-composer-actions"><AiAttachmentPicker attachments={attachments} onChange={setAttachments} disabled={busy} onError={(error) => { if (uiMode !== 'advanced') updateActiveMessages((current) => [...current, { role: 'assistant', content: `无法添加附件：${errorMessage(error)}`, status: 'error' }]) }} />{busy ? <button className="secondary-button compact" type="button" onClick={cancelInspiration}><X size={14} />暂停任务</button> : null}<button className="send-button" title="发送" disabled={busy || (!draft.trim() && !attachments.length)} onClick={() => void send()}>{busy ? <LoaderCircle className="spin" size={17} /> : <Send size={17} />}</button></div>
           </div>
+          {persistenceWarning ? <div className="inspiration-persistence-warning" role="status"><CircleAlert size={14} />{persistenceWarning}</div> : null}
         </section>
       </div>
     </div>
@@ -1533,6 +1583,7 @@ export default function App(): React.JSX.Element {
   const switchingBackendRef = useRef<CodingBackend | null>(null)
   const pendingBackendSwitchRef = useRef<PendingBackendSwitch | null>(null)
   const backendSwitchRequestsRef = useRef(new Map<number, PendingBackendSwitch>())
+  const cancelAiPromiseRef = useRef<Promise<void> | null>(null)
   switchingBackendRef.current = switchingBackend
   const [detectedJavaHomes, setDetectedJavaHomes] = useState<DetectedJavaHome[]>([])
   const [javaScanState, setJavaScanState] = useState<'idle' | 'scanning' | 'done' | 'failed'>('idle')
@@ -1748,15 +1799,52 @@ export default function App(): React.JSX.Element {
   }, [project?.path])
   const workspacePromptHistoryRef = useRef<Map<string, string[]>>(new Map())
   const cancelAi = (): void => {
+    if (cancelAiPromiseRef.current) return
+    const taskProjectPath = projectPathRef.current
+    if (!taskProjectPath) return
     // Pausing keeps the project checkpoint and Codex session for a later
     // natural-language "继续" or explicit recovery.
-    setPlanning(false)
-    setRunningBackend(undefined)
-    setBeginnerTaskState('idle')
-    setAiOutputStatus('idle')
-    setAiTimeline((current) => settleWorkbenchActivity(current))
-    if (projectPathRef.current) nextAiRunToken(projectPathRef.current)
-    void window.modmind.ai.cancelCode(workspaceSessionRef.current || undefined, projectPathRef.current || undefined)
+    nextAiRunToken(taskProjectPath)
+    setNotice('正在停止 Agent，等待进程完全退出…')
+    const cancellation = (async (): Promise<void> => {
+      try {
+        const result = await window.modmind.ai.cancelCode(workspaceSessionRef.current || undefined, taskProjectPath)
+        if (normalizeProjectPath(projectPathRef.current) !== normalizeProjectPath(taskProjectPath)) return
+        if (result.status === 'timed_out') {
+          const taskState = await window.modmind.ai.getProjectTaskState(taskProjectPath).catch(() => null)
+          if (normalizeProjectPath(projectPathRef.current) !== normalizeProjectPath(taskProjectPath)) return
+          const stillRunning = Boolean(taskState?.startedAt)
+          setPlanning(stillRunning)
+          setProcessingStartedAt(taskState?.startedAt)
+          setRunningBackend(taskState?.backend)
+          setAiOutputStatus(stillRunning ? 'running' : 'idle')
+          setNotice(stillRunning
+            ? `Agent 进程尚未完全退出（仍有 ${result.remaining} 个任务），未允许新任务覆盖它；可再次停止或导出诊断`
+            : 'Agent 已停止')
+          if (stillRunning) return
+        }
+        setPlanning(false)
+        setProcessingStartedAt(undefined)
+        setRunningBackend(undefined)
+        setBeginnerTaskState('idle')
+        setAiOutputStatus('idle')
+        setAiTimeline((current) => settleWorkbenchActivity(current))
+        setNotice(result.status === 'idle' ? '当前没有正在运行的 Agent 任务' : 'Agent 已完全停止，恢复点已保留')
+      } catch (error) {
+        const taskState = await window.modmind.ai.getProjectTaskState(taskProjectPath).catch(() => null)
+        if (normalizeProjectPath(projectPathRef.current) !== normalizeProjectPath(taskProjectPath)) return
+        const stillRunning = Boolean(taskState?.startedAt)
+        setPlanning(stillRunning)
+        setProcessingStartedAt(taskState?.startedAt)
+        setRunningBackend(taskState?.backend)
+        setAiOutputStatus(stillRunning ? 'running' : 'idle')
+        setNotice(stillRunning ? `Agent 停止失败：${errorMessage(error)}` : 'Agent 已停止')
+      } finally {
+        cancelAiPromiseRef.current = null
+      }
+    })()
+    cancelAiPromiseRef.current = cancellation
+    void cancellation
   }
   const activateWorkbenchConversation = (conversationId: string): void => {
     setActiveWorkbenchConversationId(conversationId)
@@ -2648,6 +2736,22 @@ export default function App(): React.JSX.Element {
       }
     }
   }
+
+  const automaticRecoveryKeyRef = useRef('')
+  useEffect(() => {
+    const retry = aiRecovery?.retry
+    if (!project?.path || planning || !aiRecovery?.pending || !retry) return
+    if (aiRecovery.lifecycle !== 'waiting_retry' && aiRecovery.lifecycle !== 'repairing') return
+    const key = `${normalizeProjectPath(project.path)}:${aiRecovery.contextRevision ?? 0}:${retry.attempt}:${retry.nextAttemptAt ?? ''}`
+    if (automaticRecoveryKeyRef.current === key) return
+    const scheduledAt = retry.nextAttemptAt ? Date.parse(retry.nextAttemptAt) : Date.now()
+    const delayMs = Number.isFinite(scheduledAt) ? Math.max(0, scheduledAt - Date.now()) : 0
+    const timer = window.setTimeout(() => {
+      automaticRecoveryKeyRef.current = key
+      void resumeInterruptedAi()
+    }, Math.min(delayMs, 2_147_000_000))
+    return () => window.clearTimeout(timer)
+  }, [aiRecovery?.contextRevision, aiRecovery?.lifecycle, aiRecovery?.pending, aiRecovery?.retry, planning, project?.path])
 
   const inspectExistingProject = async (sourceType: 'folder' | 'zip'): Promise<void> => {
     setExistingInspecting(true)
@@ -3661,16 +3765,18 @@ export default function App(): React.JSX.Element {
         if (result.result) storeProjectPlan(taskProjectPath, result.result)
         if (result.status === 'idle') setNotice(`已切换到 ${backend === 'quota' ? '智能引擎' : backend === 'codex' ? 'Codex' : 'Claude Code'}`)
       })
-      .catch((error) => {
+      .catch(async (error) => {
+        const taskState = await window.modmind.ai.getProjectTaskState(taskProjectPath).catch(() => null)
         if (backendSwitchGenerationRef.current === generation) {
+          preservePlanning = wasPlanning && (taskState ? Boolean(taskState.startedAt) : true)
           const pending = pendingBackendSwitchRef.current
           if (pending?.generation === generation && !pending.accepted) {
             settingsRef.current = { ...settingsRef.current, codingBackend: pending.previousBackend }
             setSettings((current) => ({ ...current, codingBackend: pending.previousBackend }))
-            setRunningBackend(pending.previousBackend)
+            setRunningBackend(taskState?.backend ?? pending.previousBackend)
           }
           setNotice(`引擎切换失败：${aiFailureMessage(error)}`)
-          setAiOutputStatus('error')
+          setAiOutputStatus(preservePlanning ? 'running' : 'error')
         }
       })
       .finally(() => {
@@ -3982,10 +4088,14 @@ export default function App(): React.JSX.Element {
     () => pluginSnapshot.plugins.filter((plugin) => plugin.enabled && !plugin.error && plugin.manifest.panel),
     [pluginSnapshot]
   )
+  const hasEnabledOverlayPlugin = useMemo(
+    () => pluginSnapshot.plugins.some((plugin) => plugin.enabled && !plugin.error && plugin.manifest.overlay),
+    [pluginSnapshot]
+  )
   const visibleNavGroupsWithPlugins = useMemo(
     () => {
       const showManagerAlways = uiMode !== 'beginner'
-      if (enabledPanelPlugins.length === 0 && !showManagerAlways) return visibleNavGroupsRaw
+      if (enabledPanelPlugins.length === 0 && !hasEnabledOverlayPlugin && !showManagerAlways) return visibleNavGroupsRaw
       return [...visibleNavGroupsRaw, {
         label: '插件',
         items: [
@@ -3998,7 +4108,7 @@ export default function App(): React.JSX.Element {
         ]
       }]
     },
-    [enabledPanelPlugins, visibleNavGroupsRaw, uiMode]
+    [enabledPanelPlugins, hasEnabledOverlayPlugin, visibleNavGroupsRaw, uiMode]
   )
   const navLabelMap: Partial<Record<ViewId, string>> = {
     workspace: modpackProject ? '工作台' : uiMode === 'beginner' ? '开始创作' : '工作台',
@@ -4397,6 +4507,7 @@ export default function App(): React.JSX.Element {
 
   return (
     <div className={`app-shell ${settings.darkMode ? 'dark-mode' : ''} ${uiMode === 'beginner' ? 'beginner-mode' : ''} ${isDetachedWindow ? 'detached-window' : ''} ${initialDetachedGroup ? 'detached-group-window-shell' : ''} mode-transition mode-${uiMode}`}>
+      {!isDetachedWindow ? <PluginOverlayLayer snapshot={pluginSnapshot} theme={settings.darkMode ? 'dark' : 'light'} /> : null}
       {isDetachedWindow ? <header className="titlebar detached-titlebar">
         <div className="titlebar-name">{initialDetachedGroup ? detachedGroup?.label ?? '' : <><img src={appLogo} alt="" />{detachedWindowTitle}</>}</div>
         <div className="titlebar-actions">

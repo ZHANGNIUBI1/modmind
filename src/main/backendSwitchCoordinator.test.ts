@@ -46,4 +46,29 @@ describe('backend switch coordinator', () => {
     expect(coordinator.current('project')).toBe(first)
     expect(coordinator.current('project')?.target).toEqual({ backend: 'codex', switchId: 1 })
   })
+
+  it('clears only the current failed transition', () => {
+    const coordinator = new BackendSwitchCoordinator<string, string>()
+    const first = coordinator.accept(coordinator.request('project'), 'quota', 'codex')!
+    const second = coordinator.accept(coordinator.request('project'), 'codex', 'claude')!
+    expect(coordinator.fail(first)).toBe(false)
+    expect(coordinator.current('project')).toBe(second)
+    expect(coordinator.fail(second)).toBe(true)
+    expect(coordinator.current('project')).toBeUndefined()
+  })
+
+  it('invalidates validation work that has not been accepted yet', () => {
+    const coordinator = new BackendSwitchCoordinator<string, string>()
+    const ticket = coordinator.request('project')
+    coordinator.invalidatePending('project')
+    expect(coordinator.isLatestRequest(ticket)).toBe(false)
+    expect(coordinator.accept(ticket, 'quota', 'codex')).toBeNull()
+  })
+
+  it('keeps an accepted transition current while cancellation unwinds it', () => {
+    const coordinator = new BackendSwitchCoordinator<string, string>()
+    const transition = coordinator.accept(coordinator.request('project'), 'quota', 'codex')!
+    coordinator.invalidatePending('project')
+    expect(coordinator.isCurrent(transition)).toBe(true)
+  })
 })

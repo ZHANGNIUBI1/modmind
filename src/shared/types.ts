@@ -583,6 +583,13 @@ export interface AiRecoveryInfo {
   backend?: CodingBackend
   /** Monotonic unified-context revision. */
   contextRevision?: number
+  lifecycle?: 'running' | 'waiting_retry' | 'repairing' | 'action_required' | 'paused'
+  retry?: {
+    category: 'rate-limit' | 'server' | 'connection' | 'no-output' | 'compatibility' | 'process' | 'policy' | 'action-required' | 'cancelled'
+    attempt: number
+    message: string
+    nextAttemptAt?: string
+  }
 }
 
 export interface BeginnerTaskStatus {
@@ -836,6 +843,7 @@ export interface InspirationChatMessage {
   kind?: 'tool'
   id?: string
   time?: string
+  sessionId?: string
   content: string
   status?: 'streaming' | 'completed' | 'error' | 'cancelled'
   dedupeKey?: string
@@ -849,6 +857,8 @@ export interface AiCreateCodeOptions {
   surface?: AiSurface
   sessionScope?: string
   resumeSession?: boolean
+  /** Unwrapped inspiration question used for per-turn latency policy. */
+  inspirationQuestion?: string
   /** Allows an independently opened workbench to bind a task to its project. */
   projectPath?: string
   /** Original request used if a persisted CLI session is no longer available. */
@@ -904,6 +914,12 @@ export interface AiBackendReadyEvent {
   backend: CodingBackend
   projectPath: string
   switchId?: number
+}
+
+export interface AiCancellationResult {
+  status: 'idle' | 'stopped' | 'timed_out'
+  matched: number
+  remaining: number
 }
 
 export interface AiPlan {
@@ -1165,7 +1181,7 @@ export interface ModMindApi {
   ai: {
     createCode: (prompt: string, sessionId?: string, backend?: CodingBackend, executionProfile?: AiExecutionProfile, options?: AiCreateCodeOptions) => Promise<CodingResult>
     pickAttachments: (kind: AiAttachmentSelectionKind) => Promise<AiAttachment[]>
-    cancelCode: (sessionId?: string, projectPath?: string) => Promise<void>
+    cancelCode: (sessionId?: string, projectPath?: string) => Promise<AiCancellationResult>
     clearQuotaCredentials: () => Promise<void>
     getRecovery: (projectPath?: string) => Promise<AiRecoveryInfo>
     getProjectTaskState: (projectPath?: string) => Promise<AiProjectTaskState>
@@ -1264,12 +1280,23 @@ export interface ModMindApi {
     reload: () => Promise<import('./plugins').PluginSnapshot>
     openDirectory: () => Promise<void>
     invokeTool: (pluginId: string, toolName: string, input?: unknown) => Promise<unknown>
+    activate: (pluginId: string) => Promise<import('./plugins').PluginDiagnostics>
+    restart: (pluginId: string) => Promise<import('./plugins').PluginDiagnostics>
+    diagnostics: (pluginId: string) => Promise<import('./plugins').PluginDiagnostics>
+    clearDiagnostics: (pluginId: string) => Promise<import('./plugins').PluginDiagnostics>
+    recordLog: (pluginId: string, source: import('./plugins').PluginLogSource, level: 'info' | 'warn' | 'error', message: string) => Promise<void>
     handleContextOp: (pluginId: string, op: string, args?: Record<string, unknown>) => Promise<unknown>
     getProjectInfo: (pluginId: string) => Promise<unknown>
     copyToClipboard: (pluginId: string, text: string) => Promise<unknown>
     export: (pluginId: string) => Promise<string | null>
     exportDoc: (content: string) => Promise<string>
     delete: (pluginId: string) => Promise<import('./plugins').PluginSnapshot>
+    getOverlayWindows: () => Promise<import('./plugins').PluginOverlayWindowState[]>
+    openOverlayWindow: (pluginId: string) => Promise<import('./plugins').PluginOverlayWindowState>
+    closeOverlayWindow: (pluginId: string) => Promise<import('./plugins').PluginOverlayWindowState>
+    setOverlayAlwaysOnTop: (pluginId: string, alwaysOnTop: boolean) => Promise<import('./plugins').PluginOverlayWindowState>
     onChanged: (listener: (snapshot: import('./plugins').PluginSnapshot) => void) => () => void
+    onDiagnosticsChanged: (listener: (diagnostics: import('./plugins').PluginDiagnostics) => void) => () => void
+    onOverlayWindowsChanged: (listener: (states: import('./plugins').PluginOverlayWindowState[]) => void) => () => void
   }
 }

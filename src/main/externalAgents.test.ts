@@ -149,6 +149,7 @@ describe('agent stream failure extraction', () => {
     const badRequest = classifyAgentStreamFailure('returned 400 Bad Request')
     expect(badRequest.transient).toBe(false)
     expect(badRequest.status).toBe(400)
+    expect(classifyAgentStreamFailure('模型服务与当前 Agent 请求不兼容（415）').kind).toBe('invalid-request')
     expect(classifyAgentStreamFailure('401 Unauthorized').reason).toContain('更新 API Key')
     expect(classifyAgentStreamFailure('402 Payment Required').reason).toContain('额度不足')
     expect(classifyAgentStreamFailure('404 Not Found').reason).toContain('重新扫描模型')
@@ -253,6 +254,85 @@ describe('agent stream failure extraction', () => {
     expect(audits.every((audit) => audit.outcome !== 'retry')).toBe(true)
   }, 30_000)
 
+  it('keeps a persistent task alive across exhausted retry batches', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-persistent-retry-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {name: 'Persistent Retry', path: root, loader: 'fabric', minecraftVersion: '1.21.1', namespace: 'persistent_retry', createdAt: new Date().toISOString()}
+    const runner = path.join(root, 'fake-agent.mjs')
+    const attempts = path.join(root, 'attempts.txt')
+    await fs.writeFile(runner, [
+      "import fs from 'node:fs';",
+      `const attempts = ${JSON.stringify(attempts)};`,
+      "const count = fs.existsSync(attempts) ? Number(fs.readFileSync(attempts, 'utf8')) + 1 : 1;",
+      "fs.writeFileSync(attempts, String(count));",
+      "if (count <= 2) { console.log(JSON.stringify({type:'error', message:'last status: 429 Too Many Requests'})); process.exit(1); }",
+      "console.log(JSON.stringify({type:'item.completed', item:{type:'agent_message', text:'recovered'}}));",
+      "console.log(JSON.stringify({type:'turn.completed'}));"
+    ].join('\n'), 'utf8')
+    const executable = process.platform === 'win32' ? path.join(root, 'fake-agent.cmd') : path.join(root, 'fake-agent.sh')
+    await fs.writeFile(executable, process.platform === 'win32'
+      ? `@echo off\r\nnode "%~dp0fake-agent.mjs" %*\r\n`
+      : `#!/bin/sh\nnode "$(dirname "$0")/fake-agent.mjs" "$@"\n`, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(executable, 0o755)
+    const audits: string[] = []
+    const states: string[] = []
+
+    const result = await runExternalAgent({
+      kind: 'codex', executable, project, prompt: 'finish the task', maxAttempts: 2,
+      persistentRetry: true, retryDelayMs: 1,
+      signal: new AbortController().signal,
+      onOutput: () => undefined,
+      onProgress: () => undefined,
+      onAttemptAudit: (audit) => audits.push(audit.outcome),
+      onRetryState: (state) => { states.push(state.phase) },
+      bridge: stubBridgeHandlers(project)
+    })
+
+    expect(result.summary).toBe('recovered')
+    expect(Number(await fs.readFile(attempts, 'utf8'))).toBe(3)
+    expect(audits).toContain('waiting')
+    expect(audits.at(-1)).toBe('complete')
+    expect(audits).not.toContain('failure')
+    expect(states).toContain('waiting')
+  }, 30_000)
+
+  it('rebuilds a fresh session after a persistent 400 compatibility failure', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-persistent-compat-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {name: 'Persistent Compatibility', path: root, loader: 'fabric', minecraftVersion: '1.21.1', namespace: 'persistent_compatibility', createdAt: new Date().toISOString()}
+    const runner = path.join(root, 'fake-agent.mjs')
+    const attempts = path.join(root, 'attempts.txt')
+    await fs.writeFile(runner, [
+      "import fs from 'node:fs';",
+      `const attempts = ${JSON.stringify(attempts)};`,
+      "const count = fs.existsSync(attempts) ? Number(fs.readFileSync(attempts, 'utf8')) + 1 : 1;",
+      "fs.writeFileSync(attempts, String(count));",
+      "if (count === 1) { console.log(JSON.stringify({type:'turn.failed', error:{message:'returned 400 Bad Request'}})); process.exit(1); }",
+      "console.log(JSON.stringify({type:'item.completed', item:{type:'agent_message', text:'compatible again'}}));",
+      "console.log(JSON.stringify({type:'turn.completed'}));"
+    ].join('\n'), 'utf8')
+    const executable = process.platform === 'win32' ? path.join(root, 'fake-agent.cmd') : path.join(root, 'fake-agent.sh')
+    await fs.writeFile(executable, process.platform === 'win32'
+      ? `@echo off\r\nnode "%~dp0fake-agent.mjs" %*\r\n`
+      : `#!/bin/sh\nnode "$(dirname "$0")/fake-agent.mjs" "$@"\n`, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(executable, 0o755)
+    const audits: string[] = []
+
+    const result = await runExternalAgent({
+      kind: 'codex', executable, project, prompt: 'original task', maxAttempts: 1,
+      persistentRetry: true, retryDelayMs: 1,
+      signal: new AbortController().signal,
+      onOutput: () => undefined,
+      onProgress: () => undefined,
+      onAttemptAudit: (audit) => audits.push(audit.outcome),
+      bridge: stubBridgeHandlers(project)
+    })
+
+    expect(result.summary).toBe('compatible again')
+    expect(Number(await fs.readFile(attempts, 'utf8'))).toBe(2)
+    expect(audits).toEqual(['waiting', 'complete'])
+  }, 30_000)
+
   it('does not invent a successful answer when the provider completes without text', async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-empty-response-'))
     temporaryRoots.push(root)
@@ -272,9 +352,64 @@ describe('agent stream failure extraction', () => {
       bridge: stubBridgeHandlers(project)
     })).rejects.toMatchObject({name: 'ExternalAgentEmptyResponseError', message: expect.stringContaining('没有返回可显示的回答')})
   }, 30_000)
+
+  it('does not promote a native retry notice when the provider reports completion', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-retry-as-answer-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {name: 'Retry Notice', path: root, loader: 'fabric', minecraftVersion: '1.21.1', namespace: 'retry_notice', createdAt: new Date().toISOString()}
+    const runner = path.join(root, 'fake-agent.mjs')
+    await fs.writeFile(runner, [
+      "console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'模型服务暂时不可用（429），8 秒后自动重试（第 2 次，最多 4 次）'}}))",
+      "console.log(JSON.stringify({type:'turn.completed'}))",
+      'process.exit(0)'
+    ].join(';'), 'utf8')
+    const executable = process.platform === 'win32' ? path.join(root, 'fake-agent.cmd') : path.join(root, 'fake-agent.sh')
+    await fs.writeFile(executable, process.platform === 'win32'
+      ? `@echo off\r\nnode "%~dp0fake-agent.mjs" %*\r\n`
+      : `#!/bin/sh\nnode "$(dirname "$0")/fake-agent.mjs" "$@"\n`, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(executable, 0o755)
+
+    await expect(runExternalAgent({
+      kind: 'codex', executable, project, prompt: '请回答', maxAttempts: 1,
+      signal: new AbortController().signal,
+      onOutput: () => undefined,
+      onProgress: () => undefined,
+      bridge: stubBridgeHandlers(project)
+    })).rejects.toMatchObject({name: 'ExternalAgentEmptyResponseError'})
+  }, 30_000)
 })
 
 describe('ModMind external agent MCP bridge', () => {
+  it('passes a per-run Codex reasoning effort without changing global configuration', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-run-effort-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {name: 'Run Effort', path: root, loader: 'fabric', minecraftVersion: '1.21.1', namespace: 'run_effort', createdAt: new Date().toISOString()}
+    const runner = path.join(root, 'fake-agent.mjs')
+    const argsFile = path.join(root, 'args.json')
+    await fs.writeFile(runner, [
+      "import fs from 'node:fs';",
+      `fs.writeFileSync(${JSON.stringify(argsFile)}, JSON.stringify(process.argv.slice(2)));`,
+      "process.stdin.resume(); process.stdin.on('end', () => {",
+      "console.log(JSON.stringify({type:'item.completed',item:{type:'agent_message',text:'fast answer'}}));",
+      "console.log(JSON.stringify({type:'turn.completed'}));",
+      "});"
+    ].join('\n'), 'utf8')
+    const executable = process.platform === 'win32' ? path.join(root, 'fake-agent.cmd') : path.join(root, 'fake-agent.sh')
+    await fs.writeFile(executable, process.platform === 'win32'
+      ? `@echo off\r\nnode "%~dp0fake-agent.mjs" %*\r\n`
+      : `#!/bin/sh\nnode "$(dirname "$0")/fake-agent.mjs" "$@"\n`, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(executable, 0o755)
+
+    await runExternalAgent({
+      kind: 'codex', executable, project, prompt: 'quick idea', reasoningEffort: 'low',
+      signal: new AbortController().signal, onOutput: () => undefined, onProgress: () => undefined,
+      bridge: stubBridgeHandlers(project)
+    })
+
+    const args = JSON.parse(await fs.readFile(argsFile, 'utf8')) as string[]
+    expect(args).toContain('model_reasoning_effort="low"')
+  }, 20_000)
+
   it('keeps retry prompts to the single continuation instruction', () => {
     expect(externalAgentRetryPrompt()).toBe('继续')
     expect(externalAgentAttemptPrompt({prompt: '原始任务', fallbackPrompt: '备用任务'}, 1)).toEqual({prompt: '继续', retryOnly: true})
@@ -336,6 +471,7 @@ describe('ModMind external agent MCP bridge', () => {
     const url = 'https://repo1.maven.org/maven2/example/library/1.0/library-1.0.jar'
     expect(managedNativeDownloadAction(project, `Invoke-WebRequest -Uri '${url}' -Method Head`)).toBeUndefined()
     expect(managedNativeDownloadAction(project, `Invoke-WebRequest -Uri '${url}' -OutFile library.jar`)).toBe('maven_dependency_install')
+    expect(managedNativeDownloadAction(project, "Invoke-WebRequest -Uri 'http://127.0.0.1:42485/tool' -Body '{\"javaHome\":\"C:/Program Files/Eclipse Adoptium/jdk-17\"}'")).toBeUndefined()
   })
 
   it('identifies native Gradle builds while allowing file inspection and status commands', () => {
@@ -531,6 +667,19 @@ describe('ModMind external agent MCP bridge', () => {
       onProgress: () => undefined,
       bridge: stubBridgeHandlers(project)
     })).rejects.toThrow()
+    expect(started).toBe(0)
+
+    const controller = new AbortController()
+    const cancelledDuringSetup = runExternalAgent({
+      kind: 'codex', executable: script, project, prompt: 'cancel before spawn',
+      signal: controller.signal,
+      onStarted: () => { started += 1 },
+      onOutput: () => undefined,
+      onProgress: () => undefined,
+      bridge: stubBridgeHandlers(project)
+    })
+    controller.abort()
+    await expect(cancelledDuringSetup).rejects.toMatchObject({ name: 'AbortError' })
     expect(started).toBe(0)
   })
 
@@ -758,6 +907,44 @@ describe('ModMind external agent MCP bridge', () => {
       message: expect.stringContaining('上游模型仍未返回任何内容')
     })
     expect(outputs.filter((message) => message === '继续')).toHaveLength(0)
+  }, 20_000)
+
+  it('rebuilds a silent process when persistent recovery is enabled', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-agent-persistent-no-output-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {
+      name: 'Persistent No Output', path: root, loader: 'fabric', minecraftVersion: '1.21.1',
+      namespace: 'persistent_no_output', createdAt: new Date().toISOString()
+    }
+    const counter = path.join(root, 'attempts.txt')
+    const runner = path.join(root, 'silent-then-success.mjs')
+    await fs.writeFile(runner, [
+      '#!/usr/bin/env node',
+      "import fs from 'node:fs';",
+      `const counter = ${JSON.stringify(counter)};`,
+      "const count = fs.existsSync(counter) ? Number(fs.readFileSync(counter, 'utf8')) + 1 : 1;",
+      "fs.writeFileSync(counter, String(count));",
+      "if (count === 1) setInterval(() => undefined, 1000);",
+      "else { console.log(JSON.stringify({type:'item.completed', item:{type:'agent_message', text:'awake'}})); console.log(JSON.stringify({type:'turn.completed'})); }"
+    ].join('\n'), 'utf8')
+    const executable = process.platform === 'win32' ? path.join(root, 'silent-then-success.cmd') : runner
+    if (process.platform === 'win32') await fs.writeFile(executable, `@echo off\r\nnode "%~dp0silent-then-success.mjs" %*\r\n`, 'utf8')
+    else await fs.chmod(executable, 0o755)
+    const states: string[] = []
+
+    const result = await runExternalAgent({
+      kind: 'codex', executable, project, prompt: 'recover silence', maxAttempts: 1,
+      persistentRetry: true, retryDelayMs: 1, noOutputTimeoutMs: 40,
+      signal: new AbortController().signal,
+      onOutput: () => undefined,
+      onProgress: () => undefined,
+      onRetryState: (state) => { states.push(state.category) },
+      bridge: stubBridgeHandlers(project)
+    })
+
+    expect(result.summary).toBe('awake')
+    expect(Number(await fs.readFile(counter, 'utf8'))).toBe(2)
+    expect(states).toContain('no-output')
   }, 20_000)
 
   it.each([

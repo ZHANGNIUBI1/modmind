@@ -41,6 +41,13 @@ const log = {
   error: (message) => post({ kind: 'log', level: 'error', message: String(message) })
 }
 
+process.on('uncaughtExceptionMonitor', (error) => {
+  log.error(`未捕获异常：${error instanceof Error ? (error.stack || error.message) : String(error)}`)
+})
+process.on('unhandledRejection', (reason) => {
+  log.error(`未处理的 Promise 拒绝：${reason instanceof Error ? (reason.stack || reason.message) : String(reason)}`)
+})
+
 const contextWaiters = new Map()
 function requestContext(op, args) {
   if (!parentPort) return Promise.reject(new Error('宿主上下文不可用（无 parentPort）'))

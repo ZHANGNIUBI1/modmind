@@ -2,19 +2,25 @@ import { useEffect, useState } from 'react'
 import { marked } from 'marked'
 import {
   BookOpen,
+  Bug,
   Check,
   Download,
+  Eraser,
+  ExternalLink,
   FolderOpen,
   LayoutDashboard,
   LoaderCircle,
   PackagePlus,
+  Play,
   Puzzle,
   RefreshCw,
+  RotateCw,
+  Terminal,
   Trash2,
   Wrench,
   X
 } from 'lucide-react'
-import type { PluginSnapshot } from '../../../shared/plugins'
+import type { PluginDiagnostics, PluginRecord, PluginSnapshot } from '../../../shared/plugins'
 import pluginDevelopmentDocument from '../../../../docs/plugin-development.zh-CN.md?raw'
 
 interface PluginsManagerProps {
@@ -40,6 +46,14 @@ const pluginDocumentationHtml = (() => {
   return marked.parse(pluginDevelopmentDocument, { async: false, gfm: true, breaks: true, renderer }) as string
 })()
 
+const runtimeStatusLabels: Record<PluginDiagnostics['status'], string> = {
+  idle: '尚未启动',
+  starting: '正在启动',
+  running: '运行中',
+  stopped: '已停止',
+  failed: '启动失败'
+}
+
 /**
  * 插件管理页：列表、启停、导入、导出、删除与制作文档。
  * 独立于设置页，避免设置分区膨胀。
@@ -51,6 +65,9 @@ export function PluginsManager({ snapshot, hasProject, onRefresh, onOpenPanel, c
   const [docDownloaded, setDocDownloaded] = useState(false)
   const [docDownloading, setDocDownloading] = useState(false)
   const [docToast, setDocToast] = useState<string | null>(null)
+  const [developerPlugin, setDeveloperPlugin] = useState<PluginRecord | null>(null)
+  const [diagnostics, setDiagnostics] = useState<PluginDiagnostics | null>(null)
+  const [developerBusy, setDeveloperBusy] = useState(false)
 
   useEffect(() => {
     if (!message) return
@@ -63,6 +80,38 @@ export function PluginsManager({ snapshot, hasProject, onRefresh, onOpenPanel, c
     const timer = setTimeout(() => setDocToast(null), 3500)
     return () => clearTimeout(timer)
   }, [docToast])
+
+  useEffect(() => window.modmind.plugins.onDiagnosticsChanged((next) => {
+    if (next.pluginId === developerPlugin?.manifest.id) setDiagnostics(next)
+  }), [developerPlugin?.manifest.id])
+
+  const openDeveloper = async (plugin: PluginRecord): Promise<void> => {
+    setDeveloperPlugin(plugin)
+    setDeveloperBusy(true)
+    try {
+      setDiagnostics(await window.modmind.plugins.diagnostics(plugin.manifest.id))
+      if (plugin.manifest.backend && plugin.enabled && !plugin.error) {
+        setDiagnostics(await window.modmind.plugins.activate(plugin.manifest.id))
+      }
+    } catch (error) {
+      setMessage(`失败：${error instanceof Error ? error.message : String(error)}`)
+      setDiagnostics(await window.modmind.plugins.diagnostics(plugin.manifest.id).catch(() => null))
+    } finally {
+      setDeveloperBusy(false)
+    }
+  }
+
+  const restartDeveloperPlugin = async (): Promise<void> => {
+    if (!developerPlugin?.manifest.backend) return
+    setDeveloperBusy(true)
+    try {
+      setDiagnostics(await window.modmind.plugins.restart(developerPlugin.manifest.id))
+    } catch (error) {
+      setMessage(`失败：${error instanceof Error ? error.message : String(error)}`)
+    } finally {
+      setDeveloperBusy(false)
+    }
+  }
 
   const downloadDoc = async (): Promise<void> => {
     if (docDownloading) return
@@ -95,7 +144,7 @@ export function PluginsManager({ snapshot, hasProject, onRefresh, onOpenPanel, c
 
   const plugins = [...snapshot.plugins].sort((a, b) => a.manifest.id.localeCompare(b.manifest.id))
   const enabledCount = plugins.filter((plugin) => plugin.enabled && !plugin.error).length
-  const panelCount = plugins.filter((plugin) => plugin.manifest.panel).length
+  const panelCount = plugins.filter((plugin) => plugin.manifest.panel || plugin.manifest.overlay).length
   const toolCount = plugins.reduce((total, plugin) => total + (plugin.manifest.backend?.tools.length ?? 0), 0)
 
   return (
@@ -147,7 +196,7 @@ export function PluginsManager({ snapshot, hasProject, onRefresh, onOpenPanel, c
           <div className="plugin-stats">
             <div className="plugin-stat"><strong>{plugins.length}</strong><span>已安装</span></div>
             <div className="plugin-stat"><strong>{enabledCount}</strong><span>已启用</span></div>
-            <div className="plugin-stat"><strong>{panelCount}</strong><span>面板插件</span></div>
+            <div className="plugin-stat"><strong>{panelCount}</strong><span>界面插件</span></div>
             <div className="plugin-stat"><strong>{toolCount}</strong><span>MCP 工具</span></div>
           </div>
 
@@ -183,17 +232,26 @@ export function PluginsManager({ snapshot, hasProject, onRefresh, onOpenPanel, c
                 ) : (
                   <div className="plugin-card-tags">
                     {plugin.manifest.panel ? <span className="plugin-tag"><LayoutDashboard size={11} />面板</span> : null}
+                    {plugin.manifest.overlay ? <span className="plugin-tag"><ExternalLink size={11} />跨页面悬浮</span> : null}
                     {plugin.manifest.backend?.tools.length ? <span className="plugin-tag"><Wrench size={11} />{plugin.manifest.backend.tools.length} 个工具</span> : null}
-                    {!plugin.manifest.panel && !plugin.manifest.backend?.tools.length ? <span className="plugin-tag">无面板或工具</span> : null}
+                    {!plugin.manifest.panel && !plugin.manifest.overlay && !plugin.manifest.backend?.tools.length ? <span className="plugin-tag">无界面或工具</span> : null}
                   </div>
                 )}
                 <footer className="plugin-card-actions">
-                  {!plugin.error && plugin.manifest.panel ? (
-                    <button className="secondary-button compact" type="button" onClick={() => onOpenPanel(plugin.manifest.id)}>
-                      打开面板
-                    </button>
-                  ) : <span />}
+                  <div className="plugin-card-primary-actions">
+                    {!plugin.error && plugin.manifest.panel ? (
+                      <button className="secondary-button compact" type="button" onClick={() => onOpenPanel(plugin.manifest.id)}>打开面板</button>
+                    ) : null}
+                    {!plugin.error && plugin.enabled && plugin.manifest.overlay ? (
+                      <button className="secondary-button compact" type="button" onClick={() => void runAction(async () => { await window.modmind.plugins.openOverlayWindow(plugin.manifest.id) }, '悬浮窗已弹到桌面')}>
+                        <ExternalLink size={13} />弹到桌面
+                      </button>
+                    ) : null}
+                  </div>
                   <div className="plugin-card-icon-actions">
+                    <button className="icon-button" type="button" title="开发者控制台" disabled={busy} onClick={() => void openDeveloper(plugin)}>
+                      <Bug size={15} />
+                    </button>
                     <button className="icon-button" type="button" title="导出 .zip 分享" disabled={busy} onClick={() => void runAction(async () => Boolean(await window.modmind.plugins.export(plugin.manifest.id)), '已导出')}>
                       <PackagePlus size={15} />
                     </button>
@@ -230,6 +288,51 @@ export function PluginsManager({ snapshot, hasProject, onRefresh, onOpenPanel, c
             </div>
             <div className="plugin-docs-content markdown-message" dangerouslySetInnerHTML={{ __html: pluginDocumentationHtml }} />
           </div>
+        </div>
+      ) : null}
+
+      {developerPlugin ? (
+        <div className="plugin-developer-backdrop" role="presentation" onMouseDown={() => setDeveloperPlugin(null)}>
+          <aside className="plugin-developer-drawer" role="dialog" aria-modal="true" aria-label={`${developerPlugin.manifest.name} 开发者控制台`} onMouseDown={(event) => event.stopPropagation()}>
+            <header className="plugin-developer-header">
+              <div>
+                <h2><Terminal size={17} />{developerPlugin.manifest.name}</h2>
+                <p>{developerPlugin.manifest.id} · {diagnostics ? runtimeStatusLabels[diagnostics.status] : '正在读取状态'}{diagnostics?.pid ? ` · PID ${diagnostics.pid}` : ''}</p>
+              </div>
+              <button className="icon-button" type="button" title="关闭" onClick={() => setDeveloperPlugin(null)}><X size={17} /></button>
+            </header>
+
+            <div className="plugin-developer-actions">
+              {developerPlugin.manifest.backend ? (
+                <>
+                  <button className="secondary-button compact" type="button" disabled={developerBusy || diagnostics?.status === 'running'} onClick={() => void openDeveloper(developerPlugin)}>
+                    {developerBusy ? <LoaderCircle className="spin" size={14} /> : <Play size={14} />}启动
+                  </button>
+                  <button className="secondary-button compact" type="button" disabled={developerBusy} onClick={() => void restartDeveloperPlugin()}><RotateCw size={14} />重启</button>
+                </>
+              ) : null}
+              <button className="secondary-button compact" type="button" disabled={!diagnostics?.logs.length} onClick={() => void window.modmind.plugins.clearDiagnostics(developerPlugin.manifest.id).then(setDiagnostics)}><Eraser size={14} />清空</button>
+              <button className="secondary-button compact" type="button" onClick={() => void window.modmind.plugins.openDirectory()}><FolderOpen size={14} />插件目录</button>
+            </div>
+
+            {diagnostics?.error ? <div className="plugin-developer-error">{diagnostics.error}</div> : null}
+            <div className="plugin-developer-meta">
+              <span>入口：{developerPlugin.manifest.backend?.entry ?? developerPlugin.manifest.overlay?.entry ?? developerPlugin.manifest.panel?.entry ?? '无'}</span>
+              <span>权限：{developerPlugin.manifest.permissions.join(', ') || '无'}</span>
+              {diagnostics?.startedAt ? <span>启动：{new Date(diagnostics.startedAt).toLocaleString()}</span> : null}
+              {diagnostics?.exitCode !== undefined ? <span>退出码：{diagnostics.exitCode}</span> : null}
+            </div>
+
+            <div className="plugin-developer-console" role="log" aria-live="polite">
+              {diagnostics?.logs.length ? diagnostics.logs.map((entry) => (
+                <div className={`plugin-console-line ${entry.level}`} key={entry.id}>
+                  <time>{new Date(entry.time).toLocaleTimeString()}</time>
+                  <span className="plugin-console-source">{entry.source}</span>
+                  <pre>{entry.message}</pre>
+                </div>
+              )) : <div className="plugin-console-empty">暂无日志</div>}
+            </div>
+          </aside>
         </div>
       ) : null}
 

@@ -44,6 +44,25 @@ function validManifest(overrides: Record<string, unknown> = {}): Record<string, 
 }
 
 describe('PluginService', () => {
+  it('loads overlay-only plugins and validates their entry', async () => {
+    const globalDir = roots[roots.length - 1]
+    await writePlugin(globalDir, 'desktop-pet', validManifest({
+      id: 'desktop-pet',
+      panel: undefined,
+      overlay: { entry: 'overlay/index.html', mode: 'pet', width: 220, height: 260, alwaysOnTop: true }
+    }), { 'overlay/index.html': '<html></html>' })
+    await writePlugin(globalDir, 'broken-overlay', validManifest({
+      id: 'broken-overlay',
+      panel: undefined,
+      overlay: { entry: 'overlay/missing.html' }
+    }))
+
+    const service = new PluginService({ globalDirectory: globalDir, projectRoot: () => null })
+    const snapshot = await service.refresh()
+    expect(snapshot.plugins.find((plugin) => plugin.manifest.id === 'desktop-pet')?.manifest.overlay).toMatchObject({ mode: 'pet', width: 220, height: 260 })
+    expect(snapshot.plugins.find((plugin) => plugin.manifest.id === 'broken-overlay')?.error).toContain('overlay.entry')
+  })
+
   it('scans global and project scopes with project precedence', async () => {
     const globalDir = roots[roots.length - 1]
     const projectRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-plugin-project-'))

@@ -3,12 +3,14 @@ import { app, BrowserWindow, clipboard, dialog, net } from 'electron'
 import { PluginService } from './pluginService'
 import { PluginRuntime } from './pluginRuntime'
 import { registerPluginProtocol, registerPluginProtocolScheme } from './pluginProtocol'
+import { InitialReadiness } from './initialReadiness'
 import type { ExternalAgentPluginBridgeTarget } from './externalAgents'
-import type { PluginRecord, PluginSnapshot } from '../shared/plugins'
+import type { PluginDiagnostics, PluginRecord, PluginSnapshot } from '../shared/plugins'
 
 // 模块级单例：index.ts 与各服务通过这里访问插件系统。
 let pluginService: PluginService | null = null
 let pluginRuntime: PluginRuntime | null = null
+const pluginRegistryReadiness = new InitialReadiness<PluginSnapshot>()
 
 function bundledHostScriptPath(): string {
   // 双路径候选，与 codex-skills / server-pack-creator 同模式：打包后位于
@@ -23,6 +25,7 @@ export function initializePlugins(options: {
   projectRoot: () => string | null
   projectInfo: () => { name: string; path: string; kind: string } | null
   onSnapshotChanged: (snapshot: PluginSnapshot) => void
+  onDiagnosticsChanged?: (diagnostics: PluginDiagnostics) => void
 }): void {
   if (pluginService) return
   const globalDirectory = path.join(options.userDataDirectory, 'plugins')
@@ -40,6 +43,7 @@ export function initializePlugins(options: {
     netFetch: ((input: string | URL | Request, init?: RequestInit) => net.fetch(input.toString(), init)) as typeof fetch,
     clipboardWrite: (text) => clipboard.writeText(text),
     onRuntimeError: (pluginId, error) => pluginService?.setRuntimeError(pluginId, error),
+    onDiagnostics: (diagnostics) => options.onDiagnosticsChanged?.(diagnostics),
     log: (_level, message) => {
       // 接入诊断日志由调用方决定；此处仅 console 以便开发期观察
       console.log(`[plugins] ${message}`)
@@ -59,12 +63,22 @@ export function registerPluginProtocolSchemeEarly(): void {
 }
 
 /** 应用启动/项目切换后刷新注册表并启动目录监听。 */
-export async function refreshPluginRegistry(forceReload = false): Promise<PluginSnapshot> {
+async function performPluginRegistryRefresh(forceReload: boolean): Promise<PluginSnapshot> {
   if (!pluginService) return { plugins: [] }
   const snapshot = await pluginService.refresh({ forceReload }).catch(() => ({ plugins: [] as PluginRecord[] }))
   pluginRuntime?.syncRecords(new Map(snapshot.plugins.map((record) => [record.manifest.id, record])))
   pluginService.startWatching()
   return snapshot
+}
+
+export function refreshPluginRegistry(forceReload = false): Promise<PluginSnapshot> {
+  return pluginRegistryReadiness.run(() => performPluginRegistryRefresh(forceReload))
+}
+
+/** Early renderer requests wait for the initial cache read/scan instead of observing an empty registry. */
+export function waitForPluginRegistry(): Promise<PluginSnapshot> {
+  if (!pluginService) return Promise.reject(new Error('插件系统未初始化'))
+  return pluginRegistryReadiness.wait(() => performPluginRegistryRefresh(false))
 }
 
 export function getPluginService(): PluginService | null {
@@ -80,6 +94,7 @@ export function shutdownPlugins(): void {
   pluginService?.close()
   pluginService = null
   pluginRuntime = null
+  pluginRegistryReadiness.reset()
 }
 
 /** 构造注入 ModMindBridge 的插件目标；未初始化时返回 undefined（零插件行为不变）。 */

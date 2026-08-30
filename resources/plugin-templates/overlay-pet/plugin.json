@@ -1,0 +1,18 @@
+{
+  "id": "overlay-pet",
+  "name": "悬浮伙伴模板",
+  "version": "0.1.0",
+  "description": "演示跨页面常驻界面，以及可拖到 ModMind 窗口外的透明桌面悬浮窗。",
+  "author": "",
+  "permissions": [],
+  "overlay": {
+    "entry": "overlay/index.html",
+    "mode": "pet",
+    "width": 220,
+    "height": 260,
+    "minWidth": 160,
+    "minHeight": 180,
+    "resizable": true,
+    "alwaysOnTop": true
+  }
+}

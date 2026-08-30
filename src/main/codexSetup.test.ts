@@ -43,6 +43,7 @@ describe('Codex beginner preparation', () => {
       expect(first.configSource).toBe('local-settings')
       expect(await fs.readFile(first.configPath, 'utf8')).toContain('model = "test-model"')
       expect(await fs.readFile(first.configPath, 'utf8')).toContain('model_reasoning_effort = "high"')
+      expect(await fs.readFile(first.configPath, 'utf8')).toContain('enable_request_compression = false')
       expect(await fs.readFile(path.join(root, 'codex-home', 'skills', 'headless-minecraft-testing', 'SKILL.md'), 'utf8')).toContain('headless-minecraft-testing')
 
       const second = await prepareCodex({rootDir: root, serverConfig: settings, existingExecutable: 'C:\\codex.exe', bundledSkillsDir})
