@@ -7,6 +7,7 @@ cleanup-backup-*/
 artifacts/
 output/
 .agents/
+.zcode/
 *.recovery-backup
 *.log
 *.tsbuildinfo
@@ -14,9 +15,17 @@ ui-check*.png
 ui-check*.jpg
 .DS_Store
 
+# Local runtime state and generated archives
+/HeadlessMC/
+/log/
+/modmind-mcp-open-source.zip
+/resources/server-pack-creator/.parts/
+/resources/server-pack-creator/*.partial
+
 # Local development artifacts
 /video-assets/
 /scripts/inspect-loader-ui.mjs
 /scripts/inspect-production-ui.mjs
+/scripts/restore-timeline.py
 /scripts/smoke-loader-templates.ts
 /scripts/smoke-packaged-app.mjs

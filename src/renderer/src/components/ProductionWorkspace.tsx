@@ -13,6 +13,7 @@ import {
   Plus,
   RefreshCw,
   ShieldCheck,
+  Sparkles,
   Trash2,
   Workflow,
   X
@@ -28,6 +29,7 @@ import type {
   TestTarget
 } from '../../../shared/production'
 import type { ProjectInfo } from '../../../shared/types'
+import { useConfirmDialog } from './InteractionDialogs'
 
 type ProductionTab = 'dependencies' | 'content' | 'tests' | 'release'
 type PublishTarget = 'modrinth' | 'curseforge' | 'github'
@@ -54,7 +56,10 @@ const testTargets: Array<{ id: TestTarget; label: string; detail: string }> = [
 const defaultRelease = (project: ProjectInfo): ReleaseSettings => ({
   version: '0.1.0',
   displayName: `${project.name} 0.1.0`,
+  summary: '',
   changelog: '',
+  autoBump: true,
+  bumpMode: 'patch',
   channel: 'release',
   modrinthProjectId: '',
   curseForgeProjectId: '',
@@ -69,7 +74,14 @@ function compactNumber(value: number): string {
   return new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 }).format(value)
 }
 
+function DependencyIcon({ url }: { url?: string }): React.JSX.Element {
+  const [failed, setFailed] = useState(false)
+  if (!url || failed) return <span className="dependency-placeholder" aria-hidden="true"><PackageSearch size={19} /></span>
+  return <img src={url} alt="" loading="lazy" referrerPolicy="no-referrer" onError={() => setFailed(true)} />
+}
+
 function DependenciesPane({ onFilesChanged }: { onFilesChanged: () => void }): React.JSX.Element {
+  const { confirm: requestConfirm, dialog: confirmDialog } = useConfirmDialog()
   const [query, setQuery] = useState('')
   const [hits, setHits] = useState<DependencyProject[]>([])
   const [managed, setManaged] = useState<ManagedDependency[]>([])
@@ -92,7 +104,7 @@ function DependenciesPane({ onFilesChanged }: { onFilesChanged: () => void }): R
     try {
       const result = await window.modmind.production.dependencies.search(query)
       setHits(result.hits)
-      if (!result.hits.length) setNotice('没有找到与当前 Loader 和 Minecraft 版本兼容的项目。')
+      if (!result.hits.length) setNotice('没有找到与当前 Loader 和 Minecraft 版本兼容的项目')
     } catch (error) {
       setNotice(errorMessage(error))
     } finally {
@@ -116,7 +128,7 @@ function DependenciesPane({ onFilesChanged }: { onFilesChanged: () => void }): R
   }
 
   const remove = async (dependency: ManagedDependency): Promise<void> => {
-    if (!window.confirm(`移除依赖“${dependency.name}”？\n\n将同步更新 Gradle、项目依赖目录和测试实例。`)) return
+    if (!await requestConfirm({ title: `移除依赖“${dependency.name}”？`, message: '将同步更新 Gradle、项目依赖目录和测试实例', confirmLabel: '移除依赖', tone: 'danger' })) return
     setBusy(dependency.projectId)
     setNotice('')
     try {
@@ -169,7 +181,7 @@ function DependenciesPane({ onFilesChanged }: { onFilesChanged: () => void }): R
 
   return <div className="production-pane dependency-pane">
     <div className="production-toolbar">
-      <div><h2>Modrinth 依赖中心</h2><p>搜索结果已按当前 Loader 与 Minecraft 版本筛选。</p></div>
+      <div><h2>Modrinth 依赖中心</h2><p>搜索结果已按当前 Loader 与 Minecraft 版本筛选</p></div>
       <div className="production-search">
         <input value={query} onChange={(event) => setQuery(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter') void search() }} placeholder="搜索 API、前置或兼容模组" />
         <button className="primary-button" disabled={!query.trim() || Boolean(busy)} onClick={() => void search()}>{busy === 'search' ? <LoaderCircle className="spin" size={15} /> : <PackageSearch size={15} />}搜索</button>
@@ -177,15 +189,15 @@ function DependenciesPane({ onFilesChanged }: { onFilesChanged: () => void }): R
     </div>
     {notice ? <div className="production-notice"><CircleAlert size={14} /><span>{notice}</span></div> : null}
     <section className="maven-dependency-form">
-      <div><h3>Maven 坐标</h3><p>添加不在 Modrinth 上的 API 或库；仓库地址仅允许 HTTPS。</p></div>
-      <input value={mavenCoordinate} onChange={(event) => setMavenCoordinate(event.target.value)} placeholder="group:artifact:version" />
-      <input value={mavenRepository} onChange={(event) => setMavenRepository(event.target.value)} placeholder="https://repo.example.com/releases（可选）" />
-      <select value={mavenConfiguration} onChange={(event) => setMavenConfiguration(event.target.value as typeof mavenConfiguration)}>
+      <div className="maven-dependency-copy"><h3>Maven 坐标</h3><p>添加不在 Modrinth 上的 API 或库；仓库地址仅允许 HTTPS</p></div>
+      <label className="maven-field">坐标<input value={mavenCoordinate} onChange={(event) => setMavenCoordinate(event.target.value)} placeholder="group:artifact:version" /></label>
+      <label className="maven-field">仓库地址<input value={mavenRepository} onChange={(event) => setMavenRepository(event.target.value)} placeholder="https://repo.example.com/releases（可选）" /></label>
+      <label className="maven-field">依赖配置<select value={mavenConfiguration} onChange={(event) => setMavenConfiguration(event.target.value as typeof mavenConfiguration)}>
         <option value="implementation">implementation</option>
         <option value="modImplementation">modImplementation</option>
         <option value="compileOnly">compileOnly</option>
         <option value="runtimeOnly">runtimeOnly</option>
-      </select>
+      </select></label>
       <button className="secondary-button" disabled={!mavenCoordinate.trim() || Boolean(busy)} onClick={() => void installMaven()}>{busy === 'maven' ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}添加 Maven</button>
     </section>
     <section className="managed-dependencies">
@@ -199,11 +211,12 @@ function DependenciesPane({ onFilesChanged }: { onFilesChanged: () => void }): R
     </section>
     <section className="dependency-results" aria-label="依赖搜索结果">
       {hits.map((dependencyProject) => <article className="dependency-result" key={dependencyProject.projectId}>
-        {dependencyProject.iconUrl ? <img src={dependencyProject.iconUrl} alt="" /> : <span className="dependency-placeholder"><PackageSearch size={19} /></span>}
+        <DependencyIcon url={dependencyProject.iconUrl} />
         <div><h3>{dependencyProject.title}</h3><p>{dependencyProject.description}</p><small>{compactNumber(dependencyProject.downloads)} 次下载 · 客户端 {dependencyProject.clientSide} / 服务端 {dependencyProject.serverSide}</small></div>
         <button className={installedIds.has(dependencyProject.projectId) ? 'secondary-button compact' : 'primary-button compact'} disabled={Boolean(busy)} onClick={() => void install(dependencyProject)}>{busy === dependencyProject.projectId ? <LoaderCircle className="spin" size={14} /> : installedIds.has(dependencyProject.projectId) ? <RefreshCw size={14} /> : <Download size={14} />}{installedIds.has(dependencyProject.projectId) ? '更新' : '安装'}</button>
       </article>)}
     </section>
+    {confirmDialog}
   </div>
 }
 
@@ -289,7 +302,7 @@ function ContentPane({ onFilesChanged }: { onFilesChanged: () => void }): React.
 
   return <div className="production-pane content-pane">
     <div className="production-toolbar">
-      <div><h2>内容与数据</h2><p>生成版本匹配的资源 JSON，导入音频并检查资源引用。</p></div>
+      <div><h2>内容与数据</h2><p>生成版本匹配的资源 JSON，导入音频并检查资源引用</p></div>
       <button className="secondary-button" disabled={Boolean(busy)} onClick={() => void validate()}>{busy === 'validate' ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}验证资源</button>
     </div>
     <div className="content-builder">
@@ -355,7 +368,7 @@ function TestsPane(): React.JSX.Element {
 
   return <div className="production-pane tests-pane">
     <div className="production-toolbar">
-      <div><h2>自动测试矩阵</h2><p>顺序验证构建、客户端、专用服务器和 Loader GameTest。</p></div>
+      <div><h2>自动测试矩阵</h2><p>顺序验证构建、客户端、专用服务器和 Loader GameTest</p></div>
       <button className="secondary-button" disabled={Boolean(busy)} onClick={() => void workflow()}>{busy === 'workflow' ? <LoaderCircle className="spin" size={15} /> : <Workflow size={15} />}生成 CI</button>
     </div>
     <div className="test-targets">{testTargets.map((target) => <label key={target.id} className={targets.includes(target.id) ? 'selected' : ''}>
@@ -373,6 +386,7 @@ function TestsPane(): React.JSX.Element {
 }
 
 function ReleasePane({ project }: { project: ProjectInfo }): React.JSX.Element {
+  const { confirm: requestConfirm, dialog: confirmDialog } = useConfirmDialog()
   const [settings, setSettings] = useState<ReleaseSettings>(() => defaultRelease(project))
   const [targets, setTargets] = useState<PublishTarget[]>([])
   const [preflight, setPreflight] = useState<ReleasePreflightResult | null>(null)
@@ -394,7 +408,7 @@ function ReleasePane({ project }: { project: ProjectInfo }): React.JSX.Element {
     setNotice('')
     try {
       setSettings(await window.modmind.production.release.saveSettings(settings))
-      setNotice('发布配置已保存，令牌使用系统加密存储。')
+      setNotice('发布配置已保存，令牌使用系统加密存储')
     } catch (error) {
       setNotice(errorMessage(error))
     } finally {
@@ -416,10 +430,10 @@ function ReleasePane({ project }: { project: ProjectInfo }): React.JSX.Element {
 
   const publish = async (): Promise<void> => {
     if (!preflight?.ready) {
-      setNotice('请先完成预检并修复失败项。')
+      setNotice('请先完成预检并修复失败项')
       return
     }
-    if (!targets.length || !window.confirm(`确认将 ${settings.version} 发布到 ${targets.join('、')}？\n\n这是不可自动撤销的外部操作。`)) return
+    if (!targets.length || !await requestConfirm({ title: `确认发布 ${settings.version}？`, message: `目标：${targets.join('、')}\n\n这是不可自动撤销的外部操作`, confirmLabel: '确认发布', tone: 'danger', actionIcon: 'continue' })) return
     setBusy('publish')
     setResults([])
     setNotice('')
@@ -436,7 +450,7 @@ function ReleasePane({ project }: { project: ProjectInfo }): React.JSX.Element {
 
   return <div className="production-pane release-pane">
     <div className="production-toolbar">
-      <div><h2>发布中心</h2><p>统一预检并发布到 Modrinth、CurseForge 和 GitHub Releases。</p></div>
+      <div><h2>发布中心</h2><p>统一预检并发布到 Modrinth、CurseForge 和 GitHub Releases</p></div>
       <div className="production-toolbar-actions">
         <button className="secondary-button" disabled={Boolean(busy)} onClick={() => void check()}>{busy === 'check' ? <LoaderCircle className="spin" size={15} /> : <ShieldCheck size={15} />}预检</button>
         <button className="primary-button" disabled={Boolean(busy)} onClick={() => void save()}>{busy === 'save' ? <LoaderCircle className="spin" size={15} /> : <Check size={15} />}保存</button>
@@ -445,6 +459,9 @@ function ReleasePane({ project }: { project: ProjectInfo }): React.JSX.Element {
     <div className="release-form">
       <label>版本<input value={settings.version} onChange={(event) => update('version', event.target.value)} /></label>
       <label>显示名称<input value={settings.displayName} onChange={(event) => update('displayName', event.target.value)} /></label>
+      <label>摘要<textarea value={settings.summary ?? ''} onChange={(event) => update('summary', event.target.value)} /></label>
+      <label>自动递增<select value={settings.bumpMode ?? 'patch'} onChange={(event) => update('bumpMode', event.target.value as NonNullable<ReleaseSettings['bumpMode']>)}><option value="patch">Patch</option><option value="minor">Minor</option><option value="major">Major</option></select></label>
+      <label className="check-row"><input type="checkbox" checked={settings.autoBump !== false} onChange={(event) => update('autoBump', event.target.checked)} />导出成功后自动增加版本</label>
       <label>通道<select value={settings.channel} onChange={(event) => update('channel', event.target.value as ReleaseSettings['channel'])}><option value="release">Release</option><option value="beta">Beta</option><option value="alpha">Alpha</option></select></label>
       <label className="release-platform-id">Modrinth 项目 ID<input value={settings.modrinthProjectId} onChange={(event) => update('modrinthProjectId', event.target.value)} /></label>
       <label className="release-platform-token">Modrinth Token<input type="password" value={settings.modrinthToken ?? ''} onChange={(event) => update('modrinthToken', event.target.value)} placeholder={settings.hasModrinthToken ? '已加密保存，留空保持不变' : ''} /></label>
@@ -463,11 +480,93 @@ function ReleasePane({ project }: { project: ProjectInfo }): React.JSX.Element {
       <button className="primary-button" disabled={!targets.length || Boolean(busy) || !preflight?.ready} onClick={() => void publish()}>{busy === 'publish' ? <LoaderCircle className="spin" size={15} /> : <CloudUpload size={15} />}确认发布</button>
     </div>
     {results.length ? <div className="publish-results">{results.map((result) => <div className={result.success ? 'success' : 'error'} key={result.target}>{result.success ? <Check size={14} /> : <X size={14} />}<strong>{result.target}</strong><span>{result.detail}</span></div>)}</div> : null}
+    {confirmDialog}
+  </div>
+}
+
+function ModpackDeliveryPane({ project }: { project: ProjectInfo }): React.JSX.Element {
+  const [busy, setBusy] = useState(false)
+  const [notice, setNotice] = useState('')
+  const [settings, setSettings] = useState<ReleaseSettings>(() => defaultRelease(project))
+
+  useEffect(() => {
+    void window.modmind.production.release.getSettings().then(setSettings).catch((error) => setNotice(errorMessage(error)))
+  }, [project.path])
+
+  const update = <K extends keyof ReleaseSettings>(key: K, value: ReleaseSettings[K]): void => setSettings((current) => ({ ...current, [key]: value }))
+
+  const suggestSummary = async (): Promise<void> => {
+    if (busy) return
+    setBusy(true)
+    setNotice('')
+    try {
+      const draft = await window.modmind.production.release.suggestSummary()
+      setSettings((current) => ({ ...current, summary: draft.summary, changelog: draft.changelog || current.changelog }))
+      setNotice(draft.generatedBy === 'ai' ? 'AI 已生成可编辑的摘要和更新日志草稿' : '已根据本地整合包内容生成摘要草稿；连接 AI 后可获得更精炼的文案')
+    } catch (error) {
+      setNotice(`生成摘要失败：${errorMessage(error)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const exportPack = async (): Promise<void> => {
+    if (busy) return
+    setBusy(true)
+    setNotice('')
+    try {
+      await window.modmind.production.release.saveSettings(settings)
+      const target = await window.modmind.project.exportArtifact()
+      if (target) {
+        setSettings(await window.modmind.production.release.getSettings())
+        setNotice(`整合包已导出到 ${target}`)
+      }
+    } catch (error) {
+      setNotice(`导出失败：${errorMessage(error)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const exportServerPack = async (): Promise<void> => {
+    if (busy) return
+    setBusy(true)
+    setNotice('')
+    try {
+      const target = await window.modmind.modpack.exportServerPack()
+      if (target) setNotice(`服务端包已导出：${target}`)
+    } catch (error) {
+      setNotice(`服务端包导出失败：${errorMessage(error)}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return <div className="production-page">
+    <header className="content-toolbar">
+      <div><h1>交付</h1><p>{project.loader} · Minecraft {project.minecraftVersion} · Modrinth 整合包</p></div>
+      <span className="production-ready"><GitBranch size={14} />整合包归档</span>
+    </header>
+    <section className="production-pane modpack-delivery-pane">
+      <div><h2>版本与导出</h2><p>当前版本用于本次 .mrpack；成功导出后才更新到下一版本</p></div>
+      <div className="release-form modpack-release-form">
+        <label>版本<input value={settings.version} onChange={(event) => update('version', event.target.value)} /></label>
+        <label>显示名称<input value={settings.displayName} onChange={(event) => update('displayName', event.target.value)} /></label>
+        <label>自动递增<select value={settings.bumpMode ?? 'patch'} onChange={(event) => update('bumpMode', event.target.value as NonNullable<ReleaseSettings['bumpMode']>)}><option value="patch">Patch</option><option value="minor">Minor</option><option value="major">Major</option></select></label>
+        <label className="check-row"><input type="checkbox" checked={settings.autoBump !== false} onChange={(event) => update('autoBump', event.target.checked)} />导出成功后自动递增</label>
+        <label className="release-changelog">摘要<textarea value={settings.summary ?? ''} onChange={(event) => update('summary', event.target.value)} placeholder="用于 Modrinth 整合包摘要" /></label>
+        <label className="release-changelog">更新日志<textarea value={settings.changelog} onChange={(event) => update('changelog', event.target.value)} placeholder="说明这次交付的变化" /></label>
+      </div>
+      <div className="modpack-delivery-actions"><button className="secondary-button" disabled={busy} onClick={() => void suggestSummary()}>{busy ? <LoaderCircle className="spin" size={15} /> : <Sparkles size={15} />}AI 草拟摘要</button><button className="secondary-button" disabled={busy} onClick={() => void exportServerPack()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}导出服务端包</button><button className="primary-button" disabled={busy} onClick={() => void exportPack()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}导出 .mrpack</button></div>
+      {notice ? <div className="production-notice"><CircleAlert size={14} /><span>{notice}</span></div> : null}
+    </section>
   </div>
 }
 
 export default function ProductionWorkspace({ project, onFilesChanged }: { project: ProjectInfo; onFilesChanged: () => void }): React.JSX.Element {
   const [tab, setTab] = useState<ProductionTab>('dependencies')
+
+  if (project.kind === 'modpack') return <ModpackDeliveryPane project={project} />
 
   return <div className="production-page">
     <header className="content-toolbar">

@@ -26,4 +26,11 @@ describe('Gradle wrapper failure classification', () => {
     expect(isGradleDistributionLockFailure(log)).toBe(false)
     expect(isGradleWrapperBootstrapFailure(log)).toBe(false)
   })
+
+  it('keeps Maven dependency timeouts out of Wrapper recovery', () => {
+    const log = "Could not download mercury-0.4.3.jar (net.fabricmc:mercury:0.4.3)\nCould not get resource 'https://maven.fabricmc.net/net/fabricmc/mercury/0.4.3/mercury-0.4.3.jar'.\nRead timed out"
+
+    expect(isGradleNetworkFailure(log)).toBe(false)
+    expect(isGradleWrapperBootstrapFailure(log)).toBe(false)
+  })
 })

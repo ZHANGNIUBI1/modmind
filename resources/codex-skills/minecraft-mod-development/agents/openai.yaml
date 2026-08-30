@@ -1,0 +1,4 @@
+interface:
+  display_name: "Minecraft Mod Development"
+  short_description: "Implement complete Minecraft mod features across loaders"
+  default_prompt: "Use $minecraft-mod-development to implement this Minecraft mod feature end to end."

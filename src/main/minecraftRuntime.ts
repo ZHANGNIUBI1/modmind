@@ -1,28 +1,26 @@
-import { app } from 'electron'
+import { app, net } from 'electron'
 import { createHash } from 'node:crypto'
 import { spawn } from 'node:child_process'
 import type { ChildProcess, ChildProcessWithoutNullStreams } from 'node:child_process'
 import { createReadStream, createWriteStream, promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
-import { Readable, Transform } from 'node:stream'
-import { pipeline } from 'node:stream/promises'
 import extractZip from 'extract-zip'
-import { Agent } from 'undici'
-import { MinecraftFolder, Version, launch } from '@xmcl/core'
+import { Agent, interceptors } from 'undici'
+import { LaunchPrecheck, MinecraftFolder, Version, launch } from '@xmcl/core'
 import {
   fetchJavaRuntimeManifest,
   getFabricLoaders,
   getForgeVersionList,
   getQuiltLoaders,
   getVersionList,
-  install,
-  installDependencies,
+  installDependenciesTask,
   installFabric,
-  installForge,
+  installForgeTask,
   installJavaRuntimeTask,
-  installNeoForged,
+  installNeoForgedTask,
   installQuiltVersion,
+  installTask,
   JavaRuntimeTargetType
 } from '@xmcl/installer'
 import type {
@@ -35,20 +33,202 @@ import type {
   MinecraftRuntimeStage,
   MinecraftRuntimeState
 } from '../shared/minecraft'
-import type { LoaderKind, ProjectInfo } from '../shared/types'
-import { gradleDistributionSources, type GradleDistributionSource, type GradleDownloadSourcePreference } from './gradleDownload'
-import { isGradleDistributionLockFailure, isGradleNetworkFailure, isGradleWrapperBootstrapFailure } from './gradleFailure'
-import { gradleChecksumForVersion, gradleVersionForProject, javaRuntimeTargetForMinecraft } from './loaderCompatibility'
+import type { JavaPreferences, DetectedJavaHome, LoaderKind, ProjectInfo } from '../shared/types'
+import { isJavaLoader, platformLabel } from '../shared/projectPlatform'
+import { isGradleNetworkFailure } from './gradleFailure'
+import { readModpackManifest, syncModpackOverrides } from './modpackService'
+import { modpackModsRoot } from './modpackPaths'
+import { buildJavaRangeForProject, gradleVersionForProject, javaRuntimeTargetForJavaVersion, javaRuntimeTargetForMinecraft, javaVersionForMinecraft } from './loaderCompatibility'
+import { buildBedrockAddon, buildNeteaseArchive } from './bedrockAddon'
+import { ensureManagedJdk, type ManagedJdkProgress } from './jdkDownload'
+import { sameProjectPath } from './projectPath'
+import { ensureGradleMavenFallback, gradleDistributionSources, type GradleDownloadSourcePreference } from './gradleDownload'
+import { windowsCmdInvocation } from './windowsCommand'
+import { managedJavaExecutable, normalizeRuntimeMetadata, type RuntimeMetadata } from './runtimeMetadata'
+import { diagnosticJournal } from './diagnosticLog'
+import { verifiedDownload } from './downloadService'
+import { downloadActivities } from './downloadActivityService'
+import { describeProcessTermination, MANAGED_GRADLE_BUILD_ARGUMENTS, normalizeProcessExitCode } from './gradleProcess'
+import { isMissingFileError, isTransientFileLockError, lockedFileReadError, retryTransientFileLock } from './fileLockRetry'
+import {
+  BMCLAPI_BASE_URL,
+  MINECRAFT_VERSION_MANIFEST_SOURCES,
+  resolveMinecraftVersionFromManifests
+} from './minecraftVersionManifest'
+import { runMinecraftTaskWithRecovery } from './minecraftTaskRecovery'
 
-interface RuntimeMetadata {
-  minecraftVersion: string
-  loader: LoaderKind
-  loaderVersionId: string
-  fabricVersionId?: string
-  loaderVersion: string
-  javaPath: string
-  javaTarget: string
-  preparedAt: string
+const BMCLAPI = BMCLAPI_BASE_URL
+const MINECRAFT_ASSET_HOSTS = [`${BMCLAPI}/assets`, 'https://resources.download.minecraft.net']
+const MINECRAFT_MAVEN_HOSTS = [`${BMCLAPI}/maven`, 'https://libraries.minecraft.net', 'https://repo1.maven.org/maven2']
+const FORGE_MAVEN_HOSTS = [`${BMCLAPI}/maven`, 'https://maven.minecraftforge.net']
+const NEOFORGE_MAVEN_HOSTS = [`${BMCLAPI}/maven`, 'https://maven.neoforged.net/releases']
+
+function mirrorVersionJsonUrl(versionId: string): string {
+  return `${BMCLAPI}/version/${encodeURIComponent(versionId)}/${encodeURIComponent(versionId)}.json`
+}
+
+function mirrorMinecraftJarUrl(versionId: string, side: 'client' | 'server'): string {
+  return `${BMCLAPI}/version/${encodeURIComponent(versionId)}/${side}`
+}
+
+function officialAssetIndexUrls(version: { assets?: string; assetIndex?: { sha1?: string } }): string[] {
+  const id = version.assets?.trim()
+  const sha1 = version.assetIndex?.sha1?.trim()
+  if (!id || !sha1) return []
+  return [
+    `https://piston-meta.mojang.com/v1/packages/${sha1}/${encodeURIComponent(id)}.json`,
+    `https://launchermeta.mojang.com/v1/packages/${sha1}/${encodeURIComponent(id)}.json`
+  ]
+}
+
+const MAX_ASSET_INDEX_BYTES = 32 * 1024 * 1024
+
+function assetIndexPath(resourceRoot: string, version: { assets?: string }): string | null {
+  const id = version.assets?.trim()
+  return id ? path.join(resourceRoot, 'assets', 'indexes', `${id}.json`) : null
+}
+
+function hashedAssetIndexPath(resourceRoot: string, sha1: string): string {
+  return path.join(resourceRoot, 'assets', 'indexes', `${sha1}.json`)
+}
+
+async function validAssetIndex(filePath: string, expectedSha1: string): Promise<boolean> {
+  try {
+    if ((await fs.stat(filePath)).size < 1) return false
+    if ((await sha1File(filePath)) !== expectedSha1.toLowerCase()) return false
+    const parsed = JSON.parse(await fs.readFile(filePath, 'utf8')) as { objects?: unknown }
+    return Boolean(parsed && parsed.objects && typeof parsed.objects === 'object' && !Array.isArray(parsed.objects))
+  } catch {
+    return false
+  }
+}
+
+function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message
+  return String(error)
+}
+
+/**
+ * Electron's network stack uses the platform certificate store. This matters
+ * on Windows when a proxy or security product installs a trusted root there,
+ * while Node/Undici still reports UNABLE_TO_VERIFY_LEAF_SIGNATURE.
+ */
+async function ensureAssetIndex(
+  version: { assets?: string; assetIndex?: { sha1?: string } },
+  resourceRoot: string,
+  signal?: AbortSignal
+): Promise<void> {
+  const expectedSha1 = version.assetIndex?.sha1?.trim().toLowerCase()
+  const destination = assetIndexPath(resourceRoot, version)
+  if (!expectedSha1 || !destination) return
+  const hashedDestination = hashedAssetIndexPath(resourceRoot, expectedSha1)
+  if (await validAssetIndex(destination, expectedSha1)) {
+    if (!(await validAssetIndex(hashedDestination, expectedSha1))) {
+      await fs.copyFile(destination, hashedDestination).catch(() => undefined)
+    }
+    return
+  }
+  if (await validAssetIndex(hashedDestination, expectedSha1)) {
+    await fs.copyFile(hashedDestination, destination).catch(() => undefined)
+    return
+  }
+
+  await fs.rm(destination, { force: true }).catch(() => undefined)
+  await fs.rm(hashedDestination, { force: true }).catch(() => undefined)
+  const pending = `${destination}.pending-${process.pid}-${Date.now()}`
+  const pendingHash = `${hashedDestination}.pending-${process.pid}-${Date.now()}`
+  const failures: string[] = []
+  for (const url of officialAssetIndexUrls(version)) {
+    try {
+      const response = await domesticMinecraftFetch(url, { signal })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const body = Buffer.from(await response.arrayBuffer())
+      if (body.length < 1 || body.length > MAX_ASSET_INDEX_BYTES) throw new Error(`invalid response size: ${body.length}`)
+      const actualSha1 = createHash('sha1').update(body).digest('hex')
+      if (actualSha1 !== expectedSha1) throw new Error(`SHA1 mismatch: expected ${expectedSha1}, got ${actualSha1}`)
+      const parsed = JSON.parse(body.toString('utf8')) as { objects?: unknown }
+      if (!parsed || !parsed.objects || typeof parsed.objects !== 'object' || Array.isArray(parsed.objects)) {
+        throw new Error('asset index JSON does not contain an objects map')
+      }
+      await fs.mkdir(path.dirname(destination), { recursive: true })
+      await fs.writeFile(pending, body, { flag: 'w' })
+      await fs.rename(pending, destination)
+      await fs.writeFile(pendingHash, body, { flag: 'w' })
+      await fs.rename(pendingHash, hashedDestination)
+      diagnosticJournal.record({
+        subsystem: 'minecraft-download',
+        operation: 'asset-index',
+        phase: 'success',
+        message: 'Minecraft asset index downloaded and verified',
+        data: { url, destination, bytes: body.length, sha1: actualSha1 }
+      })
+      return
+    } catch (error) {
+      if (signal?.aborted) throw abortError()
+      const detail = errorMessage(error)
+      failures.push(`${url}: ${detail}`)
+      diagnosticJournal.record({
+        subsystem: 'minecraft-download',
+        operation: 'asset-index',
+        phase: 'error',
+        level: 'warning',
+        message: 'Minecraft asset index request failed',
+        data: { url, destination },
+        error
+      })
+      await fs.rm(pending, { force: true }).catch(() => undefined)
+      await fs.rm(pendingHash, { force: true }).catch(() => undefined)
+    }
+  }
+  const detail = failures.join('; ')
+  const error = new Error(`Minecraft asset index download failed${detail ? `: ${detail}` : ''}`)
+  throw error
+}
+
+async function domesticMinecraftFetch(input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]): Promise<Response> {
+  const timeout = AbortSignal.timeout(90_000)
+  const signal = init?.signal ? AbortSignal.any([init.signal, timeout]) : timeout
+  const startedAt = Date.now()
+  const url = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+  try {
+    const response = await net.fetch(
+      typeof input === 'string' ? input : input instanceof URL ? input.toString() : input,
+      {...init, signal} as any
+    ) as unknown as Response
+    const durationMs = Date.now() - startedAt
+    if (!response.ok || durationMs >= 5_000) {
+      diagnosticJournal.record({
+        subsystem: 'minecraft-download',
+        operation: 'fetch',
+        phase: response.ok ? 'slow-response' : 'http-error',
+        level: response.ok ? 'warning' : 'error',
+        message: `${response.ok ? 'Slow' : 'Failed'} Minecraft request: HTTP ${response.status}`,
+        durationMs,
+        data: { url, status: response.status, redirected: response.redirected, responseUrl: response.url }
+      })
+    }
+    return response
+  } catch (error) {
+    diagnosticJournal.record({ subsystem: 'minecraft-download', operation: 'fetch', phase: 'error', message: 'Minecraft network request failed', durationMs: Date.now() - startedAt, data: { url }, error })
+    throw error
+  }
+}
+
+function minecraftDownloadDispatcher() {
+  return new Agent({ connections: 4, bodyTimeout: 60_000, headersTimeout: 30_000 }).compose(
+    interceptors.retry({ maxRetries: 3 }),
+    interceptors.redirect({ maxRedirections: 5 })
+  )
+}
+
+function minecraftAssetHosts(attempt: number): string[] {
+  return attempt % 2 === 1 ? MINECRAFT_ASSET_HOSTS : [MINECRAFT_ASSET_HOSTS[1], MINECRAFT_ASSET_HOSTS[0]]
+}
+
+function minecraftMavenHosts(attempt: number): string[] {
+  return attempt % 2 === 1
+    ? MINECRAFT_MAVEN_HOSTS
+    : [MINECRAFT_MAVEN_HOSTS[1], MINECRAFT_MAVEN_HOSTS[0], MINECRAFT_MAVEN_HOSTS[2]]
 }
 
 interface MinecraftRuntimeOptions {
@@ -56,11 +236,9 @@ interface MinecraftRuntimeOptions {
   onState: (state: MinecraftRuntimeState) => void
   onEvent: (event: MinecraftRuntimeEvent) => void
   authorizeBuild?: (project: ProjectInfo) => Promise<void>
-  getGradlePreference?: () => Promise<{
-    preferLocalGradle: boolean
-    executable?: string
-    downloadSource?: GradleDownloadSourcePreference
-  }>
+  getGradleDownloadSource?: () => Promise<GradleDownloadSourcePreference>
+  getJavaPreference?: () => Promise<Partial<JavaPreferences> | undefined>
+  prepareProjectDependencies?: (project: ProjectInfo, signal?: AbortSignal) => Promise<void>
 }
 
 export function gradleVersionFor(project: ProjectInfo): string {
@@ -70,89 +248,31 @@ export function gradleVersionFor(project: ProjectInfo): string {
 interface GradleRuntimeSelection {
   executable: string
   javaHome: string
-  usesWrapper: boolean
-  source: 'wrapper' | 'managed' | 'local'
-  version?: string
+  usesWrapper: true
+  source: 'wrapper'
 }
 
-async function probeGradleExecutable(configured: string | undefined): Promise<{ executable: string; version?: string } | null> {
-  let executable = configured?.trim() || 'gradle'
-  if (/["\r\n&|<>^]/.test(executable)) return null
-  if (configured?.trim()) {
-    const stat = await fs.stat(executable).catch(() => null)
-    if (stat?.isDirectory()) executable = path.join(executable, 'bin', process.platform === 'win32' ? 'gradle.bat' : 'gradle')
-    if (!(await exists(executable))) return null
-  }
-  return await new Promise((resolve) => {
-    const child = spawn(executable, ['--version'], { windowsHide: true, shell: process.platform === 'win32' })
-    let output = ''
-    let settled = false
-    const finish = (value: { executable: string; version?: string } | null): void => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      resolve(value)
-    }
-    const timer = setTimeout(() => {
-      if (child.pid) {
-        if (process.platform === 'win32') spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, shell: false })
-        else child.kill('SIGTERM')
-      }
-      finish(null)
-    }, 10_000)
-    child.stdout.on('data', (chunk: Buffer) => { output += chunk.toString('utf8') })
-    child.stderr.on('data', (chunk: Buffer) => { output += chunk.toString('utf8') })
-    child.once('error', () => finish(null))
-    child.once('exit', (code) => {
-      const version = output.match(/^Gradle\s+([^\s]+)$/m)?.[1]
-      finish(code === 0 ? { executable, ...(version ? { version } : {}) } : null)
-    })
-  })
+export function projectGradleWrapperExecutable(projectRoot: string, platform: NodeJS.Platform = process.platform): string {
+  return path.join(projectRoot, platform === 'win32' ? 'gradlew.bat' : 'gradlew')
 }
 
-async function probeGradleDistributionSource(source: GradleDistributionSource): Promise<number> {
-  const sampleBytes = 2 * 1024 * 1024
-  const started = Date.now()
-  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
-  let downloaded = 0
-  try {
-    const response = await fetch(source.url, {
-      headers: { Range: `bytes=0-${sampleBytes - 1}` },
-      signal: AbortSignal.timeout(10_000)
-    })
-    if (!response.ok || !response.body) return 0
-    reader = response.body.getReader()
-    while (downloaded < sampleBytes) {
-      const result = await reader.read()
-      if (result.done) break
-      downloaded += result.value.byteLength
-    }
-    const elapsedMs = Math.max(Date.now() - started, 1)
-    return downloaded >= 64 * 1024 ? downloaded / elapsedMs : 0
-  } catch {
-    return 0
-  } finally {
-    await reader?.cancel().catch(() => undefined)
-  }
+function projectDataDirectory(_project: ProjectInfo): '.modmind' {
+  return '.modmind'
 }
 
-function projectDataDirectory(project: ProjectInfo): '.modmind' | '.modtool' {
-  return project.toolDataDirectory === '.modtool' ? '.modtool' : '.modmind'
-}
-
-function projectArtifactName(project: ProjectInfo): string {
-  return projectDataDirectory(project) === '.modtool' ? 'modtool-current-project.jar' : 'modmind-current-project.jar'
+function projectArtifactName(_project: ProjectInfo): string {
+  return 'modmind-current-project.jar'
 }
 
 function managedLoaderApiName(project: ProjectInfo): string {
   const api = project.loader === 'quilt' ? 'quilted-fabric-api' : 'fabric-api'
-  return projectDataDirectory(project) === '.modtool' ? `modtool-managed-${api}.jar` : `modmind-managed-${api}.jar`
+  return `modmind-managed-${api}.jar`
 }
 
 function summarizeGradleFailure(logText: string): string {
   const lines = logText.split(/\r?\n/)
   if (isGradleNetworkFailure(logText)) {
-    return '无法下载 Gradle 分发包。请检查网络/代理，或在设置中启用“优先使用本机 Gradle”并指定与模板兼容的版本；迁移本身不受影响。'
+    return '项目 Gradle Wrapper 无法取得配置的 Gradle 分发包。请检查 gradle/wrapper/gradle-wrapper.properties、网络或代理设置'
   }
   const compilerErrors: string[] = []
   for (let index = 0; index < lines.length && compilerErrors.length < 12; index += 1) {
@@ -176,7 +296,7 @@ function summarizeMinecraftCrash(report: string): string {
   const causes = lines.filter((line) => line.startsWith('Caused by:'))
   const rootCause = causes.at(-1)
   const modFrames = lines
-    .filter((line) => /^\s*at (?:knot\/\/)?dev\.(?:modmind|modtool)\./.test(line))
+    .filter((line) => /^\s*at (?:knot\/\/)?dev\.modmind\./.test(line))
     .slice(0, 6)
     .map((line) => line.trim())
   const diagnostic = rootCause?.includes("This registry can't create intrusive holders")
@@ -198,7 +318,26 @@ async function listExtractedFiles(root: string): Promise<string[]> {
   return files
 }
 
-async function validateModArtifact(filePath: string, loader: LoaderKind): Promise<void> {
+/** Fabric API is a legal jar-in-jar: its compiled classes live in nested JARs. */
+async function containsCompiledClass(root: string, files: string[]): Promise<boolean> {
+  if (files.some((file) => file.endsWith('.class'))) return true
+  const nestedJars = files.filter((file) => /^META-INF\/jars\/[^/]+\.jar$/i.test(file))
+  for (const nested of nestedJars) {
+    const nestedRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-nested-jar-'))
+    try {
+      await extractZip(path.join(root, nested), { dir: nestedRoot })
+      const nestedFiles = await listExtractedFiles(nestedRoot)
+      if (nestedFiles.some((file) => file.endsWith('.class'))) return true
+    } catch {
+      // A malformed nested archive is rejected by the loader; keep checking other entries.
+    } finally {
+      await fs.rm(nestedRoot, { recursive: true, force: true }).catch(() => undefined)
+    }
+  }
+  return false
+}
+
+async function validateModArtifact(filePath: string, loader: LoaderKind, displayPath = filePath): Promise<void> {
   const stat = await fs.stat(filePath)
   if (stat.size < 1_024) throw new Error('Mod JAR is implausibly small')
   const temporaryRoot = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-jar-'))
@@ -212,10 +351,10 @@ async function validateModArtifact(filePath: string, loader: LoaderKind): Promis
     if (!descriptors.some((descriptor) => files.includes(descriptor))) {
       throw new Error(`Mod JAR does not contain a ${loader} descriptor`)
     }
-    if (!files.some((file) => file.endsWith('.class'))) throw new Error('Mod JAR does not contain compiled class files')
+    if (!(await containsCompiledClass(temporaryRoot, files))) throw new Error('Mod JAR does not contain compiled class files')
   } catch (error) {
     const detail = error instanceof Error ? error.message : String(error)
-    throw new Error(`Invalid Mod JAR: ${detail}`)
+    throw new Error(`Invalid Mod JAR "${path.basename(displayPath)}": ${detail}`)
   } finally {
     await fs.rm(temporaryRoot, { recursive: true, force: true }).catch(() => undefined)
   }
@@ -229,7 +368,7 @@ async function replaceModArtifact(source: string, target: string, loader: Loader
   if (!(await exists(target)) && (await exists(backup))) await fs.rename(backup, target)
   await fs.rm(pending, { force: true })
   await fs.copyFile(source, pending)
-  await validateModArtifact(pending, loader)
+  await validateModArtifact(pending, loader, source)
 
   let backedUp = false
   try {
@@ -277,6 +416,241 @@ async function exists(target: string): Promise<boolean> {
   } catch {
     return false
   }
+}
+
+function abortError(message = 'Minecraft 操作已取消'): Error {
+  return Object.assign(new Error(message), { name: 'AbortError' })
+}
+
+async function waitWithAbort<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return operation
+  if (signal.aborted) throw abortError()
+  return await new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(abortError())
+    signal.addEventListener('abort', onAbort, { once: true })
+    operation.then(
+      (value) => {
+        signal.removeEventListener('abort', onAbort)
+        resolve(value)
+      },
+      (error) => {
+        signal.removeEventListener('abort', onAbort)
+        reject(error)
+      }
+    )
+  })
+}
+
+async function sha256File(filePath: string): Promise<{ size: number; sha256: string }> {
+  try {
+    return await retryTransientFileLock(async () => {
+      const stat = await fs.stat(filePath)
+      const hash = createHash('sha256')
+      for await (const chunk of createReadStream(filePath)) hash.update(chunk as Buffer)
+      return { size: stat.size, sha256: hash.digest('hex') }
+    })
+  } catch (error) {
+    if (isTransientFileLockError(error)) throw lockedFileReadError(filePath, error)
+    throw error
+  }
+}
+
+async function sha1File(filePath: string): Promise<string> {
+  const hash = createHash('sha1')
+  for await (const chunk of createReadStream(filePath)) hash.update(chunk as Buffer)
+  return hash.digest('hex')
+}
+
+interface JavaProbeResult {
+  javaPath: string
+  major: number
+}
+
+async function probeJavaHome(home: string, minimumMajor: number, requireJavac: boolean, maximumMajor = Number.POSITIVE_INFINITY): Promise<JavaProbeResult | null> {
+  let normalizedHome = home.trim().replace(/^"|"$/g, '')
+  if (path.basename(normalizedHome).toLowerCase() === (process.platform === 'win32' ? 'java.exe' : 'java')) {
+    normalizedHome = path.dirname(path.dirname(normalizedHome))
+  }
+  if (!normalizedHome) return null
+  const javaPath = path.join(normalizedHome, 'bin', process.platform === 'win32' ? 'java.exe' : 'java')
+  if (!(await exists(javaPath))) return null
+  const output = await new Promise<{code: number; text: string}>((resolve) => {
+    let text = ''
+    const child = spawn(javaPath, ['-version'], { cwd: normalizedHome, windowsHide: true, shell: false })
+    const finish = (code: number): void => resolve({ code, text: text.slice(-8_000) })
+    const timer = setTimeout(() => {
+      if (child.pid) {
+        if (process.platform === 'win32') spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, shell: false })
+        else child.kill('SIGTERM')
+      }
+      finish(124)
+    }, 10_000)
+    const capture = (chunk: Buffer): void => { text += chunk.toString('utf8') }
+    child.stdout.on('data', capture)
+    child.stderr.on('data', capture)
+    child.once('error', () => { clearTimeout(timer); finish(1) })
+    child.once('exit', (code) => { clearTimeout(timer); finish(code ?? 1) })
+  })
+  if (output.code !== 0) return null
+  const rawVersion = output.text.match(/version\s+["'](?:1\.)?(\d+)/i)?.[1]
+  const major = rawVersion ? Number(rawVersion) : 0
+  if (!major || major < minimumMajor || major > maximumMajor) return null
+  if (!requireJavac) return { javaPath, major }
+  const javacPath = path.join(normalizedHome, 'bin', process.platform === 'win32' ? 'javac.exe' : 'javac')
+  if (!(await exists(javacPath))) return null
+  const compiler = await new Promise<boolean>((resolve) => {
+    const child = spawn(javacPath, ['-version'], { cwd: normalizedHome, windowsHide: true, shell: false })
+    const timer = setTimeout(() => {
+      if (child.pid) {
+        if (process.platform === 'win32') spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, shell: false })
+        else child.kill('SIGTERM')
+      }
+      resolve(false)
+    }, 10_000)
+    child.once('error', () => { clearTimeout(timer); resolve(false) })
+    child.once('exit', (code) => { clearTimeout(timer); resolve(code === 0) })
+  })
+  return compiler ? { javaPath, major } : null
+}
+
+async function configuredBuildJavaHomes(project: ProjectInfo): Promise<string[]> {
+  const properties = await fs.readFile(path.join(project.path, 'gradle.properties'), 'utf8').catch(() => '')
+  const configured = properties.match(/^org\.gradle\.java\.home\s*=\s*(.+)$/m)?.[1]?.trim().replaceAll('\\\\', '\\')
+  const pathHomes: string[] = []
+  for (const entry of (process.env.PATH ?? '').split(path.delimiter)) {
+    const trimmed = entry.trim().replace(/^"|"$/g, '')
+    if (!trimmed) continue
+    const candidate = path.basename(trimmed).toLowerCase() === 'bin' ? path.dirname(trimmed) : trimmed
+    const javaExecutable = path.join(candidate, 'bin', process.platform === 'win32' ? 'java.exe' : 'java')
+    if (await exists(javaExecutable)) pathHomes.push(candidate)
+  }
+  // Windows often exposes Java through a PATH shim (for example Oracle's
+  // Common Files\Java\javapath), so the PATH entry itself is not a JDK home.
+  // Ask the selected Java runtime for its real home before falling back to the
+  // bundled Minecraft runtime.
+  const discoveredHomes = await discoverJavaHomesFromPath()
+  return [...new Set([
+    configured,
+    process.env.JAVA_HOME,
+    process.env.JDK_HOME,
+    ...discoveredHomes,
+    ...pathHomes
+  ].filter((value): value is string => Boolean(value && value.trim())))]
+}
+
+async function discoverJavaHomesFromPath(): Promise<string[]> {
+  const command = process.platform === 'win32' ? 'java.exe' : 'java'
+  return await new Promise<string[]>((resolve) => {
+    let output = ''
+    const child = spawn(command, ['-XshowSettings:properties', '-version'], {
+      windowsHide: true,
+      shell: false,
+      env: process.env
+    })
+    const timer = setTimeout(() => {
+      if (child.pid) {
+        if (process.platform === 'win32') spawn('taskkill', ['/pid', String(child.pid), '/t', '/f'], { windowsHide: true, shell: false })
+        else child.kill('SIGTERM')
+      }
+      resolve([])
+    }, 10_000)
+    const capture = (chunk: Buffer): void => { output += chunk.toString('utf8') }
+    child.stdout.on('data', capture)
+    child.stderr.on('data', capture)
+    const finish = (): void => {
+      clearTimeout(timer)
+      const home = output.match(/^\s*java\.home\s*=\s*(.+?)\s*$/m)?.[1]?.trim()
+      if (!home) return resolve([])
+      const normalized = home.replace(/^"|"$/g, '')
+      const homes = [normalized]
+      if (path.basename(normalized).toLowerCase() === 'jre') homes.push(path.dirname(normalized))
+      resolve(homes)
+    }
+    child.once('error', finish)
+    child.once('exit', finish)
+  })
+}
+
+/** Validate an arbitrary user-provided JDK home (or bin/java path) without version constraints. */
+export async function probeJavaHomeInfo(home: string): Promise<{ valid: boolean; major: number }> {
+  const candidate = await probeJavaHome(home, 1, false)
+  return candidate ? { valid: true, major: candidate.major } : { valid: false, major: 0 }
+}
+
+async function listSubdirectoryPaths(root: string): Promise<string[]> {
+  try {
+    const entries = await fs.readdir(root, { withFileTypes: true })
+    return entries.filter((entry) => entry.isDirectory()).map((entry) => path.join(root, entry.name))
+  } catch {
+    return []
+  }
+}
+
+// Launcher vendors (Oracle, Adoptium, Azul, Microsoft, ...) each install into
+// their own root; scanning the well-known parents is enough to populate the
+// settings picker without walking whole drives.
+async function commonRootJavaHomeCandidates(): Promise<string[]> {
+  if (process.platform === 'win32') {
+    const home = os.homedir()
+    const programFiles = process.env['ProgramFiles'] ?? 'C:\\Program Files'
+    const programFilesX86 = process.env['ProgramFiles(x86)'] ?? 'C:\\Program Files (x86)'
+    const roots = [
+      path.join(programFiles, 'Java'),
+      path.join(programFiles, 'Eclipse Adoptium'),
+      path.join(programFiles, 'Microsoft'),
+      path.join(programFiles, 'Zulu'),
+      path.join(programFiles, 'Amazon Corretto'),
+      path.join(programFilesX86, 'Java'),
+      path.join(programFilesX86, 'Eclipse Adoptium'),
+      path.join(home, '.jdks')
+    ]
+    const candidates = (await Promise.all(roots.map(listSubdirectoryPaths))).flat()
+    // macOS-style layouts rarely appear on Windows but a few distributions
+    // still nest under Contents/Home.
+    for (const candidate of [...candidates]) {
+      const contentsHome = path.join(candidate, 'Contents', 'Home')
+      if (await exists(path.join(contentsHome, 'bin', 'java.exe'))) candidates.push(contentsHome)
+    }
+    return candidates
+  }
+  if (process.platform === 'darwin') {
+    const roots = await listSubdirectoryPaths('/Library/Java/JavaVirtualMachines')
+    return roots.map((candidate) => path.join(candidate, 'Contents', 'Home'))
+  }
+  return await listSubdirectoryPaths('/usr/lib/jvm')
+}
+
+/**
+ * Enumerate locally installed Java homes for the settings picker. Probes every
+ * candidate so entries carry their actual major version and dead installs are
+ * filtered out.
+ */
+export async function detectInstalledJavaHomes(): Promise<DetectedJavaHome[]> {
+  const userData = app.getPath('userData')
+  const candidates = [
+    ...await listSubdirectoryPaths(path.join(userData, 'minecraft-runtime', 'java')),
+    ...await listSubdirectoryPaths(path.join(userData, 'build-jdks')),
+    ...await commonRootJavaHomeCandidates(),
+    ...(process.env.JAVA_HOME ? [process.env.JAVA_HOME] : []),
+    ...(process.env.JDK_HOME ? [process.env.JDK_HOME] : []),
+    ...await discoverJavaHomesFromPath()
+  ].map((value) => value.trim().replace(/^"|"$/g, '')).filter(Boolean)
+  const queued = new Set<string>()
+  const seen = new Set<string>()
+  const detected: DetectedJavaHome[] = []
+  for (const candidate of candidates) {
+    const candidateKey = path.resolve(candidate).toLowerCase()
+    if (queued.has(candidateKey)) continue
+    queued.add(candidateKey)
+    const probed = await probeJavaHome(candidate, 8, false)
+    if (!probed) continue
+    const home = path.dirname(path.dirname(probed.javaPath))
+    const homeKey = path.resolve(home).toLowerCase()
+    if (seen.has(homeKey)) continue
+    seen.add(homeKey)
+    detected.push({ home, major: probed.major })
+  }
+  return detected
 }
 
 async function findFile(root: string, predicate: (name: string, fullPath: string) => boolean): Promise<string | null> {
@@ -341,14 +715,22 @@ export class MinecraftRuntimeManager {
   private readonly onState: (state: MinecraftRuntimeState) => void
   private readonly onEvent: (event: MinecraftRuntimeEvent) => void
   private readonly authorizeBuild?: (project: ProjectInfo) => Promise<void>
-  private readonly getGradlePreference?: MinecraftRuntimeOptions['getGradlePreference']
+  private readonly getGradleDownloadSource?: () => Promise<GradleDownloadSourcePreference>
+  private readonly getJavaPreference?: () => Promise<Partial<JavaPreferences> | undefined>
+  private readonly prepareProjectDependencies?: (project: ProjectInfo, signal?: AbortSignal) => Promise<void>
   private process: ChildProcess | null = null
   private preparePromise: Promise<MinecraftRuntimeState> | null = null
+  private prepareController: AbortController | null = null
+  private prepareGeneration = 0
   private buildPromise: Promise<MinecraftManagedMod> | null = null
+  private buildController: AbortController | null = null
   private buildProcess: ChildProcess | null = null
   private verificationProcess: ChildProcess | null = null
+  private readonly gradleCleanupPromises = new Map<string, Promise<void>>()
+  private stopRequested = false
   private lastProgressAt = 0
   private lastProgressStage: MinecraftRuntimeStage | '' = ''
+  private stateProjectPath = ''
   private state: MinecraftRuntimeState = {
     stage: 'idle',
     minecraftVersion: '',
@@ -363,15 +745,120 @@ export class MinecraftRuntimeManager {
     this.onState = options.onState
     this.onEvent = options.onEvent
     this.authorizeBuild = options.authorizeBuild
-    this.getGradlePreference = options.getGradlePreference
+    this.getGradleDownloadSource = options.getGradleDownloadSource
+    this.getJavaPreference = options.getJavaPreference
+    this.prepareProjectDependencies = options.prepareProjectDependencies
   }
 
   getState(): MinecraftRuntimeState {
-    return { ...this.state, mods: [...this.state.mods] }
+    return { ...this.state, ...(this.stateProjectPath ? {projectPath: this.stateProjectPath} : {}), mods: [...this.state.mods] }
+  }
+
+  /** Root holding versions/libraries/assets installed through the BMCLAPI mirrors. */
+  managedMinecraftDirectory(): string {
+    return this.resourceRoot()
+  }
+
+  /** Prepare Java for server-side pack tools without downloading a Minecraft instance or loader. */
+  async ensureJavaRuntime(
+    onProgress?: (message: string) => void,
+    minimumMajorOverride?: number,
+    onDownloadProgress?: (progress: ManagedJdkProgress) => void
+  ): Promise<string> {
+    const project = this.requireProject()
+    const projectMinimumMajor = javaVersionForMinecraft(project.minecraftVersion)
+    const minimumMajor = Math.max(projectMinimumMajor, minimumMajorOverride ?? projectMinimumMajor)
+    const runtimeTarget = javaRuntimeTargetForMinecraft(project.minecraftVersion)
+    const preferredToolsJava = await this.preferredJavaHome('tools')
+    if (preferredToolsJava) {
+      const preferredCandidate = await probeJavaHome(preferredToolsJava, minimumMajor, false)
+      if (preferredCandidate) {
+        onProgress?.(`正在使用手动选择的 Java ${preferredCandidate.major}`)
+        return preferredCandidate.javaPath
+      }
+      onProgress?.(`手动选择的 Java 不满足工具运行要求（至少 Java ${minimumMajor}），已回退到自动配置`)
+    }
+    const cachedRuntime = minimumMajor === projectMinimumMajor
+      ? await probeJavaHome(path.join(this.runtimeRoot(), runtimeTarget), minimumMajor, false)
+      : null
+    if (cachedRuntime) {
+      onProgress?.(`正在使用已缓存的 Java ${cachedRuntime.major}`)
+      return cachedRuntime.javaPath
+    }
+    onProgress?.(`正在下载 Java ${minimumMajor}`)
+    let reportedSource = ''
+    const managed = await ensureManagedJdk(path.join(app.getPath('userData'), 'build-jdks'), minimumMajor, (progress) => {
+      const message = `正在从 ${progress.source} 下载完整 JDK ${minimumMajor}`
+      this.emitProgress('downloading-java', message, progress.downloaded, progress.total)
+      onDownloadProgress?.(progress)
+      if (progress.source !== reportedSource) {
+        reportedSource = progress.source
+        onProgress?.(message)
+      }
+    })
+    const candidate = await probeJavaHome(managed.home, minimumMajor, false)
+    if (!candidate) throw new Error(`已下载的 JDK 无法运行 ServerPackCreator：${managed.home}`)
+    onProgress?.(`Java ${candidate.major} 已就绪：${managed.source}`)
+    return candidate.javaPath
+  }
+
+  /** Prepare a Java runtime for tools that do not belong to a project (for example decompilation). */
+  async ensureJavaRuntimeForTools(
+    minimumMajor = 21,
+    onProgress?: (message: string) => void,
+    onDownloadProgress?: (progress: ManagedJdkProgress) => void
+  ): Promise<string> {
+    const requiredMajor = Number.isInteger(minimumMajor) ? Math.max(8, minimumMajor) : 21
+    const runtimeTarget = javaRuntimeTargetForJavaVersion(requiredMajor)
+    const preferredToolsJava = await this.preferredJavaHome('tools')
+    if (preferredToolsJava) {
+      const preferredCandidate = await probeJavaHome(preferredToolsJava, requiredMajor, false)
+      if (preferredCandidate) {
+        onProgress?.(`正在使用手动选择的 Java ${preferredCandidate.major}`)
+        return preferredCandidate.javaPath
+      }
+      onProgress?.(`手动选择的 Java 不满足工具运行要求（至少 Java ${requiredMajor}），已回退到自动配置`)
+    }
+    const cachedRuntime = await probeJavaHome(path.join(this.runtimeRoot(), runtimeTarget), requiredMajor, false)
+    if (cachedRuntime) {
+      onProgress?.(`正在使用已缓存的 Java ${cachedRuntime.major}`)
+      return cachedRuntime.javaPath
+    }
+    onProgress?.(`正在下载 Java ${requiredMajor}`)
+    let reportedSource = ''
+    const managed = await ensureManagedJdk(path.join(app.getPath('userData'), 'build-jdks'), requiredMajor, (progress) => {
+      const message = `正在从 ${progress.source} 下载完整 JDK ${requiredMajor}`
+      this.emitProgress('downloading-java', message, progress.downloaded, progress.total)
+      onDownloadProgress?.(progress)
+      if (progress.source !== reportedSource) {
+        reportedSource = progress.source
+        onProgress?.(message)
+      }
+    })
+    const candidate = await probeJavaHome(managed.home, requiredMajor, false)
+    if (!candidate) throw new Error(`已下载的 JDK 无法运行反编译工具：${managed.home}`)
+    onProgress?.(`Java ${candidate.major} 已就绪：${managed.source}`)
+    return candidate.javaPath
   }
 
   async refresh(): Promise<MinecraftRuntimeState> {
     const project = this.requireProject()
+    if (this.stateProjectPath && !sameProjectPath(this.stateProjectPath, project.path)
+      && (this.state.running || Boolean(this.process) || Boolean(this.preparePromise) || Boolean(this.buildPromise) || Boolean(this.verificationProcess))) {
+      return this.getState()
+    }
+    if (!isJavaLoader(project.loader)) {
+      const mods = await this.listMods()
+      this.updateState({
+        minecraftVersion: project.minecraftVersion,
+        loader: project.loader,
+        installed: true,
+        running: false,
+        mods,
+        message: project.loader === 'bedrock' ? '基岩 Add-On 工程已就绪' : '网易 Mod SDK 工程已就绪'
+      })
+      return this.getState()
+    }
     const metadata = await this.readMetadata(project)
     const mods = await this.listMods()
     const lastCrash = this.state.lastCrash ?? (await this.readLatestCrash(project, 0))
@@ -390,23 +877,54 @@ export class MinecraftRuntimeManager {
     return this.getState()
   }
 
-  prepare(): Promise<MinecraftRuntimeState> {
-    if (this.preparePromise) return this.preparePromise
-    this.preparePromise = this.prepareInternal()
+  prepare(signal?: AbortSignal): Promise<MinecraftRuntimeState> {
+    if (this.preparePromise) return waitWithAbort(this.preparePromise, signal)
+    const controller = new AbortController()
+    const generation = ++this.prepareGeneration
+    this.prepareController = controller
+    const forwardAbort = (): void => controller.abort()
+    signal?.addEventListener('abort', forwardAbort, { once: true })
+    this.preparePromise = this.prepareInternal(controller.signal, generation)
       .catch((error: unknown) => {
+        if (this.prepareGeneration === generation) this.prepareGeneration += 1
         const message = error instanceof Error ? error.message : String(error)
+        diagnosticJournal.record({
+          subsystem: 'minecraft',
+          operation: 'prepare',
+          phase: error instanceof Error && error.name === 'AbortError' ? 'cancelled' : 'error',
+          message,
+          error
+        })
+        if (error instanceof Error && error.name === 'AbortError') {
+          this.updateState({ stage: 'idle', running: false, message: 'Minecraft 准备已取消' })
+          throw error
+        }
         this.updateState({ stage: 'error', message })
         this.onEvent({ stage: 'error', message, level: 'error', time: new Date().toISOString() })
         throw error
       })
       .finally(() => {
+        signal?.removeEventListener('abort', forwardAbort)
+        if (this.prepareController === controller) this.prepareController = null
         this.preparePromise = null
       })
-    return this.preparePromise
+    return waitWithAbort(this.preparePromise, signal)
+  }
+
+  async cancelPreparation(): Promise<MinecraftRuntimeState> {
+    const active = this.preparePromise
+    this.prepareController?.abort()
+    if (active) await active.catch(() => undefined)
+    return this.getState()
   }
 
   async launch(options: MinecraftLaunchOptions, signal?: AbortSignal): Promise<MinecraftRuntimeState> {
     const project = this.requireProject()
+    if (!isJavaLoader(project.loader)) {
+      throw new Error(project.loader === 'bedrock'
+        ? '国际基岩版需要安装版 Minecraft 客户端；请先构建 .mcaddon 并导入游戏。自动本地部署将在后续设备集成中提供'
+        : '网易版必须通过官方开发者工作台启动 PC 或手机测试，ModMind 不能绕过工作台与账号授权')
+    }
     if (this.process && this.state.running) throw new Error('Minecraft 测试实例已经在运行')
     const username = options.username.trim()
     if (!/^[A-Za-z0-9_]{3,16}$/.test(username)) throw new Error('离线用户名需要 3-16 个字母、数字或下划线')
@@ -414,18 +932,27 @@ export class MinecraftRuntimeManager {
       throw new Error('最大内存需要在 1024-16384 MB 之间')
     }
 
-    const syncedArtifact = path.join(this.modsRoot(project), projectArtifactName(project))
-    if (!(await exists(syncedArtifact))) {
-      throw new Error('测试实例中没有已同步的项目 Mod，请先点击“构建并同步”')
+    if (project.kind !== 'modpack') {
+      const syncedArtifact = path.join(this.modsRoot(project), projectArtifactName(project))
+      if (!(await exists(syncedArtifact))) throw new Error('测试实例中没有已同步的项目 Mod，请先点击“构建并同步”')
+      await validateModArtifact(syncedArtifact, project.loader)
+    } else {
+      const manifest = await readModpackManifest(project)
+      const synced = await fs.readFile(path.join(this.instanceRoot(project), 'modmind-pack-sync.json'), 'utf8')
+        .then((value) => JSON.parse(value) as { files?: unknown })
+        .catch(() => null)
+      if (!synced || !Array.isArray(synced.files)) throw new Error('整合包尚未同步，请先点击“同步整合包”')
+      if (!manifest.mods.length && !manifest.modules.length) this.emit('launching', '正在启动空整合包实例')
     }
-    await validateModArtifact(syncedArtifact, project.loader)
     if (signal?.aborted) throw Object.assign(new Error('Minecraft 启动已取消'), { name: 'AbortError' })
-    await this.prepare()
+    await this.prepare(signal)
     const metadata = await this.readMetadata(project)
     if (!metadata) throw new Error('Minecraft 测试实例尚未准备完成')
+    const launchJavaPath = await this.resolveLaunchJava(project, metadata)
 
     const instanceRoot = this.instanceRoot(project)
     await fs.mkdir(instanceRoot, { recursive: true })
+    this.stopRequested = false
     this.updateState({ lastCrash: undefined })
     this.emit('launching', '正在生成离线启动参数')
     const launchedAt = Date.now()
@@ -435,7 +962,7 @@ export class MinecraftRuntimeManager {
         gamePath: instanceRoot,
         resourcePath: this.resourceRoot(),
         version: metadata.loaderVersionId,
-        javaPath: metadata.javaPath,
+        javaPath: launchJavaPath,
         gameProfile: { name: username, id: offlineUuid(username) },
         accessToken: '0',
         userType: 'legacy',
@@ -448,8 +975,12 @@ export class MinecraftRuntimeManager {
       })
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error)
-      this.updateState({ stage: 'error', running: false, message })
-      this.onEvent({ stage: 'error', message, level: 'error', time: new Date().toISOString() })
+      const detail = /spawn\s+unknown/i.test(message)
+        ? `${message}\nJava: ${launchJavaPath}\n实例目录：${instanceRoot}\nLoader：${metadata.loaderVersionId}`
+        : message
+      this.updateState({ stage: 'error', running: false, message: detail })
+      this.onEvent({ stage: 'error', message: detail, level: 'error', time: new Date().toISOString() })
+      if (detail !== message) throw new Error(detail, { cause: error })
       throw error
     }
     this.process = child
@@ -468,10 +999,12 @@ export class MinecraftRuntimeManager {
       this.updateState({ stage: 'error', running: false, pid: undefined, message: error.message })
       this.emit('error', error.message, 'error')
     })
-    child.once('exit', (code, signal) => {
+    child.once('close', (code, signal) => {
       this.process = null
-      launcherLog.end()
-      void this.handleMinecraftExit(project, launchedAt, code, signal)
+      const intentionallyStopped = this.stopRequested
+      launcherLog.end(() => {
+        void this.handleMinecraftExit(project, launchedAt, code, signal, intentionallyStopped)
+      })
     })
     return this.getState()
   }
@@ -506,6 +1039,7 @@ export class MinecraftRuntimeManager {
       throw new Error('Minecraft 类名格式无效')
     }
     const project = this.requireProject()
+    if (!isJavaLoader(project.loader)) throw new Error(`${platformLabel(project.loader)} 不使用 Java mappings`)
     const cacheRoot = path.join(
       app.getPath('userData'),
       'gradle-runtime',
@@ -591,12 +1125,25 @@ export class MinecraftRuntimeManager {
   }
 
   async stop(): Promise<MinecraftRuntimeState> {
+    await this.cancelPreparation()
+    this.buildController?.abort()
     const active = this.process
-    if (active && !active.killed) this.killProcessTree(active)
+    const activeBuild = this.buildProcess
+    const activeVerification = this.verificationProcess
+    if (active && !active.killed) {
+      this.stopRequested = true
+      this.killProcessTree(active)
+    }
     if (this.buildProcess && !this.buildProcess.killed) this.killProcessTree(this.buildProcess)
     if (this.verificationProcess && !this.verificationProcess.killed) this.killProcessTree(this.verificationProcess)
     const deadline = Date.now() + 5_000
-    while (active && this.process === active && Date.now() < deadline) await new Promise((resolve) => setTimeout(resolve, 100))
+    while (Date.now() < deadline) {
+      const minecraftStopping = Boolean(active && this.process === active)
+      const buildStopping = Boolean(activeBuild && this.buildProcess === activeBuild)
+      const verificationStopping = Boolean(activeVerification && this.verificationProcess === activeVerification)
+      if (!minecraftStopping && !buildStopping && !verificationStopping) break
+      await new Promise((resolve) => setTimeout(resolve, 100))
+    }
     return this.getState()
   }
 
@@ -612,63 +1159,107 @@ export class MinecraftRuntimeManager {
     args: string[],
     env: NodeJS.ProcessEnv
   ): ChildProcessWithoutNullStreams {
-    if (process.platform === 'win32' && runtime.usesWrapper) {
-      return spawn(
-        path.join(runtime.javaHome, 'bin', 'java.exe'),
-        [
-          '-Dfile.encoding=UTF-8',
-          '-Xmx64m',
-          '-Xms64m',
-          '-Dorg.gradle.appname=gradlew',
-          '-jar',
-          path.join(project.path, 'gradle', 'wrapper', 'gradle-wrapper.jar'),
-          ...args
-        ],
-        { cwd: project.path, windowsHide: true, shell: false, env }
-      )
-    }
-    return spawn(runtime.executable, args, {
+    const invocation = process.platform === 'win32'
+      ? windowsCmdInvocation(runtime.executable, args)
+      : { command: runtime.executable, args, windowsVerbatimArguments: false as const }
+    return spawn(invocation.command, invocation.args, {
       cwd: project.path,
       windowsHide: true,
-      shell: process.platform === 'win32',
+      shell: false,
+      windowsVerbatimArguments: invocation.windowsVerbatimArguments,
       env
     })
   }
 
-  private async gradleRuntime(project: ProjectInfo, forceManaged = false): Promise<GradleRuntimeSelection> {
-    const { javaPath } = await this.ensureJava(project)
-    const requiredVersion = gradleVersionFor(project)
-    const preference = await this.getGradlePreference?.().catch(() => ({
-      preferLocalGradle: false,
-      executable: undefined,
-      downloadSource: 'auto' as const
-    }))
-    const downloadSource = preference?.downloadSource ?? 'auto'
-    if (!forceManaged && preference?.preferLocalGradle) {
-      const local = await probeGradleExecutable(preference.executable)
-      if (local) {
-        if (local.version && local.version !== requiredVersion) {
-          this.emit('building-mod', `本机 Gradle ${local.version} 与模板推荐的 ${requiredVersion} 不同，按用户设置继续`, 'warning')
-        }
-        return { ...local, javaHome: path.dirname(path.dirname(javaPath)), usesWrapper: false, source: 'local' }
+  private async stopStaleGradleDaemons(runtime: GradleRuntimeSelection, project: ProjectInfo, env: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<void> {
+    const key = `${runtime.javaHome}|${gradleVersionFor(project)}`
+    const existing = this.gradleCleanupPromises.get(key)
+    if (existing) return existing
+    const cleanup = (async (): Promise<void> => {
+      if (signal?.aborted) throw Object.assign(new Error('构建已取消'), { name: 'AbortError' })
+      this.emit('building-mod', '正在清理 ModMind 上次遗留的 Gradle 守护进程')
+      const child = this.spawnGradle(runtime, project, ['--stop', '--console=plain'], env)
+      let output = ''
+      let spawnError = ''
+      child.stdout.on('data', (chunk: Buffer) => { output = `${output}${chunk.toString('utf8')}`.slice(-20_000) })
+      child.stderr.on('data', (chunk: Buffer) => { output = `${output}${chunk.toString('utf8')}`.slice(-20_000) })
+      child.once('error', (error) => { spawnError = error.message })
+      const abort = (): void => this.killProcessTree(child)
+      signal?.addEventListener('abort', abort, { once: true })
+      const result = await new Promise<{ code: number | null; signal: NodeJS.Signals | null; timedOut: boolean }>((resolve) => {
+        const timer = setTimeout(() => {
+          this.killProcessTree(child)
+          resolve({ code: null, signal: null, timedOut: true })
+        }, 20_000)
+        child.once('close', (code, closeSignal) => {
+          clearTimeout(timer)
+          resolve({ code: normalizeProcessExitCode(code), signal: closeSignal, timedOut: false })
+        })
+      })
+      signal?.removeEventListener('abort', abort)
+      if (signal?.aborted) throw Object.assign(new Error('构建已取消'), { name: 'AbortError' })
+      if (spawnError || result.timedOut || result.code !== 0) {
+        const detail = spawnError || (result.timedOut ? '清理超过 20 秒' : describeProcessTermination(result.code, result.signal))
+        this.emit('building-mod', `Gradle 历史进程清理未完成：${detail}${output.trim() ? `；${output.trim().split(/\r?\n/).at(-1)}` : ''}`, 'warning')
       }
-      this.emit('building-mod', '未找到可用的本机 Gradle，已回退项目 Wrapper', 'warning')
+    })()
+    this.gradleCleanupPromises.set(key, cleanup)
+    try {
+      await cleanup
+    } catch (error) {
+      this.gradleCleanupPromises.delete(key)
+      throw error
     }
-    const wrapperPath = path.join(project.path, process.platform === 'win32' ? 'gradlew.bat' : 'gradlew')
-    if (!forceManaged && downloadSource === 'official' && await exists(wrapperPath)) {
-      return { executable: wrapperPath, javaHome: path.dirname(path.dirname(javaPath)), usesWrapper: true, source: 'wrapper' }
+  }
+
+  private async gradleRuntime(project: ProjectInfo): Promise<GradleRuntimeSelection> {
+    const javaPath = await this.ensureBuildJava(project)
+    const wrapperPath = projectGradleWrapperExecutable(project.path)
+    if (!(await exists(wrapperPath))) {
+      throw new Error(`项目缺少 Gradle Wrapper：${path.basename(wrapperPath)}。请先在项目根目录提供可用的 Wrapper`)
     }
-    return {
-      executable: await this.ensureGradle(requiredVersion, downloadSource),
-      javaHome: path.dirname(path.dirname(javaPath)),
-      usesWrapper: false,
-      source: 'managed',
-      version: requiredVersion
+    if (process.platform !== 'win32') await fs.chmod(wrapperPath, 0o755)
+    return { executable: wrapperPath, javaHome: path.dirname(path.dirname(javaPath)), usesWrapper: true, source: 'wrapper' }
+  }
+
+  private async ensureBuildJava(project: ProjectInfo): Promise<string> {
+    const range = buildJavaRangeForProject(project)
+    const preferredBuildJava = await this.preferredJavaHome('build')
+    if (preferredBuildJava) {
+      const preferredCandidate = await probeJavaHome(preferredBuildJava, range.minimum, true, range.maximum)
+      if (preferredCandidate) {
+        this.emit('building-mod', `使用手动选择的 JDK ${preferredCandidate.major}：${preferredCandidate.javaPath}`)
+        return preferredCandidate.javaPath
+      }
+      this.emit(
+        'building-mod',
+        `手动选择的 JDK 不满足本项目编译要求（需要 Java ${range.minimum}${Number.isFinite(range.maximum) ? ` - ${range.maximum}` : '+'}，且包含 javac），已回退到自动配置：${preferredBuildJava}`,
+        'warning'
+      )
     }
+    for (const home of await configuredBuildJavaHomes(project)) {
+      const candidate = await probeJavaHome(home, range.minimum, true, range.maximum)
+      if (candidate) {
+        this.emit('building-mod', `使用项目/系统 JDK ${candidate.major}：${candidate.javaPath}`)
+        return candidate.javaPath
+      }
+      this.emit('building-mod', `已跳过不可用的项目/系统 Java：${home}`, 'warning')
+    }
+    const managed = await ensureManagedJdk(path.join(app.getPath('userData'), 'build-jdks'), range.minimum, (progress) => {
+      this.emitProgress('downloading-java', `正在从${progress.source}下载完整 JDK ${range.minimum}`, progress.downloaded, progress.total)
+    })
+    const candidate = await probeJavaHome(managed.home, range.minimum, true, range.maximum)
+    if (!candidate) {
+      throw new Error(`ModMind 下载的 JDK 无法用于 Gradle 编译：${managed.home}。请设置有效的 JDK（包含 javac）或修复 JDK 缓存`)
+    }
+    this.emit('building-mod', `使用已验证的 JDK ${candidate.major}（${managed.source}）：${candidate.javaPath}`)
+    return candidate.javaPath
   }
 
   async testGradleTask(candidates: string[], stableWindowMs = 0, signal?: AbortSignal): Promise<GradleVerificationResult> {
     const project = this.requireProject()
+    if (!isJavaLoader(project.loader)) return { skipped: true, success: true, summary: `${platformLabel(project.loader)} 不使用 Gradle 运行任务` }
+    if (project.kind === 'modpack') return { skipped: true, success: true, summary: '整合包没有统一的 Gradle 运行任务；请使用客户端启动测试' }
     if (this.process || this.verificationProcess || this.buildPromise) throw new Error('已有 Minecraft、构建或验证任务正在运行')
     await this.authorizeBuild?.(project)
     const runtime = await this.gradleRuntime(project)
@@ -696,7 +1287,10 @@ export class MinecraftRuntimeManager {
     const logPath = path.join(logDirectory, `${task}-${Date.now()}.log`)
     const log = createWriteStream(logPath, { flags: 'w' })
     this.emit('testing-server', `正在执行 Gradle ${task}`)
-    const child = this.spawnGradle(runtime, project, [task, '--console=plain', '--no-daemon', '--stacktrace'], env)
+    const preparationTasks = ['runClient', 'runServer', 'runGameTestServer'].includes(task)
+      ? ['processResources', 'classes']
+      : []
+    const child = this.spawnGradle(runtime, project, [...preparationTasks, task, '--console=plain', '--no-daemon', '--stacktrace'], env)
     this.verificationProcess = child
     let output = ''
     let readyAt = 0
@@ -739,8 +1333,9 @@ export class MinecraftRuntimeManager {
 
   async syncProjectMod(): Promise<MinecraftManagedMod | null> {
     const project = this.requireProject()
+    if (!isJavaLoader(project.loader)) return (await this.listMods())[0] ?? null
     if (this.process && this.state.running) {
-      throw new Error('Minecraft 测试实例正在运行。请先停止测试，再同步项目模组；运行中的 JAR 不允许被覆盖。')
+      throw new Error('Minecraft 测试实例正在运行。请先停止测试，再同步项目模组；运行中的 JAR 不允许被覆盖')
     }
     const buildDirectory = path.join(project.path, 'build', 'libs')
     if (!(await exists(buildDirectory))) {
@@ -768,47 +1363,196 @@ export class MinecraftRuntimeManager {
     return mods.find((mod) => mod.projectArtifact) ?? null
   }
 
+  async syncModpack(): Promise<MinecraftRuntimeState> {
+    const project = this.requireProject()
+    if (project.kind !== 'modpack') throw new Error('The active project is not a modpack')
+    if (!isJavaLoader(project.loader)) throw new Error('Only Java Edition modpacks can use the local test instance')
+    if (this.process && this.state.running) throw new Error('Stop the running Minecraft test instance before syncing the modpack')
+
+    const manifest = await readModpackManifest(project)
+    const directory = this.modsRoot(project)
+    const statePath = path.join(this.instanceRoot(project), 'modmind-pack-sync.json')
+    const previous: { files?: unknown; overrides?: unknown } = await fs.readFile(statePath, 'utf8')
+      .then((value) => JSON.parse(value) as { files?: unknown; overrides?: unknown })
+      .catch(() => ({}))
+    const previousFiles = Array.isArray(previous.files)
+      ? previous.files.map((value: unknown) => typeof value === 'string' ? value : (value && typeof value === 'object' && typeof (value as { name?: unknown }).name === 'string' ? (value as { name: string }).name : '')).filter((value): value is string => Boolean(value) && path.basename(value) === value)
+      : []
+    const previouslySynced = new Set(previousFiles.map((value) => value.toLowerCase()))
+    const totalSteps = Math.max(1, (manifest.mods.length + manifest.modules.length) * 2 + 1)
+    let completedSteps = 0
+    const reportSync = (message: string): void => this.emitProgress('syncing-mod', message, completedSteps, totalSteps)
+    reportSync(`正在校验整合包文件（0/${manifest.mods.length + manifest.modules.length}）`)
+
+    const sources: Array<{ source: string; targetName: string; integrity: { size: number; sha256: string } }> = []
+    const missingManaged: string[] = []
+    for (const mod of manifest.mods) {
+      const source = path.join(modpackModsRoot(project, manifest), mod.fileName)
+      if (!(await exists(source))) {
+        missingManaged.push(mod.fileName)
+        continue
+      }
+      const actual = await sha256File(source)
+      if (actual.size !== mod.size || actual.sha256 !== mod.sha256) throw new Error(`整合包 Mod ${mod.fileName} 已被修改，请更新清单后再同步`)
+      sources.push({ source, targetName: mod.fileName, integrity: actual })
+      completedSteps += 1
+      reportSync(`正在校验整合包文件（${completedSteps}/${manifest.mods.length + manifest.modules.length}）`)
+    }
+    for (const module of manifest.modules) {
+      const root = path.resolve(project.path, ...module.path.split('/'))
+      if (!root.startsWith(`${path.resolve(project.path)}${path.sep}`)) throw new Error(`自制 Mod ${module.name} 的路径无效`)
+      const output = path.join(root, 'build', 'libs')
+      const findLatest = async (): Promise<{ source: string; stat: Awaited<ReturnType<typeof fs.stat>> } | undefined> => {
+        const entries = await fs.readdir(output, { withFileTypes: true }).catch(() => [])
+        const candidates = await Promise.all(entries
+          .filter((entry) => entry.isFile() && entry.name.endsWith('.jar') && !/(sources|javadoc|dev|shadow)/i.test(entry.name))
+          .map(async (entry) => {
+            const source = path.join(output, entry.name)
+            return { source, stat: await fs.stat(source) }
+          }))
+        return candidates.sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs)[0]
+      }
+      let latest = await findLatest()
+      if (!latest) {
+        const moduleProject: ProjectInfo = { ...project, kind: 'mod', name: module.name, namespace: module.namespace, path: root }
+        await this.authorizeBuild?.(moduleProject)
+        if (!(await exists(path.join(root, 'build.gradle'))) && !(await exists(path.join(root, 'build.gradle.kts')))) {
+          throw new Error(`自制 Mod ${module.name} 缺少 Gradle 构建文件`)
+        }
+        this.emit('building-mod', `正在构建自制 Mod：${module.name}`)
+        await this.runGradleBuild(moduleProject)
+        latest = await findLatest()
+      }
+      if (latest) {
+        sources.push({ source: latest.source, targetName: `modmind-local-${module.namespace}.jar`, integrity: await sha256File(latest.source) })
+        completedSteps += 1
+        reportSync(`正在校验整合包文件（${completedSteps}/${manifest.mods.length + manifest.modules.length}）`)
+      } else missingManaged.push(`自制 Mod ${module.name}（尚未构建）`)
+    }
+    if (missingManaged.length) throw new Error(`整合包缺少清单中声明的内容：${missingManaged.join('、')}`)
+    const names = sources.map((entry) => entry.targetName.toLowerCase())
+    if (new Set(names).size !== names.length) throw new Error('整合包中存在重复的 Mod 文件名，无法同步')
+
+    await fs.mkdir(directory, { recursive: true })
+    const staging = await fs.mkdtemp(path.join(this.instanceRoot(project), 'modmind-pack-stage-'))
+    const written: string[] = []
+    const staged: string[] = []
+    try {
+      for (const entry of sources) {
+        const destination = path.join(directory, entry.targetName)
+        const targetHash = await sha256File(destination).catch((error) => {
+          if (isMissingFileError(error)) return null
+          throw error
+        })
+        if (targetHash && targetHash.size === entry.integrity.size && targetHash.sha256 === entry.integrity.sha256) {
+          if (!previouslySynced.has(entry.targetName.toLowerCase())) await validateModArtifact(entry.source, project.loader)
+          written.push(entry.targetName)
+        } else {
+          await replaceModArtifact(entry.source, path.join(staging, entry.targetName), project.loader)
+          written.push(entry.targetName)
+          staged.push(entry.targetName)
+        }
+        completedSteps += 1
+        reportSync(`正在同步整合包 Mod（${completedSteps - manifest.mods.length - manifest.modules.length}/${sources.length}）`)
+      }
+      const currentNames = new Set(written)
+      await Promise.all(previousFiles.filter((file) => !currentNames.has(file)).map((file: string) => fs.rm(path.join(directory, file), { force: true })))
+      for (const name of staged) await fs.rename(path.join(staging, name), path.join(directory, name))
+    } finally {
+      await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined)
+    }
+    const previousOverrides = Array.isArray(previous.overrides)
+      ? previous.overrides.filter((value: unknown): value is string => typeof value === 'string')
+      : []
+    reportSync('正在同步整合包配置与资源')
+    const overrides = await syncModpackOverrides(project, this.instanceRoot(project), previousOverrides)
+    completedSteps = totalSteps
+    reportSync('整合包同步完成')
+    await fs.mkdir(path.dirname(statePath), { recursive: true })
+    await fs.writeFile(statePath, `${JSON.stringify({ files: written, overrides }, null, 2)}\n`, 'utf8')
+    this.emit('syncing-mod', `Synced ${written.length} modpack mods and ${overrides.length} override files`)
+    await this.refresh()
+    this.updateState({ stage: 'idle', message: `已同步 ${written.length} 个整合包 Mod 和 ${overrides.length} 个配置文件` })
+    return this.getState()
+  }
+
   buildProject(signal?: AbortSignal): Promise<MinecraftManagedMod> {
     if (this.buildPromise) return this.buildPromise
-    this.buildPromise = this.buildProjectInternal(signal)
+    const controller = new AbortController()
+    const forwardAbort = (): void => controller.abort(signal?.reason)
+    if (signal?.aborted) forwardAbort()
+    else signal?.addEventListener('abort', forwardAbort, { once: true })
+    this.buildController = controller
+    this.buildPromise = this.buildProjectInternal(controller.signal)
       .catch((error: unknown) => {
         const message = error instanceof Error ? error.message : String(error)
+        if (error instanceof Error && error.name === 'AbortError') {
+          this.updateState({ stage: 'idle', message: '构建已取消' })
+          this.onEvent({ stage: 'idle', message: '构建已取消', level: 'info', time: new Date().toISOString() })
+          throw error
+        }
         this.updateState({ stage: 'error', message })
         this.onEvent({ stage: 'error', message, level: 'error', time: new Date().toISOString() })
         throw error
       })
       .finally(() => {
+        signal?.removeEventListener('abort', forwardAbort)
+        if (this.buildController === controller) this.buildController = null
         this.buildPromise = null
       })
     return this.buildPromise
   }
 
-  private async buildProjectInternal(signal?: AbortSignal, forceManaged = false): Promise<MinecraftManagedMod> {
+  private async buildProjectInternal(signal?: AbortSignal, retryAttempt = 0): Promise<MinecraftManagedMod> {
     const project = this.requireProject()
     if (this.process && this.state.running) {
-      throw new Error('Minecraft 测试实例正在运行。请先停止测试再构建，避免覆盖正在加载的项目 JAR。')
+      throw new Error('Minecraft 测试实例正在运行。请先停止测试再构建，避免覆盖正在加载的项目 JAR')
     }
     if (signal?.aborted) throw Object.assign(new Error('构建已取消'), { name: 'AbortError' })
     await this.authorizeBuild?.(project)
-    const gradleVersion = gradleVersionFor(project)
-    const runtime = await this.gradleRuntime(project, forceManaged)
-    const usesWrapper = runtime.usesWrapper
+    if (project.kind === 'modpack') return this.buildModpackInternal(project, signal)
+    if (!isJavaLoader(project.loader)) {
+      this.emit('building-mod', project.loader === 'bedrock' ? '正在校验并打包基岩 Add-On' : '正在校验并归档网易工作台工程')
+      const artifactPath = project.loader === 'bedrock'
+        ? await buildBedrockAddon(project)
+        : await buildNeteaseArchive(project)
+      const stat = await fs.stat(artifactPath)
+      const artifact: MinecraftManagedMod = {
+        name: path.basename(artifactPath),
+        path: artifactPath,
+        size: stat.size,
+        modifiedAt: stat.mtime.toISOString(),
+        projectArtifact: true
+      }
+      this.updateState({ stage: 'idle', message: `构建完成：${artifact.name}`, mods: [artifact] })
+      this.emit('syncing-mod', project.loader === 'bedrock' ? '已生成可导入的 .mcaddon' : '已生成网易开发者工作台工程归档')
+      return artifact
+    }
+    await this.prepareProjectDependencies?.(project, signal)
+    await this.prepareGradleMavenFallback(project)
+    await this.prepareGradleWrapperDownload(project, retryAttempt)
+    const runtime = await this.gradleRuntime(project)
     const logDirectory = path.join(project.path, projectDataDirectory(project), 'builds')
     const logPath = path.join(logDirectory, 'minecraft-test-build.log')
     await fs.mkdir(logDirectory, { recursive: true })
-    const log = createWriteStream(logPath, { flags: 'w' })
     const javaHome = runtime.javaHome
-    const gradleLabel = runtime.source === 'local'
-      ? `本机 Gradle${runtime.version ? ` ${runtime.version}` : ''}`
-      : usesWrapper ? '项目 Gradle Wrapper' : `Gradle ${gradleVersion}`
-    this.emit('building-mod', `正在使用 ${gradleLabel} 构建项目`)
-
-    const child = this.spawnGradle(runtime, project, ['build', '--no-daemon', '--stacktrace'], {
+    const javaPath = path.join(javaHome, 'bin', process.platform === 'win32' ? 'java.exe' : 'java')
+    const gradleEnvironment = {
       ...process.env,
       JAVA_HOME: javaHome,
       GRADLE_USER_HOME: path.join(app.getPath('userData'), 'gradle-runtime', 'cache')
-    })
+    }
+    await this.stopStaleGradleDaemons(runtime, project, gradleEnvironment, signal)
+    if (signal?.aborted) throw Object.assign(new Error('构建已取消'), { name: 'AbortError' })
+    const log = createWriteStream(logPath, { flags: 'w' })
+    this.emit('building-mod', '正在使用项目 Gradle Wrapper 执行 gradlew build')
+
+    const child = this.spawnGradle(runtime, project, [...MANAGED_GRADLE_BUILD_ARGUMENTS], gradleEnvironment)
     this.buildProcess = child
+    let spawnError = ''
+    child.once('error', (error) => {
+      spawnError = `${error.name}: ${error.message}${typeof (error as NodeJS.ErrnoException).code === 'string' ? ` (code ${(error as NodeJS.ErrnoException).code})` : ''}`
+    })
     let aborted = false
     const abortBuild = (): void => {
       aborted = true
@@ -821,6 +1565,7 @@ export class MinecraftRuntimeManager {
     }
     signal?.addEventListener('abort', abortBuild, { once: true })
     const recentLines: string[] = []
+    let gradleDownloadActivityId = ''
     const capture = (chunk: Buffer, level: MinecraftRuntimeEvent['level']): void => {
       const text = chunk.toString('utf8')
       log.write(text)
@@ -829,26 +1574,34 @@ export class MinecraftRuntimeManager {
       if (recentLines.length > 60) recentLines.splice(0, recentLines.length - 60)
       const visible = lines.at(-1)
       if (visible) this.emit('building-mod', visible, level, false)
+      const downloadUrl = text.match(/Downloading\s+(https?:\/\/[^\s\r\n]+)/i)?.[1]
+      if (downloadUrl && !gradleDownloadActivityId) {
+        const fileName = decodeURIComponent(new URL(downloadUrl).pathname.split('/').at(-1) || 'Gradle distribution')
+        gradleDownloadActivityId = downloadActivities.start({ label: fileName, detail: 'Gradle Wrapper' })
+      }
     }
     child.stdout.on('data', (chunk: Buffer) => capture(chunk, 'info'))
     child.stderr.on('data', (chunk: Buffer) => capture(chunk, 'warning'))
-    const exitCode = await new Promise<number>((resolve) => {
-      child.once('error', () => resolve(1))
-      child.once('exit', (code) => resolve(code ?? 1))
+    const termination = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      child.once('close', (code, closeSignal) => resolve({ code: normalizeProcessExitCode(code), signal: closeSignal }))
     })
     this.buildProcess = null
     signal?.removeEventListener('abort', abortBuild)
     await new Promise<void>((resolve) => log.end(resolve))
+    if (gradleDownloadActivityId) {
+      if (termination.code === 0) downloadActivities.complete(gradleDownloadActivityId)
+      else downloadActivities.fail(gradleDownloadActivityId, recentLines.at(-1) || `Gradle ${describeProcessTermination(termination.code, termination.signal)}`)
+    }
     if (aborted) throw Object.assign(new Error('构建已取消'), { name: 'AbortError' })
-    if (exitCode !== 0) {
+    if (spawnError) throw new Error(`无法启动 Gradle Wrapper：${spawnError}\nJava: ${javaPath}\nWrapper: ${runtime.executable}\n工作目录：${project.path}`)
+    if (termination.code !== 0) {
       const fullLog = await fs.readFile(logPath, 'utf8').catch(() => recentLines.join('\n'))
-      if (!forceManaged && usesWrapper && isGradleWrapperBootstrapFailure(fullLog)) {
-        const reason = isGradleDistributionLockFailure(fullLog) ? 'Wrapper 分发缓存被占用' : '项目 Wrapper 下载失败'
-        this.emit('building-mod', `${reason}，正在使用 ModMind 的跨平台 Gradle 下载器重试`, 'warning')
-        return this.buildProjectInternal(signal, true)
-      }
       const detail = summarizeGradleFailure(fullLog)
-      throw new Error(`Gradle 构建失败（退出代码 ${exitCode}）${detail ? `\n${detail}` : ''}\n完整日志：${logPath}`)
+      if (!aborted && retryAttempt < 2 && isGradleNetworkFailure(fullLog)) {
+        this.emit('building-mod', 'Gradle 下载源暂时不可用，正在切换备用源重试', 'warning')
+        return this.buildProjectInternal(signal, retryAttempt + 1)
+      }
+      throw new Error(`Gradle 构建失败（${describeProcessTermination(termination.code, termination.signal)}）${detail ? `\n${detail}` : ''}\n完整日志：${logPath}`)
     }
     const artifact = await this.syncProjectMod()
     if (!artifact) throw new Error('Gradle 构建成功，但 build/libs 中没有找到可运行的 Mod JAR')
@@ -856,8 +1609,140 @@ export class MinecraftRuntimeManager {
     return artifact
   }
 
+  private async buildModpackInternal(project: ProjectInfo, signal?: AbortSignal): Promise<MinecraftManagedMod> {
+    if (!isJavaLoader(project.loader)) throw new Error('整合包必须使用 Java Edition Loader')
+    const manifest = await readModpackManifest(project)
+    for (const module of manifest.modules) {
+      const moduleRoot = path.resolve(project.path, ...module.path.split('/'))
+      if (!moduleRoot.startsWith(`${path.resolve(project.path)}${path.sep}`)) throw new Error(`自制 Mod ${module.name} 的路径无效`)
+      const moduleProject: ProjectInfo = { ...project, kind: 'mod', name: module.name, namespace: module.namespace, path: moduleRoot }
+      if (!(await exists(path.join(moduleRoot, 'build.gradle'))) && !(await exists(path.join(moduleRoot, 'build.gradle.kts')))) {
+        throw new Error(`自制 Mod ${module.name} 缺少 Gradle 构建文件`)
+      }
+      await this.authorizeBuild?.(moduleProject)
+      this.emit('building-mod', `正在构建自制 Mod：${module.name}`)
+      await this.runGradleBuild(moduleProject, signal)
+    }
+    await this.syncModpack()
+    const mods = await this.listMods()
+    const size = mods.reduce((total, mod) => total + mod.size, 0)
+    const artifact: MinecraftManagedMod = {
+      name: `${project.namespace}.mrpack 工作区`,
+      path: project.path,
+      size,
+      modifiedAt: new Date().toISOString(),
+      projectArtifact: true
+    }
+    this.updateState({ stage: 'idle', message: `整合包构建并同步完成：${mods.length} 个 Mod`, mods })
+    return artifact
+  }
+
+  private async prepareGradleWrapperDownload(project: ProjectInfo, attempt: number): Promise<void> {
+    const propertiesPath = path.join(project.path, 'gradle', 'wrapper', 'gradle-wrapper.properties')
+    const content = await fs.readFile(propertiesPath, 'utf8').catch(() => '')
+    const match = content.match(/distributionUrl=.*?gradle-([0-9A-Za-z.+_-]+)-(bin|all)\.zip/i)
+    if (!match) return
+    const preference = await this.getGradleDownloadSource?.() ?? 'auto'
+    const source = gradleDistributionSources(match[1], preference, match[2].toLowerCase() as 'bin' | 'all')[Math.min(attempt, 2)]
+    if (!source) return
+    const next = content.replace(/distributionUrl=.*$/m, `distributionUrl=${source.url.replace(/:/g, '\\:')}`)
+    if (next !== content) await fs.writeFile(propertiesPath, next, 'utf8')
+  }
+
+  private async prepareGradleMavenFallback(project: ProjectInfo): Promise<void> {
+    if (project.loader !== 'fabric' && project.loader !== 'quilt') return
+    for (const name of ['settings.gradle', 'settings.gradle.kts', 'build.gradle', 'build.gradle.kts']) {
+      const target = path.join(project.path, name)
+      const source = await fs.readFile(target, 'utf8').catch(() => null)
+      if (source === null) continue
+      const next = ensureGradleMavenFallback(source, name.endsWith('.kts'))
+      if (next !== source) await fs.writeFile(target, next, 'utf8')
+    }
+  }
+
+  private async runGradleBuild(project: ProjectInfo, signal?: AbortSignal, retryAttempt = 0): Promise<void> {
+    await this.prepareGradleMavenFallback(project)
+    await this.prepareGradleWrapperDownload(project, retryAttempt)
+    const runtime = await this.gradleRuntime(project)
+    const logDirectory = path.join(project.path, projectDataDirectory(project), 'builds')
+    const logPath = path.join(logDirectory, 'minecraft-test-build.log')
+    await fs.mkdir(logDirectory, { recursive: true })
+    const javaHome = runtime.javaHome
+    const javaPath = path.join(javaHome, 'bin', process.platform === 'win32' ? 'java.exe' : 'java')
+    const gradleEnvironment = {
+      ...process.env,
+      JAVA_HOME: javaHome,
+      GRADLE_USER_HOME: path.join(app.getPath('userData'), 'gradle-runtime', 'cache')
+    }
+    await this.stopStaleGradleDaemons(runtime, project, gradleEnvironment, signal)
+    if (signal?.aborted) throw Object.assign(new Error('构建已取消'), { name: 'AbortError' })
+    const log = createWriteStream(logPath, { flags: 'w' })
+    const child = this.spawnGradle(runtime, project, [...MANAGED_GRADLE_BUILD_ARGUMENTS], gradleEnvironment)
+    this.buildProcess = child
+    let output = ''
+    let spawnError = ''
+    let aborted = false
+    let gradleDownloadActivityId = ''
+    child.once('error', (error) => { spawnError = `${error.name}: ${error.message}` })
+    const abort = (): void => {
+      aborted = true
+      if (child.pid) this.killProcessTree(child)
+    }
+    signal?.addEventListener('abort', abort, { once: true })
+    const capture = (chunk: Buffer, level: MinecraftRuntimeEvent['level']): void => {
+      const text = chunk.toString('utf8')
+      output = `${output}${text}`.slice(-200_000)
+      log.write(text)
+      const line = text.split(/\r?\n/).map((entry) => entry.trim()).filter(Boolean).at(-1)
+      if (line) this.emit('building-mod', line, level, false)
+      const downloadUrl = text.match(/Downloading\s+(https?:\/\/[^\s\r\n]+)/i)?.[1]
+      if (downloadUrl && !gradleDownloadActivityId) {
+        const fileName = decodeURIComponent(new URL(downloadUrl).pathname.split('/').at(-1) || 'Gradle distribution')
+        gradleDownloadActivityId = downloadActivities.start({ label: fileName, detail: 'Gradle Wrapper' })
+      }
+    }
+    child.stdout.on('data', (chunk: Buffer) => capture(chunk, 'info'))
+    child.stderr.on('data', (chunk: Buffer) => capture(chunk, 'warning'))
+    const termination = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolve) => {
+      child.once('close', (code, closeSignal) => resolve({ code: normalizeProcessExitCode(code), signal: closeSignal }))
+    })
+    this.buildProcess = null
+    signal?.removeEventListener('abort', abort)
+    await new Promise<void>((resolve) => log.end(resolve))
+    if (gradleDownloadActivityId) {
+      if (termination.code === 0) downloadActivities.complete(gradleDownloadActivityId)
+      else downloadActivities.fail(gradleDownloadActivityId, output.trim().split(/\r?\n/).at(-1) || `Gradle ${describeProcessTermination(termination.code, termination.signal)}`)
+    }
+    if (aborted) throw Object.assign(new Error('构建已取消'), { name: 'AbortError' })
+    if (spawnError) throw new Error(`无法启动 Gradle Wrapper：${spawnError}\nJava: ${javaPath}\nWrapper: ${runtime.executable}`)
+    if (termination.code !== 0) {
+      if (!aborted && retryAttempt < 2 && isGradleNetworkFailure(output)) {
+        this.emit('building-mod', 'Gradle 下载源暂时不可用，正在切换备用源重试', 'warning')
+        return this.runGradleBuild(project, signal, retryAttempt + 1)
+      }
+      throw new Error(`自制 Mod 构建失败（${describeProcessTermination(termination.code, termination.signal)}）\n${summarizeGradleFailure(output)}\n完整日志：${logPath}`)
+    }
+  }
+
+  async buildDependencyProject(project: ProjectInfo, signal?: AbortSignal): Promise<string> {
+    if (!isJavaLoader(project.loader) || project.kind === 'modpack') throw new Error('关联目标必须是 Java 模组项目')
+    if (signal?.aborted) throw Object.assign(new Error('关联项目构建已取消'), { name: 'AbortError' })
+    await this.authorizeBuild?.(project)
+    this.emit('building-mod', `正在构建关联项目：${project.name}`)
+    await this.runGradleBuild(project, signal)
+    const directory = path.join(project.path, 'build', 'libs')
+    const candidates = await Promise.all((await fs.readdir(directory, { withFileTypes: true }).catch(() => []))
+      .filter((entry) => entry.isFile() && entry.name.endsWith('.jar') && !/(?:sources|javadoc|dev|shadow)/i.test(entry.name))
+      .map(async (entry) => ({ path: path.join(directory, entry.name), stat: await fs.stat(path.join(directory, entry.name)) })))
+    const artifact = candidates.filter((entry) => entry.stat.size >= 1_024).sort((left, right) => right.stat.mtimeMs - left.stat.mtimeMs)[0]
+    if (!artifact) throw new Error(`关联项目 ${project.name} 构建完成但没有生成可用 JAR`)
+    await validateModArtifact(artifact.path, project.loader)
+    return artifact.path
+  }
+
   async importMods(filePaths: string[]): Promise<MinecraftManagedMod[]> {
     const project = this.requireProject()
+    if (!isJavaLoader(project.loader)) throw new Error(`${platformLabel(project.loader)} 不支持导入 Java Mod JAR`)
     const destination = this.modsRoot(project)
     await fs.mkdir(destination, { recursive: true })
     for (const filePath of filePaths) {
@@ -874,6 +1759,7 @@ export class MinecraftRuntimeManager {
 
   async removeMod(name: string): Promise<MinecraftManagedMod[]> {
     const project = this.requireProject()
+    if (!isJavaLoader(project.loader)) throw new Error(`${platformLabel(project.loader)} 没有托管 Java Mod 列表`)
     if (name === projectArtifactName(project) || (['fabric', 'quilt'].includes(project.loader) && name === managedLoaderApiName(project)) || path.basename(name) !== name) {
       throw new Error('不能删除项目模组、托管依赖或无效路径')
     }
@@ -887,6 +1773,17 @@ export class MinecraftRuntimeManager {
 
   async listMods(): Promise<MinecraftManagedMod[]> {
     const project = this.requireProject()
+    if (!isJavaLoader(project.loader)) {
+      const output = path.join(project.path, 'build')
+      const entries = await fs.readdir(output, { withFileTypes: true }).catch(() => [])
+      const suffix = project.loader === 'bedrock' ? '.mcaddon' : '.zip'
+      const files = await Promise.all(entries.filter((entry) => entry.isFile() && entry.name.endsWith(suffix)).map(async (entry) => {
+        const absolute = path.join(output, entry.name)
+        const stat = await fs.stat(absolute)
+        return { name: entry.name, path: absolute, size: stat.size, modifiedAt: stat.mtime.toISOString(), projectArtifact: true }
+      }))
+      return files.sort((left, right) => right.modifiedAt.localeCompare(left.modifiedAt))
+    }
     const directory = this.modsRoot(project)
     await fs.mkdir(directory, { recursive: true })
     const entries = await fs.readdir(directory, { withFileTypes: true })
@@ -917,20 +1814,29 @@ export class MinecraftRuntimeManager {
     this.verificationProcess = null
   }
 
-  private async prepareInternal(): Promise<MinecraftRuntimeState> {
+  private async prepareInternal(signal?: AbortSignal, generation = this.prepareGeneration): Promise<MinecraftRuntimeState> {
     const project = this.requireProject()
+    if (signal?.aborted) throw abortError()
+    if (!isJavaLoader(project.loader)) throw new Error(`${platformLabel(project.loader)} 必须使用对应官方客户端或开发者工作台测试`)
     const configuredLoaderVersion = (await readConfiguredLoaderVersion(project)) ?? project.loaderVersion
     await fs.mkdir(this.instanceRoot(project), { recursive: true })
     await fs.mkdir(this.resourceRoot(), { recursive: true })
-    if (project.loader === 'fabric' || project.loader === 'quilt') await this.ensureManagedLoaderApi(project)
+    if (signal?.aborted) throw abortError()
+    if (project.kind !== 'modpack' && (project.loader === 'fabric' || project.loader === 'quilt')) await this.ensureManagedLoaderApi(project)
     const cached = await this.readMetadata(project)
     const cachedVersionJson = cached
       ? path.join(this.resourceRoot(), 'versions', cached.loaderVersionId, `${cached.loaderVersionId}.json`)
       : ''
+    const cachedJavaReady = cached
+      ? await probeJavaHome(path.dirname(path.dirname(cached.javaPath)), javaVersionForMinecraft(project.minecraftVersion), false)
+      : false
+    const cachedDependenciesReady = cached && cachedJavaReady && await this.verifyCachedRuntime(cached.loaderVersionId)
+    if (cached && !cachedDependenciesReady) await this.removeInvalidCachedAssetIndex(cached.loaderVersionId)
     if (
       cached &&
       (!configuredLoaderVersion || cached.loaderVersion === configuredLoaderVersion) &&
-      (await exists(cached.javaPath)) &&
+      cachedJavaReady &&
+      cachedDependenciesReady &&
       (await exists(cachedVersionJson))
     ) {
       this.updateState({
@@ -950,92 +1856,211 @@ export class MinecraftRuntimeManager {
     }
 
     this.emit('preparing', `正在准备 Minecraft ${project.minecraftVersion}`)
-    const { target, javaPath } = await this.ensureJava(project)
+    const { target, javaPath, source: javaSource } = await this.ensureJava(project, signal, generation)
+    if (signal?.aborted) throw abortError()
 
     this.emit('downloading-game', `正在下载 Minecraft ${project.minecraftVersion}`)
-    const versionList = await getVersionList()
-    const versionMeta = versionList.versions.find((version) => version.id === project.minecraftVersion)
-    if (!versionMeta) throw new Error(`找不到 Minecraft 版本：${project.minecraftVersion}`)
-    await install(versionMeta, this.resourceRoot(), {
-      side: 'client',
-      assetsDownloadConcurrency: 16,
-      librariesDownloadConcurrency: 16
-    })
-
-    this.emit('installing-loader', `正在安装 ${project.loader} Loader`)
-    let loaderVersion = configuredLoaderVersion
-    let loaderVersionId: string
-    if (project.loader === 'fabric') {
-      const loaders = await getFabricLoaders()
-      const loader = loaderVersion
-        ? loaders.find((item) => item.version === loaderVersion)
-        : loaders.find((item) => item.stable) ?? loaders[0]
-      if (!loader) throw new Error(loaderVersion ? `Fabric Meta 没有返回 Loader ${loaderVersion}` : 'Fabric Meta 没有返回可用 Loader')
-      loaderVersion = loader.version
-      loaderVersionId = await installFabric({
-        minecraftVersion: project.minecraftVersion,
-        version: loader.version,
-        minecraft: this.resourceRoot(),
-        side: 'client'
-      })
-    } else if (project.loader === 'quilt') {
-      const loaders = await getQuiltLoaders()
-      const loader = loaderVersion
-        ? loaders.find((item) => item.version === loaderVersion)
-        : loaders.find((item) => !/(?:alpha|beta|rc)/i.test(item.version)) ?? loaders[0]
-      if (!loader) throw new Error(loaderVersion ? `Quilt Meta 没有返回 Loader ${loaderVersion}` : 'Quilt Meta 没有返回可用 Loader')
-      loaderVersion = loader.version
-      loaderVersionId = await installQuiltVersion({
-        minecraftVersion: project.minecraftVersion,
-        version: loader.version,
-        minecraft: this.resourceRoot(),
-        side: 'client'
-      })
-    } else if (project.loader === 'forge') {
-      if (!loaderVersion) {
-        const forge = await getForgeVersionList({ minecraft: project.minecraftVersion })
-        const selected = forge.versions.find((entry) => entry.type === 'recommended') ?? forge.versions.find((entry) => entry.type === 'latest') ?? forge.versions[0]
-        if (!selected) throw new Error(`Forge 没有返回 Minecraft ${project.minecraftVersion} 的版本`)
-        loaderVersion = `${project.minecraftVersion}-${selected.version}`
+    diagnosticJournal.record({
+      subsystem: 'minecraft-download',
+      operation: 'install-client',
+      phase: 'start',
+      message: `Installing Minecraft ${project.minecraftVersion}`,
+      data: {
+        resourceRoot: this.resourceRoot(),
+        versionManifest: MINECRAFT_VERSION_MANIFEST_SOURCES[0].url,
+        versionManifestFallbacks: MINECRAFT_VERSION_MANIFEST_SOURCES.slice(1).map((source) => source.url),
+        assetHosts: MINECRAFT_ASSET_HOSTS,
+        mavenHosts: MINECRAFT_MAVEN_HOSTS,
+        loader: project.loader,
+        loaderVersion: configuredLoaderVersion
       }
-      const forgeVersion = loaderVersion.startsWith(`${project.minecraftVersion}-`)
-        ? loaderVersion.slice(project.minecraftVersion.length + 1)
-        : loaderVersion
-      loaderVersionId = await installForge(
-        { mcversion: project.minecraftVersion, version: forgeVersion },
-        this.resourceRoot(),
-        { java: javaPath, side: 'client' }
-      )
-    } else {
-      if (!loaderVersion) throw new Error(`NeoForge ${project.minecraftVersion} 缺少加载器版本`)
-      const artifact = project.minecraftVersion === '1.20.1' ? 'forge' : 'neoforge'
-      loaderVersionId = await installNeoForged(artifact, loaderVersion, this.resourceRoot(), { java: javaPath, side: 'client' })
-    }
-    const resolved = await Version.parse(this.resourceRoot(), loaderVersionId)
-    await installDependencies(resolved, {
-      assetsDownloadConcurrency: 16,
-      librariesDownloadConcurrency: 16
     })
-
-    const metadata: RuntimeMetadata = {
-      minecraftVersion: project.minecraftVersion,
-      loader: project.loader,
-      loaderVersionId,
-      fabricVersionId: project.loader === 'fabric' ? loaderVersionId : undefined,
-      loaderVersion,
-      javaPath,
-      javaTarget: target,
-      preparedAt: new Date().toISOString()
+    const resolvedVersion = await resolveMinecraftVersionFromManifests(
+      project.minecraftVersion,
+      async (source) => await getVersionList({
+        remote: source.url,
+        fetch: (input, init) => {
+          const signals = [init?.signal, signal].filter((value): value is AbortSignal => Boolean(value))
+          const mergedSignal = signals.length > 1 ? AbortSignal.any(signals) : signals[0]
+          return domesticMinecraftFetch(input, { ...init, signal: mergedSignal })
+        }
+      }),
+      {
+        onFailure: (failure) => diagnosticJournal.record({
+          subsystem: 'minecraft-download',
+          operation: 'version-manifest',
+          phase: 'source-failed',
+          level: 'warning',
+          message: `Minecraft version manifest source failed: ${failure.source.label}`,
+          data: {
+            minecraftVersion: project.minecraftVersion,
+            source: failure.source.url,
+            message: failure.message
+          }
+        })
+      }
+    )
+    if (resolvedVersion.failures.length > 0) {
+      diagnosticJournal.record({
+        subsystem: 'minecraft-download',
+        operation: 'version-manifest',
+        phase: 'fallback-success',
+        level: 'warning',
+        message: `Minecraft version manifest fallback succeeded via ${resolvedVersion.source.label}`,
+        data: {
+          minecraftVersion: project.minecraftVersion,
+          source: resolvedVersion.source.url,
+          failures: resolvedVersion.failures.map((failure) => ({
+            source: failure.source.url,
+            message: failure.message
+          }))
+        }
+      })
     }
-    await fs.writeFile(this.metadataPath(project), JSON.stringify(metadata, null, 2), 'utf8')
+    const versionMeta = resolvedVersion.version
+    await ensureAssetIndex(versionMeta as unknown as { assets?: string; assetIndex?: { sha1?: string } }, this.resourceRoot(), signal)
+    const dispatcher = minecraftDownloadDispatcher()
+    let loaderVersion = configuredLoaderVersion
+    let loaderVersionId = ''
+    try {
+      await runMinecraftTaskWithRecovery({
+        signal,
+        createTask: (attempt) => installTask(versionMeta, this.resourceRoot(), {
+          side: 'client',
+          assetsDownloadConcurrency: 4,
+          librariesDownloadConcurrency: 4,
+          dispatcher,
+          json: attempt % 2 === 1 ? [mirrorVersionJsonUrl(project.minecraftVersion), versionMeta.url] : [versionMeta.url, mirrorVersionJsonUrl(project.minecraftVersion)],
+          client: attempt % 2 === 1 ? [mirrorMinecraftJarUrl(project.minecraftVersion, 'client')] : [],
+          assetsIndexUrl: (version) => officialAssetIndexUrls(version),
+          useHashForAssetsIndex: true,
+          assetsHost: minecraftAssetHosts(attempt),
+          mavenHost: minecraftMavenHosts(attempt),
+          fetch: domesticMinecraftFetch
+        }),
+        onUpdate: (task) => this.emitProgress('downloading-game', `正在下载 Minecraft ${project.minecraftVersion}`, task.progress, task.total, generation),
+        onRetry: (attempt, error) => {
+          const source = attempt % 2 === 0 ? 'Mojang 官方源' : 'BMCLAPI'
+          this.emit('downloading-game', `${error.message}，正在切换到 ${source} 自动重试（${attempt}/3）`, 'warning')
+          diagnosticJournal.record({
+            subsystem: 'minecraft-download',
+            operation: 'install-client',
+            phase: 'retry',
+            level: 'warning',
+            message: `Minecraft download stalled; retrying with ${source}`,
+            data: { attempt, minecraftVersion: project.minecraftVersion, source }
+          })
+        }
+      })
+      if (signal?.aborted) throw abortError()
+
+      this.emit('installing-loader', `正在安装 ${project.loader} Loader`)
+      if (project.loader === 'fabric') {
+        const loaders = await getFabricLoaders({ signal, fetch: (url, init) => domesticMinecraftFetch(`${BMCLAPI}/fabric-meta${new URL(url).pathname}`, init) })
+        const loader = loaderVersion
+          ? loaders.find((item) => item.version === loaderVersion)
+          : loaders.find((item) => item.stable) ?? loaders[0]
+        if (!loader) throw new Error(loaderVersion ? `Fabric Meta 没有返回 Loader ${loaderVersion}` : 'Fabric Meta 没有返回可用 Loader')
+        loaderVersion = loader.version
+        loaderVersionId = await installFabric({
+          minecraftVersion: project.minecraftVersion,
+          version: loader.version,
+          minecraft: this.resourceRoot(),
+          side: 'client',
+          signal,
+          fetch: (url, init) => domesticMinecraftFetch(`${BMCLAPI}/fabric-meta${new URL(url).pathname}`, init)
+        })
+      } else if (project.loader === 'quilt') {
+        const loaders = await getQuiltLoaders({ signal, fetch: (url, init) => domesticMinecraftFetch(`${BMCLAPI}/quilt-meta${new URL(url).pathname}`, init) })
+        const loader = loaderVersion
+          ? loaders.find((item) => item.version === loaderVersion)
+          : loaders.find((item) => !/(?:alpha|beta|rc)/i.test(item.version)) ?? loaders[0]
+        if (!loader) throw new Error(loaderVersion ? `Quilt Meta 没有返回 Loader ${loaderVersion}` : 'Quilt Meta 没有返回可用 Loader')
+        loaderVersion = loader.version
+        loaderVersionId = await installQuiltVersion({
+          minecraftVersion: project.minecraftVersion,
+          version: loader.version,
+          minecraft: this.resourceRoot(),
+          side: 'client',
+          signal,
+          fetch: (url, init) => domesticMinecraftFetch(`${BMCLAPI}/quilt-meta${new URL(url).pathname}`, init)
+        })
+      } else if (project.loader === 'forge') {
+        if (!loaderVersion) {
+          const forge = await getForgeVersionList({ minecraft: project.minecraftVersion })
+          const selected = forge.versions.find((entry) => entry.type === 'recommended') ?? forge.versions.find((entry) => entry.type === 'latest') ?? forge.versions[0]
+          if (!selected) throw new Error(`Forge 没有返回 Minecraft ${project.minecraftVersion} 的版本`)
+          loaderVersion = `${project.minecraftVersion}-${selected.version}`
+        }
+        const forgeVersion = loaderVersion.startsWith(`${project.minecraftVersion}-`)
+          ? loaderVersion.slice(project.minecraftVersion.length + 1)
+          : loaderVersion
+        loaderVersionId = await runMinecraftTaskWithRecovery({
+          signal,
+          stallTimeoutMs: 120_000,
+          createTask: () => installForgeTask(
+            { mcversion: project.minecraftVersion, version: forgeVersion },
+            this.resourceRoot(),
+            { java: javaPath, side: 'client', mavenHost: FORGE_MAVEN_HOSTS, dispatcher }
+          ),
+          onUpdate: (task) => this.emitProgress('installing-loader', `正在安装 Forge ${loaderVersion}`, task.progress, task.total, generation),
+          onRetry: (attempt, error) => this.emit('installing-loader', `${error.message}，正在重试 Forge 安装（${attempt}/3）`, 'warning')
+        })
+      } else {
+        if (!loaderVersion) throw new Error(`NeoForge ${project.minecraftVersion} 缺少加载器版本`)
+        const artifact = project.minecraftVersion === '1.20.1' ? 'forge' : 'neoforge'
+        loaderVersionId = await runMinecraftTaskWithRecovery({
+          signal,
+          stallTimeoutMs: 120_000,
+          createTask: () => installNeoForgedTask(artifact, loaderVersion!, this.resourceRoot(), { java: javaPath, side: 'client', mavenHost: NEOFORGE_MAVEN_HOSTS, dispatcher }),
+          onUpdate: (task) => this.emitProgress('installing-loader', `正在安装 NeoForge ${loaderVersion}`, task.progress, task.total, generation),
+          onRetry: (attempt, error) => this.emit('installing-loader', `${error.message}，正在重试 NeoForge 安装（${attempt}/3）`, 'warning')
+        })
+      }
+      const resolved = await Version.parse(this.resourceRoot(), loaderVersionId)
+      if (signal?.aborted) throw abortError()
+      await runMinecraftTaskWithRecovery({
+        signal,
+        createTask: (attempt) => installDependenciesTask(resolved, {
+          assetsDownloadConcurrency: 4,
+          librariesDownloadConcurrency: 4,
+          dispatcher,
+          assetsHost: minecraftAssetHosts(attempt),
+          mavenHost: minecraftMavenHosts(attempt),
+          assetsIndexUrl: (version) => officialAssetIndexUrls(version),
+          useHashForAssetsIndex: true,
+          fetch: domesticMinecraftFetch
+        }),
+        onUpdate: (task) => this.emitProgress('downloading-game', `正在校验 Minecraft ${project.minecraftVersion} 资源与依赖`, task.progress, task.total, generation),
+        onRetry: (attempt, error) => this.emit('downloading-game', `${error.message}，正在重新校验缓存并切换下载源（${attempt}/3）`, 'warning')
+      })
+
+      const metadata: RuntimeMetadata = {
+        minecraftVersion: project.minecraftVersion,
+        loader: project.loader,
+        loaderVersionId,
+        fabricVersionId: project.loader === 'fabric' ? loaderVersionId : undefined,
+        loaderVersion,
+        javaPath,
+        javaTarget: target,
+        javaSource: javaSource,
+        preparedAt: new Date().toISOString()
+      }
+      await fs.writeFile(this.metadataPath(project), JSON.stringify(metadata, null, 2), 'utf8')
+    } finally {
+      await dispatcher.close()
+    }
+
+    const metadata = await this.readMetadata(project)
+    if (!metadata) throw new Error('Minecraft 运行时安装完成但元数据未写入')
     this.updateState({
       stage: 'idle',
       minecraftVersion: project.minecraftVersion,
       loader: project.loader,
-      loaderVersionId,
-      fabricVersionId: project.loader === 'fabric' ? loaderVersionId : undefined,
-      loaderVersion,
-      javaPath,
+      loaderVersionId: metadata.loaderVersionId,
+      fabricVersionId: metadata.fabricVersionId,
+      loaderVersion: metadata.loaderVersion,
+      javaPath: metadata.javaPath,
       instancePath: this.instanceRoot(project),
       installed: true,
       message: `Minecraft 与 ${project.loader} 已准备完成`,
@@ -1047,8 +2072,49 @@ export class MinecraftRuntimeManager {
 
   private requireProject(): ProjectInfo {
     const project = this.getProject()
+    if (project && (!this.stateProjectPath || (!this.state.running && !this.process && !this.preparePromise && !this.buildPromise && !this.verificationProcess))) {
+      this.stateProjectPath = project.path
+    }
     if (!project) throw new Error('请先创建或打开一个 Mod 项目')
     return project
+  }
+
+  /**
+   * Metadata is written after the initial download, but individual library
+   * files or extracted natives can still become truncated later. Validate the
+   * cache before treating it as ready so launch can repair it through the
+   * normal installer path instead of surfacing an opaque AggregateError.
+   */
+  private async verifyCachedRuntime(versionId: string): Promise<boolean> {
+    try {
+      const folder = MinecraftFolder.from(this.resourceRoot())
+      const version = await Version.parse(folder, versionId)
+      const precheckOptions = { gamePath: this.resourceRoot(), javaPath: '', version: version.id }
+      await LaunchPrecheck.checkVersion(folder, version, precheckOptions)
+      await LaunchPrecheck.checkLibraries(folder, version, precheckOptions)
+      await LaunchPrecheck.checkNatives(folder, version, precheckOptions)
+      const assetIndex = version.assetIndex
+      if (!assetIndex?.sha1) return false
+      const assetIndexPath = folder.getPath('assets', 'indexes', `${version.assets}.json`)
+      if (await sha1File(assetIndexPath) !== assetIndex.sha1) return false
+      return true
+    } catch {
+      return false
+    }
+  }
+
+  private async removeInvalidCachedAssetIndex(versionId: string): Promise<void> {
+    try {
+      const folder = MinecraftFolder.from(this.resourceRoot())
+      const version = await Version.parse(folder, versionId)
+      if (!version.assetIndex?.sha1) return
+      const assetIndexPath = folder.getPath('assets', 'indexes', `${version.assets}.json`)
+      if (await sha1File(assetIndexPath) !== version.assetIndex.sha1) {
+        await fs.rm(assetIndexPath, { force: true })
+      }
+    } catch {
+      // A missing or malformed cache is repaired by the normal installer.
+    }
   }
 
   private resourceRoot(): string {
@@ -1059,17 +2125,58 @@ export class MinecraftRuntimeManager {
     return path.join(app.getPath('userData'), 'minecraft-runtime', 'java')
   }
 
-  private async ensureJava(project: ProjectInfo): Promise<{ target: string; javaPath: string }> {
+  private async preferredJavaHome(scenario: keyof JavaPreferences): Promise<string> {
+    const preferences = await this.getJavaPreference?.().catch(() => undefined)
+    const value = preferences?.[scenario]
+    return typeof value === 'string' ? value.trim().replace(/^"|"$/g, '') : ''
+  }
+
+  /** Resolve the Java used for launching and loader installs: manual pick first, managed runtime as fallback. */
+  private async ensureJava(project: ProjectInfo, signal?: AbortSignal, generation?: number): Promise<{ target: string; javaPath: string; source: 'managed' | 'custom' }> {    const minimumMajor = javaVersionForMinecraft(project.minecraftVersion)
     const target = javaRuntimeTargetForMinecraft(project.minecraftVersion)
+    const preferredGameJava = await this.preferredJavaHome('game')
+    if (preferredGameJava) {
+      const candidate = await probeJavaHome(preferredGameJava, minimumMajor, false)
+      if (candidate) {
+        this.emit('preparing', `使用手动选择的 Java ${candidate.major}：${candidate.javaPath}`)
+        return { target, javaPath: candidate.javaPath, source: 'custom' }
+      }
+      this.emit('preparing', `手动选择的 Java 不满足 Minecraft ${project.minecraftVersion} 的要求（至少 Java ${minimumMajor}），已回退到自动配置：${preferredGameJava}`, 'warning')
+    }
+    return { ...await this.ensureManagedJava(minimumMajor, target, signal, generation), source: 'managed' }
+  }
+
+  /**
+   * Picks the Java for an upcoming launch without re-downloading anything:
+   * honors a manual pick added after preparation, otherwise reuses whatever
+   * the instance was prepared with.
+   */
+  private async resolveLaunchJava(project: ProjectInfo, metadata: RuntimeMetadata): Promise<string> {
+    const preferredGameJava = await this.preferredJavaHome('game')
+    if (!preferredGameJava) return metadata.javaPath
+    const candidate = await probeJavaHome(preferredGameJava, javaVersionForMinecraft(project.minecraftVersion), false)
+    if (candidate) return candidate.javaPath
+    this.emit('launching', `手动选择的 Java 当前不可用，已改用实例配置的 Java：${metadata.javaPath}`, 'warning')
+    return metadata.javaPath
+  }
+
+  private async ensureManagedJava(minimumMajor: number, requestedTarget?: string, signal?: AbortSignal, generation?: number): Promise<{ target: string; javaPath: string }> {
+    const target = requestedTarget ?? javaRuntimeTargetForJavaVersion(minimumMajor)
     const javaHome = path.join(this.runtimeRoot(), target)
-    const javaPath = path.join(javaHome, 'bin', process.platform === 'win32' ? 'java.exe' : 'java')
-    if (!(await exists(javaPath))) {
+    const javaPath = managedJavaExecutable(this.runtimeRoot(), target)
+    if (!(await probeJavaHome(javaHome, minimumMajor, false))) {
+      await fs.rm(javaHome, { recursive: true, force: true })
       this.emit('downloading-java', `正在下载托管 Java：${target}`)
       const manifest = await fetchCompatibleJavaRuntimeManifest(target)
-      const task = installJavaRuntimeTask({ destination: javaHome, manifest })
-      await task.startAndWait({
-        onUpdate: () => this.emitProgress('downloading-java', '正在下载 Java Runtime', task.progress, task.total)
+      await runMinecraftTaskWithRecovery({
+        signal,
+        createTask: () => installJavaRuntimeTask({ destination: javaHome, manifest }),
+        onUpdate: (task) => this.emitProgress('downloading-java', '正在下载 Java Runtime', task.progress, task.total, generation),
+        onRetry: (attempt, error) => this.emit('downloading-java', `${error.message}，正在重新下载 Java Runtime（${attempt}/3）`, 'warning')
       })
+    }
+    if (!(await probeJavaHome(javaHome, minimumMajor, false))) {
+      throw new Error(`托管 Java 安装后仍无法运行：${javaPath}。缓存可能损坏、架构不匹配或被安全软件拦截`)
     }
     return { target, javaPath }
   }
@@ -1083,137 +2190,42 @@ export class MinecraftRuntimeManager {
     }
     const modsDirectory = this.modsRoot(project)
     const target = path.join(modsDirectory, managedLoaderApiName(project))
-    const marker = path.join(
-      modsDirectory,
-      projectDataDirectory(project) === '.modtool' ? `.modtool-${project.loader}-api-version` : `.modmind-${project.loader}-api-version`
-    )
+    const marker = path.join(modsDirectory, `.modmind-${project.loader}-api-version`)
     await fs.mkdir(modsDirectory, { recursive: true })
     const installedVersion = await fs.readFile(marker, 'utf8').catch(() => '')
     if (installedVersion.trim() === version && (await exists(target))) return
 
     const encodedVersion = encodeURIComponent(version)
-    const baseUrl = project.loader === 'quilt'
-      ? `https://maven.quiltmc.org/repository/release/org/quiltmc/quilted-fabric-api/quilted-fabric-api/${encodedVersion}/quilted-fabric-api-${encodedVersion}.jar`
-      : `https://maven.fabricmc.net/net/fabricmc/fabric-api/fabric-api/${encodedVersion}/fabric-api-${encodedVersion}.jar`
-    const temporary = `${target}.download`
+    const relativePath = project.loader === 'quilt'
+      ? `org/quiltmc/quilted-fabric-api/quilted-fabric-api/${encodedVersion}/quilted-fabric-api-${encodedVersion}.jar`
+      : `net/fabricmc/fabric-api/fabric-api/${encodedVersion}/fabric-api-${encodedVersion}.jar`
+    const sources = project.loader === 'quilt'
+      ? [`${BMCLAPI}/maven/${relativePath}`, `https://maven.quiltmc.org/repository/release/${relativePath}`]
+      : [`${BMCLAPI}/maven/${relativePath}`, `https://maven.fabricmc.net/${relativePath}`]
     this.emit('installing-fabric', `正在准备 ${label} ${version}`)
-    for (let attempt = 1; attempt <= 3; attempt += 1) {
+    let expected = ''
+    let checksumError: unknown
+    for (const source of sources) {
       try {
-        const [response, checksumResponse] = await Promise.all([fetch(baseUrl), fetch(`${baseUrl}.sha1`)])
-        if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`)
+        const checksumResponse = await fetch(`${source}.sha1`, { signal: AbortSignal.timeout(30_000) })
         if (!checksumResponse.ok) throw new Error(`SHA-1 HTTP ${checksumResponse.status}`)
-        const expected = (await checksumResponse.text()).trim().split(/\s+/)[0]?.toLowerCase()
+        expected = (await checksumResponse.text()).trim().split(/\s+/)[0]?.toLowerCase() ?? ''
         if (!expected || !/^[a-f0-9]{40}$/.test(expected)) throw new Error(`${label} SHA-1 格式无效`)
-        await pipeline(Readable.fromWeb(response.body as never), createWriteStream(temporary))
-        const hasher = createHash('sha1')
-        await pipeline(createReadStream(temporary), hasher)
-        if (hasher.digest('hex') !== expected) throw new Error(`${label} SHA-1 校验失败`)
-        await fs.rm(target, { force: true })
-        await fs.rename(temporary, target)
-        await fs.writeFile(marker, version, 'utf8')
-        this.emit('installing-fabric', `${label} ${version} 已就绪`)
-        return
+        break
       } catch (error) {
-        await fs.rm(temporary, { force: true })
-        if (attempt === 3) throw error
-        this.emit('installing-fabric', `${label} 下载中断，正在重试 ${attempt + 1}/3`, 'warning')
+        checksumError = error
       }
     }
-  }
-
-  private async ensureGradle(
-    gradleVersion: string,
-    preference: GradleDownloadSourcePreference = 'auto'
-  ): Promise<string> {
-    const root = path.join(app.getPath('userData'), 'gradle-runtime')
-    const home = path.join(root, `gradle-${gradleVersion}`)
-    const executable = path.join(home, 'bin', process.platform === 'win32' ? 'gradle.bat' : 'gradle')
-    if (await exists(executable)) return executable
-
-    await fs.mkdir(root, { recursive: true })
-    const archive = path.join(root, `gradle-${gradleVersion}-bin.zip`)
-    const temporary = `${archive}.${process.pid}.download`
-    const staging = path.join(root, `.gradle-${gradleVersion}-${process.pid}.extracting`)
-    let expectedChecksum = gradleChecksumForVersion(gradleVersion)
-    if (!expectedChecksum) {
-      const checksumResponse = await fetch(`https://services.gradle.org/distributions/gradle-${gradleVersion}-bin.zip.sha256`, {
-        signal: AbortSignal.timeout(30_000)
-      })
-      if (!checksumResponse.ok) throw new Error(`Gradle 校验文件下载失败：HTTP ${checksumResponse.status}`)
-      expectedChecksum = (await checksumResponse.text()).trim().split(/\s+/)[0]?.toLowerCase()
-    }
-    if (!expectedChecksum || !/^[a-f0-9]{64}$/.test(expectedChecksum)) throw new Error('Gradle 官方校验值格式无效')
-
-    let sources = gradleDistributionSources(gradleVersion, preference)
-    if (preference === 'auto') {
-      this.emit('building-mod', '正在测速 Gradle 下载源')
-      const probes = await Promise.all(sources.map(async (source) => ({
-        source,
-        throughput: await probeGradleDistributionSource(source)
-      })))
-      sources = probes.sort((left, right) => right.throughput - left.throughput).map((probe) => probe.source)
-      const fastest = probes[0]
-      if (fastest?.throughput) {
-        this.emit('building-mod', `已选择${fastest.source.label}（测速 ${((fastest.throughput * 1000) / 1024 / 1024).toFixed(1)} MiB/s）`)
-      }
-    }
-    const attempts: GradleDistributionSource[] = preference === 'official'
-      ? [...sources, ...sources, ...sources]
-      : sources
-    const failures: string[] = []
-    let downloadedGradle = false
-    for (let index = 0; index < attempts.length && !downloadedGradle; index += 1) {
-      const source = attempts[index]
-      try {
-        await fs.rm(temporary, { force: true })
-        this.emit('building-mod', `正在从${source.label}下载 Gradle ${gradleVersion}`)
-        const response = await fetch(source.url, {
-          signal: AbortSignal.timeout(5 * 60_000)
-        })
-        if (!response.ok || !response.body) throw new Error(`HTTP ${response.status}`)
-        const total = Number(response.headers.get('content-length')) || 0
-        let downloaded = 0
-        const progress = new Transform({
-          transform: (chunk: Buffer, _encoding, callback) => {
-            downloaded += chunk.length
-            this.emitProgress('building-mod', `${source.label} · Gradle ${gradleVersion}`, downloaded, total)
-            callback(null, chunk)
-          }
-        })
-        await pipeline(Readable.fromWeb(response.body as never), progress, createWriteStream(temporary))
-        const hasher = createHash('sha256')
-        await pipeline(createReadStream(temporary), hasher)
-        if (hasher.digest('hex') !== expectedChecksum) {
-          throw new Error('SHA-256 与模板固定校验值不一致')
-        }
-        downloadedGradle = true
-      } catch (error) {
-        await fs.rm(temporary, { force: true })
-        const reason = error instanceof Error ? error.message : String(error)
-        failures.push(`${source.label}: ${reason}`)
-        if (index + 1 < attempts.length) {
-          this.emit('building-mod', `${source.label}不可用，正在自动切换下载源`, 'warning')
-        }
-      }
-    }
-    if (!downloadedGradle) throw new Error(`Gradle 下载失败：${failures.join('；')}`)
-    await fs.rm(archive, { force: true })
-    await fs.rename(temporary, archive)
-    this.emit('building-mod', '正在解压 Gradle')
-    try {
-      await fs.rm(staging, { recursive: true, force: true })
-      await fs.mkdir(staging, { recursive: true })
-      await extractZip(archive, { dir: staging })
-      const stagedHome = path.join(staging, `gradle-${gradleVersion}`)
-      const stagedExecutable = path.join(stagedHome, 'bin', process.platform === 'win32' ? 'gradle.bat' : 'gradle')
-      if (!(await exists(stagedExecutable))) throw new Error('Gradle 解压完成，但未找到启动程序')
-      if (!(await exists(home))) await fs.rename(stagedHome, home)
-    } finally {
-      await fs.rm(staging, { recursive: true, force: true }).catch(() => undefined)
-      await fs.rm(archive, { force: true }).catch(() => undefined)
-    }
-    if (!(await exists(executable))) throw new Error('Gradle 运行时安装未完成')
-    return executable
+    if (!expected) throw new Error(`${label} 校验信息下载失败：${checksumError instanceof Error ? checksumError.message : String(checksumError)}`)
+    await verifiedDownload.download({
+      sources: sources.map((url, index) => ({ id: `${project.loader}-api-${index + 1}`, label: `${label} 下载源 ${index + 1}`, url })),
+      destination: target,
+      expectedHash: { algorithm: 'sha1', value: expected },
+      maxBytes: 256 * 1024 * 1024,
+      retriesPerSource: 2
+    })
+    await fs.writeFile(marker, version, 'utf8')
+    this.emit('installing-fabric', `${label} ${version} 已就绪`)
   }
 
   private instanceRoot(project: ProjectInfo): string {
@@ -1232,9 +2244,13 @@ export class MinecraftRuntimeManager {
     project: ProjectInfo,
     launchedAt: number,
     code: number | null,
-    signal: NodeJS.Signals | null
+    signal: NodeJS.Signals | null,
+    intentionallyStopped: boolean
   ): Promise<void> {
-    const crashed = code !== 0 && code !== null
+    const abnormalExitCode = code !== 0 && code !== null
+    const parsedCrash = abnormalExitCode ? await this.readLatestCrash(project, launchedAt) : undefined
+    const normalShutdown = abnormalExitCode && !parsedCrash && await this.readNormalShutdownEvidence(project, launchedAt)
+    const crashed = abnormalExitCode && !intentionallyStopped && !normalShutdown
     if (!crashed) {
       const message = `Minecraft 已退出${signal ? ` (${signal})` : ''}`
       await fs.writeFile(path.join(this.instanceRoot(project), 'last-clean-exit'), new Date().toISOString(), 'utf8').catch(() => undefined)
@@ -1244,7 +2260,6 @@ export class MinecraftRuntimeManager {
     }
 
     const signedCode = code > 0x7fffffff ? code - 0x100000000 : code
-    const parsedCrash = await this.readLatestCrash(project, launchedAt)
     const lastCrash: MinecraftCrashInfo = parsedCrash ?? {
       summary: `Minecraft 异常退出，代码 ${signedCode}`,
       exitCode: signedCode,
@@ -1255,6 +2270,21 @@ export class MinecraftRuntimeManager {
     const message = summary.split('\n')[0] || `Minecraft 异常退出，代码 ${signedCode}`
     this.updateState({ stage: 'error', running: false, pid: undefined, message, lastCrash })
     this.emit('error', `${message}${reportPath ? `\n崩溃报告：${reportPath}` : ''}`, 'error')
+  }
+
+  private async readNormalShutdownEvidence(project: ProjectInfo, launchedAt: number): Promise<boolean> {
+    const candidates = [
+      path.join(this.instanceRoot(project), 'launcher-console.log'),
+      path.join(this.instanceRoot(project), 'logs', 'latest.log')
+    ]
+    for (const filePath of candidates) {
+      const stat = await fs.stat(filePath).catch(() => null)
+      if (!stat || stat.mtimeMs < launchedAt - 2_000) continue
+      const content = await fs.readFile(filePath, 'utf8').catch(() => '')
+      const tail = content.slice(-96_000)
+      if (/(?:Stopping!|Stopping server|Saving (?:all )?worlds|Saving players|Shutting down|Shutdown complete|Exiting game)/i.test(tail)) return true
+    }
+    return false
   }
 
   private async readLatestCrash(project: ProjectInfo, launchedAt: number): Promise<MinecraftCrashInfo | undefined> {
@@ -1292,20 +2322,15 @@ export class MinecraftRuntimeManager {
   private async readMetadata(project: ProjectInfo): Promise<RuntimeMetadata | null> {
     try {
       const metadata = JSON.parse(await fs.readFile(this.metadataPath(project), 'utf8')) as Partial<RuntimeMetadata>
-      if (metadata.minecraftVersion !== project.minecraftVersion) return null
-      const loader = metadata.loader ?? (metadata.fabricVersionId ? 'fabric' : undefined)
-      const loaderVersionId = metadata.loaderVersionId ?? metadata.fabricVersionId
-      if (loader !== project.loader || !loaderVersionId || !metadata.loaderVersion || !metadata.javaPath || !metadata.javaTarget || !metadata.preparedAt) return null
-      return {
-        minecraftVersion: project.minecraftVersion,
-        loader,
-        loaderVersionId,
-        fabricVersionId: metadata.fabricVersionId,
-        loaderVersion: metadata.loaderVersion,
-        javaPath: metadata.javaPath,
-        javaTarget: metadata.javaTarget,
-        preparedAt: metadata.preparedAt
+      const normalized = normalizeRuntimeMetadata(project, metadata, this.runtimeRoot())
+      if (!normalized) return null
+
+      // A copied project can contain a Java path from another Windows user.
+      // Keep the cache useful by rewriting only the derived runtime fields.
+      if (metadata.javaPath !== normalized.javaPath || metadata.javaTarget !== normalized.javaTarget || metadata.javaSource !== normalized.javaSource) {
+        await fs.writeFile(this.metadataPath(project), `${JSON.stringify(normalized, null, 2)}\n`, 'utf8').catch(() => undefined)
       }
+      return normalized
     } catch {
       return null
     }
@@ -1323,12 +2348,13 @@ export class MinecraftRuntimeManager {
     updateState = true
   ): void {
     if (!message) return
-    const event: MinecraftRuntimeEvent = { stage, message, level, time: new Date().toISOString() }
+    const event: MinecraftRuntimeEvent = { stage, message, level, time: new Date().toISOString(), ...(this.stateProjectPath ? {projectPath: this.stateProjectPath} : {}) }
     this.onEvent(event)
     if (updateState) this.updateState({ stage, message })
   }
 
-  private emitProgress(stage: MinecraftRuntimeStage, message: string, progress: number, total: number): void {
+  private emitProgress(stage: MinecraftRuntimeStage, message: string, progress: number, total: number, generation?: number): void {
+    if (generation !== undefined && generation !== this.prepareGeneration) return
     const now = Date.now()
     const finished = total > 0 && progress >= total
     if (this.lastProgressStage === stage && now - this.lastProgressAt < 150 && !finished) return

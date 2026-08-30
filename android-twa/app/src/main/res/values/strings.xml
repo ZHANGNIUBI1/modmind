@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="appName">Ether Studio</string>
+    <!--
+      Statement verifying this app owns https://ether-studio.top.
+      SHA256_FINGERPRINT must be replaced with the real value printed by:
+        keytool -list -v -keystore etherstudio-release.keystore -alias etherstudio
+      (also run it against the debug keystore for local verification).
+      Without a matching fingerprint Chrome shows the URL bar instead of fullscreen.
+    -->
+    <string name="assetStatements">
+        [{
+            \"relation\": [\"delegate_permission/common.handle_all_urls\"],
+            \"target\": {
+                \"namespace\": \"android_app\",
+                \"package_name\": \"top.etherstudio.remote\",
+                \"sha256_cert_fingerprints\": [\"SHA256_FINGERPRINT_REPLACE_ME\"]
+            }
+        }]
+    </string>
+</resources>

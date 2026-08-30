@@ -1,0 +1,11 @@
+{
+  "id": "panel-only",
+  "name": "仅面板插件模板",
+  "version": "0.1.0",
+  "description": "演示如何在侧边栏渲染一个沙箱网页面板并通过受限桥调用宿主能力。",
+  "author": "",
+  "permissions": ["project.read"],
+  "panel": {
+    "entry": "panel/index.html"
+  }
+}

@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <title>面板+工具插件模板</title>
+  <style>
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; padding: 20px;
+      font-family: 'Segoe UI', 'Microsoft YaHei', sans-serif;
+      color: var(--mm-text, #1f2937);
+    }
+    button {
+      padding: 6px 14px; border-radius: 8px;
+      border: 1px solid var(--mm-border, rgba(128,128,128,.4));
+      background: var(--mm-surface, rgba(128,128,128,.08));
+      color: inherit; cursor: pointer; font-size: 13px;
+    }
+    pre { white-space: pre-wrap; word-break: break-all; font-size: 12px; padding: 10px; border-radius: 8px; background: var(--mm-surface, rgba(128,128,128,.08)); min-height: 20px; }
+  </style>
+</head>
+<body>
+  <h1 style="font-size:18px;margin-top:0">面板 + 后端工具</h1>
+  <p style="font-size:13px;opacity:.7">点击按钮经宿主中转调用本插件的 summarize_project 工具（同一函数也注册在 MCP 上，可被 AI Agent 调用）。</p>
+  <button id="run">调用 summarize_project</button>
+  <pre id="output">等待调用…</pre>
+
+  <script>
+    let requestSeq = 0
+    const pending = new Map()
+
+    function applyTheme(theme) {
+      const dark = theme === 'dark'
+      const values = dark
+        ? { '--mm-bg': '#1f2024', '--mm-text': '#f0f1f3', '--mm-border': '#484a50', '--mm-surface': '#2a2c31' }
+        : { '--mm-bg': '#ffffff', '--mm-text': '#1f2937', '--mm-border': '#d8dadd', '--mm-surface': '#f4f5f7' }
+      for (const [name, value] of Object.entries(values)) document.documentElement.style.setProperty(name, value)
+    }
+
+    function request(payload) {
+      return new Promise((resolve, reject) => {
+        const requestId = `req-${Date.now()}-${requestSeq += 1}`
+        pending.set(requestId, { resolve, reject })
+        window.parent.postMessage({ ...payload, requestId }, '*')
+      })
+    }
+
+    window.addEventListener('message', (event) => {
+      const data = event.data
+      if (data && data.type === 'hostInfo') {
+        applyTheme(data.hostInfo?.theme)
+        return
+      }
+      if (data && data.type === 'result' && pending.has(data.requestId)) {
+        const entry = pending.get(data.requestId)
+        pending.delete(data.requestId)
+        if (data.ok) entry.resolve(data.result)
+        else entry.reject(new Error(data.error))
+      }
+    })
+
+    window.parent.postMessage({ type: 'ready' }, '*')
+
+    document.getElementById('run').addEventListener('click', async () => {
+      const output = document.getElementById('output')
+      try {
+        const result = await request({ type: 'invokeTool', toolName: 'summarize_project', input: {} })
+        output.textContent = JSON.stringify(result, null, 2)
+      } catch (error) {
+        output.textContent = `失败：${error.message}`
+      }
+    })
+  </script>
+</body>
+</html>

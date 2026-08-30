@@ -6,9 +6,9 @@ import type {
   MappingMember,
   MappingSearchResult
 } from '../shared/mappings'
+import { fetchTextWithRetry } from './networkRequest'
 
 const SOURCE_ROOT = 'https://mappings.dev'
-const REQUEST_TIMEOUT_MS = 30_000
 
 interface MappingIndex {
   namespaces: string[]
@@ -143,17 +143,14 @@ export class MappingService {
     } catch {
       // A missing or incomplete cache entry is downloaded below.
     }
-    let response: Response
+    let content: string
     try {
-      response = await fetch(url, {
-        headers: { 'User-Agent': `ModMind/${this.productVersion} (mappings)` },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
+      content = await fetchTextWithRetry(url, {
+        headers: { 'User-Agent': `ModMind/${this.productVersion} (mappings)` }
       })
     } catch (error) {
       throw new Error(`无法连接 mappings.dev：${error instanceof Error ? error.message : String(error)}`)
     }
-    if (!response.ok) throw new Error(`mappings.dev 返回 ${response.status}（Minecraft ${version}）`)
-    const content = await response.text()
     await fs.mkdir(path.dirname(target), { recursive: true })
     await fs.writeFile(target, content, 'utf8')
     return { content, cached: false }

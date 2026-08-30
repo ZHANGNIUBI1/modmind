@@ -3,14 +3,69 @@ import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
-import { externalAgentDocsUrl, ModMindBridge, parseExternalAgentOutputLine, runExternalAgent, type ExternalAgentBridgeHandlers } from './externalAgents'
-import type { AiSettings, ProjectInfo } from '../shared/types'
+import { auditExternalAgentCompletion, agentStreamFailureMessage, buildWindowsExternalAgentLaunch, classifyAgentStreamFailure, clearExternalAgentFailureCircuits, decodeExternalProcessOutput, detectExternalAgent, externalAgentAttemptPrompt, externalAgentContextText, externalAgentDocsUrl, externalAgentLabel, externalAgentRetryPrompt, installExternalAgent, isExternalAgentCompletionEvent, isForcefulProcessTerminationCommand, isNativeGradleBuildCommand, isReadOnlyActionDenied, isResumedPromptRejection, managedNativeDownloadAction, MCP_SERVER_SOURCE, ModMindBridge, nativePermissionArgs, parseExternalAgentOutputLine, readExternalAgentHistory, refreshExternalAgentContext, runExternalAgent, type ExternalAgentBridgeHandlers } from './externalAgents'
+import type { ProjectInfo } from '../shared/types'
 
 const temporaryRoots: string[] = []
 const bridges: ModMindBridge[] = []
 const children: ChildProcessWithoutNullStreams[] = []
 
+describe('MC百科 MCP boundary', () => {
+  it('exposes query-only tools and no captcha or download action', () => {
+    expect(MCP_SERVER_SOURCE).toContain("name:'modmind_mcmod_search'")
+    expect(MCP_SERVER_SOURCE).toContain("name:'modmind_mcmod_files'")
+    expect(MCP_SERVER_SOURCE).not.toMatch(/name:'modmind_mcmod_(?:download|captcha|submit)/)
+    expect(MCP_SERVER_SOURCE).not.toMatch(/mcmod_(?:download|captcha|submit):/)
+  })
+})
+
+describe('modpack migration MCP boundary', () => {
+  it('exposes the same scan, apply, history, and undo commands used by the manual workspace', () => {
+    expect(MCP_SERVER_SOURCE).toContain("name:'modmind_modpack_migration_targets'")
+    expect(MCP_SERVER_SOURCE).toContain("name:'modmind_modpack_migration_preview'")
+    expect(MCP_SERVER_SOURCE).toContain("name:'modmind_modpack_migration_apply'")
+    expect(MCP_SERVER_SOURCE).toContain("name:'modmind_modpack_migration_history'")
+    expect(MCP_SERVER_SOURCE).toContain("name:'modmind_modpack_migration_undo'")
+    expect(isReadOnlyActionDenied('modpack_migration_apply')).toBe(true)
+    expect(isReadOnlyActionDenied('modpack_migration_undo')).toBe(true)
+    expect(isReadOnlyActionDenied('modpack_migration_preview')).toBe(false)
+  })
+})
+
+describe('advanced Blockbench MCP boundary', () => {
+  it('exposes editable mesh, reference, visual review, candidate, and history tools', () => {
+    for (const name of [
+      'modmind_asset_compile_advanced', 'modmind_asset_preview_advanced', 'modmind_asset_apply_advanced',
+      'modmind_asset_compile_reference', 'modmind_asset_preview_reference', 'modmind_asset_apply_reference',
+      'modmind_asset_visual_review', 'modmind_blockbench_history', 'modmind_blockbench_checkpoint',
+      'modmind_blockbench_restore_history'
+    ]) expect(MCP_SERVER_SOURCE).toContain(`name:'${name}'`)
+    for (const action of ['add-mesh', 'update-mesh', 'paint-texture', 'auto-unwrap-mesh', 'add-armature', 'set-vertex-weights', 'add-ik-target']) {
+      expect(MCP_SERVER_SOURCE).toContain(`const:'${action}'`)
+    }
+    expect(isReadOnlyActionDenied('asset_apply_advanced')).toBe(true)
+    expect(isReadOnlyActionDenied('asset_apply_reference')).toBe(true)
+    expect(isReadOnlyActionDenied('blockbench_restore_history')).toBe(true)
+  })
+})
+
+describe('platform-specific Agent context', () => {
+  it('keeps NetEase work on the local Python Mod SDK project structure', () => {
+    const context = externalAgentContextText({
+      name: 'NetEase UI', path: 'C:/projects/netease-ui', loader: 'netease-mobile',
+      minecraftVersion: '3.8', namespace: 'netease_ui', createdAt: new Date().toISOString()
+    })
+    expect(context).toContain('behavior_pack/modMain.py')
+    expect(context).toContain('clientSystem.py')
+    expect(context).toContain('serverSystem.py')
+    expect(context).toContain('Never run Gradle')
+    expect(context).toContain('Do not spend the first turn scraping the web')
+    expect(context).toContain('official NetEase developer workbench')
+  })
+})
+
 afterEach(async () => {
+  clearExternalAgentFailureCircuits()
   for (const child of children.splice(0)) child.kill()
   await Promise.all(bridges.splice(0).map((bridge) => bridge.stop()))
   await Promise.all(temporaryRoots.splice(0).map((root) => fs.rm(root, {recursive: true, force: true})))
@@ -19,14 +74,29 @@ afterEach(async () => {
 async function rpc(child: ChildProcessWithoutNullStreams, request: Record<string, unknown>): Promise<Record<string, unknown>> {
   return await new Promise((resolve, reject) => {
     let stderr = ''
-    const onData = (chunk: Buffer): void => {
-      const line = chunk.toString('utf8').trim().split(/\r?\n/).at(-1)
-      if (!line) return
+    // tools/list payloads exceed the 64 KiB pipe chunk size, so responses must
+    // be reassembled across chunks before a full line can be parsed.
+    let buffer = ''
+    const cleanup = (): void => {
       child.stdout.off('data', onData)
+      child.stderr.off('data', onError)
+      child.off('close', onClose)
+    }
+    const onData = (chunk: Buffer): void => {
+      buffer += chunk.toString('utf8')
+      const newline = buffer.indexOf('\n')
+      if (newline === -1) return
+      const line = buffer.slice(0, newline).trim()
+      buffer = buffer.slice(newline + 1)
+      if (!line) return
+      cleanup()
       try { resolve(JSON.parse(line) as Record<string, unknown>) } catch (error) { reject(error) }
     }
     const onError = (chunk: Buffer): void => { stderr += chunk.toString('utf8') }
-    const onClose = (code: number | null): void => reject(new Error(`MCP process exited with ${code}: ${stderr}`))
+    const onClose = (code: number | null): void => {
+      cleanup()
+      reject(new Error(`MCP process exited with ${code}: ${stderr}`))
+    }
     child.stdout.on('data', onData)
     child.stderr.on('data', onError)
     child.once('close', onClose)
@@ -34,10 +104,330 @@ async function rpc(child: ChildProcessWithoutNullStreams, request: Record<string
   })
 }
 
+function stubBridgeHandlers(project: ProjectInfo): ExternalAgentBridgeHandlers {
+  return {
+    projectInfo: {name: project.name},
+    projectFiles: async () => ({files: [], truncated: false}),
+    setIntent: async () => ({}),
+    applyEdits: async () => ({}),
+    updateTodo: async () => ({}),
+    mappingsSearch: async () => ({}),
+    mappingsClass: async () => ({}),
+    dependencySearch: async () => ({}),
+    dependencyInstall: async () => ({}),
+    contentValidate: async () => ({}),
+    testMatrix: async () => ({}),
+    releasePreflight: async () => ({}),
+    build: async () => ({}),
+    testMinecraft: async () => ({}),
+    blockbenchActions: async () => ({}),
+    runtimeState: async () => ({})
+  }
+}
+
+describe('agent stream failure extraction', () => {
+  it('reads the CLI-reported reason from both codex error event shapes', () => {
+    expect(agentStreamFailureMessage({type: 'error', message: 'exceeded retry limit, last status: 429 Too Many Requests'}))
+      .toBe('exceeded retry limit, last status: 429 Too Many Requests')
+    expect(agentStreamFailureMessage({type: 'turn.failed', error: {message: 'exceeded retry limit, last status: 429 Too Many Requests'}}))
+      .toBe('exceeded retry limit, last status: 429 Too Many Requests')
+    expect(agentStreamFailureMessage({type: 'item.completed', item: {type: 'error'}})).toBe('')
+    expect(agentStreamFailureMessage(null)).toBe('')
+  })
+
+  it('classifies transient provider failures for retry and request errors as permanent', () => {
+    // 429/5xx are transient and retryable.
+    for (const message of ['last status: 429 Too Many Requests', 'upstream returned 502', 'server error, status_code=500']) {
+      const result = classifyAgentStreamFailure(message)
+      expect(result.transient).toBe(true)
+      expect(result.reason).toContain('暂时不可用')
+    }
+    // 400-class request failures fail fast with a short actionable reason.
+    const invalid = classifyAgentStreamFailure('请求参数无效，请检查请求格式和参数(request id: 20260827014043304885208268d9d6yoZi5cow)')
+    expect(invalid.transient).toBe(false)
+    expect(invalid.reason).toContain('不是你的需求内容错误')
+    const badRequest = classifyAgentStreamFailure('returned 400 Bad Request')
+    expect(badRequest.transient).toBe(false)
+    expect(badRequest.status).toBe(400)
+    expect(classifyAgentStreamFailure('401 Unauthorized').reason).toContain('更新 API Key')
+    expect(classifyAgentStreamFailure('402 Payment Required').reason).toContain('额度不足')
+    expect(classifyAgentStreamFailure('404 Not Found').reason).toContain('重新扫描模型')
+    // Dropped connections retry; digits inside request ids never look like statuses.
+    expect(classifyAgentStreamFailure('stream disconnected before completion').transient).toBe(true)
+    const idNoise = classifyAgentStreamFailure('超时 (request id: 20260827014043304885208268d9d6yoZi5cow)')
+    expect(idNoise.status).toBeNull()
+    expect(idNoise.transient).toBe(false)
+  })
+
+  it('retries transient provider failures with rendered progress and gives up after the cap', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-transient-retry-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {name: 'Transient Retry', path: root, loader: 'fabric', minecraftVersion: '1.21.1', namespace: 'transient_retry', createdAt: new Date().toISOString()}
+    const runner = path.join(root, 'fake-agent.mjs')
+    await fs.writeFile(runner, [
+      "console.log(JSON.stringify({type:'thread.started', thread_id:'transient-thread'}));",
+      "console.log(JSON.stringify({type:'error', message:'exceeded retry limit, last status: 429 Too Many Requests'}));",
+      "process.exit(1);"
+    ].join('\n'), 'utf8')
+    const executable = process.platform === 'win32' ? path.join(root, 'fake-agent.cmd') : path.join(root, 'fake-agent.sh')
+    await fs.writeFile(executable, process.platform === 'win32'
+      ? `@echo off\r\nnode "%~dp0fake-agent.mjs" %*\r\n`
+      : `#!/bin/sh\nnode "$(dirname "$0")/fake-agent.mjs" "$@"\n`, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(executable, 0o755)
+    const outputs: Array<{kind: string; content: string}> = []
+    const progresses: Array<{title: string}> = []
+    const audits: Array<{outcome: string}> = []
+    await expect(runExternalAgent({
+      kind: 'codex', executable, project, prompt: '原始任务', maxAttempts: 2,
+      signal: new AbortController().signal,
+      onOutput: (kind, content) => outputs.push({kind, content}),
+      onProgress: (title) => progresses.push({title}),
+      onAttemptAudit: (audit) => audits.push({outcome: audit.outcome}),
+      bridge: stubBridgeHandlers(project)
+    })).rejects.toThrow('已停止重试')
+    // Two stream-error events collapse into one short UI message per attempt.
+    expect(outputs.filter((entry) => entry.kind === 'error')).toHaveLength(2)
+    expect(outputs.every((entry) => entry.content.length < 120 && !entry.content.includes('request id'))).toBe(true)
+    // The retry is rendered on screen, not silent.
+    expect(progresses.some((entry) => entry.title.includes('自动重试'))).toBe(true)
+    expect(outputs.some((entry) => entry.kind === 'retry' && entry.content.includes('重试'))).toBe(true)
+    // Only attempts that will actually run again are recorded as retries.
+    expect(audits.filter((audit) => audit.outcome === 'retry')).toHaveLength(1)
+    expect(audits[audits.length - 1]?.outcome).toBe('failure')
+  }, 30_000)
+
+  it('opens a short circuit after a provider retry batch is exhausted', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-provider-circuit-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {name: 'Circuit', path: root, loader: 'fabric', minecraftVersion: '1.21.1', namespace: 'circuit', createdAt: new Date().toISOString()}
+    const runner = path.join(root, 'fake-agent.mjs')
+    await fs.writeFile(runner, "console.log(JSON.stringify({type:'error',message:'last status: 429 Too Many Requests'}));process.exit(1)", 'utf8')
+    const executable = process.platform === 'win32' ? path.join(root, 'fake-agent.cmd') : path.join(root, 'fake-agent.sh')
+    await fs.writeFile(executable, process.platform === 'win32' ? `@echo off\r\nnode "%~dp0fake-agent.mjs" %*\r\n` : `#!/bin/sh\nnode "$(dirname "$0")/fake-agent.mjs" "$@"\n`, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(executable, 0o755)
+    const options = {
+      kind: 'codex' as const, executable, project, prompt: 'task', maxAttempts: 1, retryScope: 'provider:model',
+      signal: new AbortController().signal, onOutput: () => undefined, onProgress: () => undefined,
+      bridge: stubBridgeHandlers(project)
+    }
+    await expect(runExternalAgent(options)).rejects.toThrow('连续 1 次')
+    await expect(runExternalAgent(options)).rejects.toThrow('线路仍在冷却')
+  }, 30_000)
+
+  it('fails fast on invalid-request (400-class) provider errors without retrying', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-invalid-request-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {name: 'Invalid Request', path: root, loader: 'fabric', minecraftVersion: '1.21.1', namespace: 'invalid_request', createdAt: new Date().toISOString()}
+    const runner = path.join(root, 'fake-agent.mjs')
+    const attempts = path.join(root, 'attempts.jsonl')
+    await fs.writeFile(runner, [
+      "import fs from 'node:fs';",
+      `const attempts = ${JSON.stringify(attempts)};`,
+      "fs.appendFileSync(attempts, 'run\\n');",
+      "console.log(JSON.stringify({type:'error', message:'请求参数无效，请检查请求格式和参数(request id: 20260827014043304885208268d9d6yoZi5cow)'}));",
+      "console.log(JSON.stringify({type:'turn.failed', error:{message:'请求参数无效，请检查请求格式和参数(request id: 20260827014043304885208268d9d6yoZi5cow)'}}));",
+      "process.exit(1);"
+    ].join('\n'), 'utf8')
+    const executable = process.platform === 'win32' ? path.join(root, 'fake-agent.cmd') : path.join(root, 'fake-agent.sh')
+    await fs.writeFile(executable, process.platform === 'win32'
+      ? `@echo off\r\nnode "%~dp0fake-agent.mjs" %*\r\n`
+      : `#!/bin/sh\nnode "$(dirname "$0")/fake-agent.mjs" "$@"\n`, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(executable, 0o755)
+    const outputs: Array<{kind: string; content: string}> = []
+    const audits: Array<{outcome: string}> = []
+    await expect(runExternalAgent({
+      kind: 'codex', executable, project, prompt: '原始任务',
+      signal: new AbortController().signal,
+      onOutput: (kind, content) => outputs.push({kind, content}),
+      onProgress: () => undefined,
+      onAttemptAudit: (audit) => audits.push({outcome: audit.outcome}),
+      bridge: stubBridgeHandlers(project)
+    })).rejects.toThrow('不是你的需求内容错误')
+    // Exactly one CLI run — no retries — and raw JSON never reaches the UI.
+    expect((await fs.readFile(attempts, 'utf8')).trim().split(/\r?\n/)).toHaveLength(1)
+    const errorOutputs = outputs.filter((entry) => entry.kind === 'error')
+    expect(errorOutputs).toHaveLength(1)
+    expect(errorOutputs[0]?.content).toContain('不是你的需求内容错误')
+    expect(outputs.some((entry) => entry.content.includes('invalid_request_error'))).toBe(false)
+    expect(audits.some((audit) => audit.outcome === 'failure')).toBe(true)
+    expect(audits.every((audit) => audit.outcome !== 'retry')).toBe(true)
+  }, 30_000)
+
+  it('does not invent a successful answer when the provider completes without text', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-empty-response-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {name: 'Empty Response', path: root, loader: 'fabric', minecraftVersion: '1.21.1', namespace: 'empty_response', createdAt: new Date().toISOString()}
+    const runner = path.join(root, 'fake-agent.mjs')
+    await fs.writeFile(runner, "console.log(JSON.stringify({type:'turn.completed'}));process.exit(0)", 'utf8')
+    const executable = process.platform === 'win32' ? path.join(root, 'fake-agent.cmd') : path.join(root, 'fake-agent.sh')
+    await fs.writeFile(executable, process.platform === 'win32'
+      ? `@echo off\r\nnode "%~dp0fake-agent.mjs" %*\r\n`
+      : `#!/bin/sh\nnode "$(dirname "$0")/fake-agent.mjs" "$@"\n`, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(executable, 0o755)
+    await expect(runExternalAgent({
+      kind: 'codex', executable, project, prompt: '请回答', maxAttempts: 1,
+      signal: new AbortController().signal,
+      onOutput: () => undefined,
+      onProgress: () => undefined,
+      bridge: stubBridgeHandlers(project)
+    })).rejects.toMatchObject({name: 'ExternalAgentEmptyResponseError', message: expect.stringContaining('没有返回可显示的回答')})
+  }, 30_000)
+})
+
 describe('ModMind external agent MCP bridge', () => {
+  it('keeps retry prompts to the single continuation instruction', () => {
+    expect(externalAgentRetryPrompt()).toBe('继续')
+    expect(externalAgentAttemptPrompt({prompt: '原始任务', fallbackPrompt: '备用任务'}, 1)).toEqual({prompt: '继续', retryOnly: true})
+    expect(externalAgentAttemptPrompt({prompt: '原始任务', fallbackPrompt: '备用任务'}, 1, false)).toEqual({prompt: '备用任务'})
+    expect(externalAgentAttemptPrompt({prompt: '原始任务', fallbackPrompt: '备用任务'}, 0)).toEqual({prompt: '备用任务'})
+  })
+
+  it('treats Claude API error messages and failed results as errors', () => {
+    expect(parseExternalAgentOutputLine(JSON.stringify({
+      type: 'assistant', is_error: true, message: {role: 'assistant', content: [{type: 'text', text: 'Failed to authenticate'}]}
+    }), 'stdout')).toMatchObject({kind: 'error', agentMessage: false})
+    expect(parseExternalAgentOutputLine(JSON.stringify({
+      type: 'result', subtype: 'success', is_error: true, result: 'API Error: 403'
+    }), 'stdout')).toMatchObject({kind: 'error', content: 'API Error: 403', agentMessage: false})
+  })
+
+  it('recognizes Codex terminal events without requiring a tool call', () => {
+    expect(isExternalAgentCompletionEvent({ type: 'turn.completed' })).toBe(true)
+    expect(isExternalAgentCompletionEvent({ type: 'event_msg', payload: { type: 'task_complete' } })).toBe(true)
+    expect(isExternalAgentCompletionEvent({ type: 'item.completed' })).toBe(false)
+  })
+
+  it('detects backend rejections of a resumed conversation', () => {
+    expect(isResumedPromptRejection({error: {code: 'invalid_prompt', message: 'Invalid Responses API request'}})).toBe(true)
+    expect(isResumedPromptRejection({error: {message: 'Invalid Responses API request'}})).toBe(true)
+    expect(isResumedPromptRejection({
+      type: 'item.completed',
+      item: {id: 'item_0', type: 'error', message: 'stream error: Invalid Responses API request; retries exhausted'}
+    })).toBe(true)
+    // A generic 400 is not enough evidence that the persisted session is bad.
+    expect(isResumedPromptRejection({error: {code: 'invalid_request_error', message: '会话历史包含无法识别的条目'}})).toBe(true)
+    expect(isResumedPromptRejection({type: 'error', message: '请求参数无效，请检查请求格式和参数'})).toBe(false)
+    expect(isResumedPromptRejection({error: {code: 'rate_limited', message: 'slow down'}})).toBe(false)
+    expect(isResumedPromptRejection({type: 'item.completed', item: {type: 'agent_message', text: 'hi'}})).toBe(false)
+    expect(isResumedPromptRejection(null)).toBe(false)
+  })
+
+  it('audits terminal evidence before allowing a retry', () => {
+    expect(auditExternalAgentCompletion({rawExitCode: 1, terminalEventSeen: true, noOutputTimedOut: true})).toMatchObject({complete: true, reason: 'terminal-event'})
+    expect(auditExternalAgentCompletion({rawExitCode: 0, terminalEventSeen: false, noOutputTimedOut: false})).toMatchObject({complete: true, reason: 'clean-exit'})
+    expect(auditExternalAgentCompletion({rawExitCode: 1, terminalEventSeen: false, noOutputTimedOut: true})).toMatchObject({complete: false, reason: 'no-output-timeout'})
+    expect(auditExternalAgentCompletion({rawExitCode: 1, terminalEventSeen: false, noOutputTimedOut: false})).toMatchObject({complete: false, reason: 'process-error'})
+  })
+
+  it('uses each CLI\'s trusted local-agent mode', () => {
+    expect(nativePermissionArgs('codex')).toEqual(['--dangerously-bypass-approvals-and-sandbox'])
+    expect(nativePermissionArgs('claude')).toEqual(['--dangerously-skip-permissions'])
+    expect(nativePermissionArgs('codex', true)).toEqual(['-s', 'read-only'])
+    expect(nativePermissionArgs('claude', true)).toEqual(['--permission-mode', 'plan', '--tools', 'Read', 'Glob', 'Grep'])
+    expect(isReadOnlyActionDenied('apply_edits')).toBe(true)
+    expect(isReadOnlyActionDenied('maven_dependency_install')).toBe(true)
+    expect(isReadOnlyActionDenied('modpack_download_content')).toBe(true)
+    expect(isReadOnlyActionDenied('asset_apply_refinement')).toBe(true)
+    expect(isReadOnlyActionDenied('mapping_search')).toBe(false)
+  })
+
+  it('allows read-only network probes but identifies covered downloads', () => {
+    const project: ProjectInfo = {name: 'Probe', path: 'C:\\Probe', loader: 'fabric', minecraftVersion: '1.21.1', namespace: 'probe', createdAt: new Date().toISOString()}
+    const url = 'https://repo1.maven.org/maven2/example/library/1.0/library-1.0.jar'
+    expect(managedNativeDownloadAction(project, `Invoke-WebRequest -Uri '${url}' -Method Head`)).toBeUndefined()
+    expect(managedNativeDownloadAction(project, `Invoke-WebRequest -Uri '${url}' -OutFile library.jar`)).toBe('maven_dependency_install')
+  })
+
+  it('identifies native Gradle builds while allowing file inspection and status commands', () => {
+    expect(isNativeGradleBuildCommand('.\\gradlew.bat build --no-daemon')).toBe(true)
+    expect(isNativeGradleBuildCommand('.\\gradlew runClient')).toBe(true)
+    expect(isNativeGradleBuildCommand('Get-Content build.gradle')).toBe(false)
+    expect(isNativeGradleBuildCommand('.\\gradlew.bat --status')).toBe(false)
+  })
+
+  it('blocks forceful process termination commands from managed agents', () => {
+    expect(isForcefulProcessTerminationCommand('Get-Process java | Stop-Process -Force')).toBe(true)
+    expect(isForcefulProcessTerminationCommand('taskkill.exe /pid 123 /t /f')).toBe(true)
+    expect(isForcefulProcessTerminationCommand("Remove-Item 'C:\\Users\\me\\.gradle\\daemon\\9.5.1\\registry.bin' -Force")).toBe(true)
+    expect(isForcefulProcessTerminationCommand('Get-Process java')).toBe(false)
+  })
+
+  it('decodes Windows command errors emitted in the active GBK code page', () => {
+    const gbk = Buffer.from('276e706d2e636d642720b2bbcac7c4dab2bfbbf2cde2b2bfc3fcc1eea3acd2b2b2bbcac7bfc9d4cbd0d0b5c4b3ccd0f2', 'hex')
+    expect(decodeExternalProcessOutput(gbk, 'win32')).toBe("'npm.cmd' 不是内部或外部命令，也不是可运行的程序")
+    expect(decodeExternalProcessOutput(Buffer.from('安装完成', 'utf8'), 'win32')).toBe('安装完成')
+  })
+
+  it('creates a visible Windows terminal for manually launched agents', () => {
+    const launch = buildWindowsExternalAgentLaunch('codex', 'C:\\Projects\\Demo', 'C:\\Users\\me\\AppData\\Roaming\\npm\\codex.cmd', 'Read the context')
+    expect(launch.args.slice(0, 4)).toEqual(['/d', '/c', 'start', '""'])
+    expect(launch.args).toContain('powershell.exe')
+    expect(launch.args).toContain('-NoExit')
+    expect(launch.args).toContain('-EncodedCommand')
+    const encoded = launch.args.at(-1) ?? ''
+    expect(Buffer.from(encoded, 'base64').toString('utf16le')).toContain("Set-Location -LiteralPath 'C:\\Projects\\Demo'")
+  })
+
+  it('keeps uninstalled agents as explicit, non-ready entries', async () => {
+    const status = await detectExternalAgent('claude')
+    expect(status.kind).toBe('claude')
+    expect(status.label).toBe('Claude Code')
+    expect(typeof status.installed).toBe('boolean')
+  })
+
+  it('detects only the explicitly supplied managed Codex executable when requested', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-managed-codex-detect-'))
+    temporaryRoots.push(root)
+    const executable = process.platform === 'win32' ? path.join(root, 'codex.cmd') : path.join(root, 'codex')
+    await fs.writeFile(executable, process.platform === 'win32'
+      ? '@echo off\r\necho codex-cli 0.146.0\r\n'
+      : '#!/bin/sh\necho codex-cli 0.146.0\n', 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(executable, 0o755)
+
+    await expect(detectExternalAgent('codex', {executables: [executable], includeDefaults: false})).resolves.toMatchObject({
+      installed: true,
+      executable,
+      version: 'codex-cli 0.146.0'
+    })
+  })
+
+  it('does not install Codex latest through the generic package-manager path', async () => {
+    await expect(installExternalAgent('codex')).rejects.toThrow('固定版本托管运行时')
+  })
+
   it('opens Bilibili installation tutorials', () => {
     expect(externalAgentDocsUrl('codex')).toMatch(/^https:\/\/search\.bilibili\.com\//)
     expect(externalAgentDocsUrl('claude')).toMatch(/^https:\/\/search\.bilibili\.com\//)
+  })
+
+  it('refreshes a moved project context before manual agent launch', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-context-move-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {
+      name: 'Moved Project', path: root, loader: 'fabric', minecraftVersion: '1.21.1',
+      namespace: 'moved_project', createdAt: new Date().toISOString()
+    }
+    const context = path.join(root, '.modmind', 'external-agents', 'agent-context.md')
+    await fs.mkdir(path.dirname(context), {recursive: true})
+    await fs.writeFile(context, 'Project path: E:\\AAAMOD\\villagerwheretogo\n', 'utf8')
+    await refreshExternalAgentContext(project)
+    const content = await fs.readFile(context, 'utf8')
+    expect(content).toContain(`Project path: ${root}`)
+    expect(content).not.toContain('E:\\AAAMOD\\villagerwheretogo')
+  })
+
+  it('does not resume legacy external sessions without a project path', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-session-move-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {
+      name: 'Moved Session', path: root, loader: 'fabric', minecraftVersion: '1.21.1',
+      namespace: 'moved_session', createdAt: new Date().toISOString()
+    }
+    const sessions = path.join(root, '.modmind', 'external-agents')
+    await fs.mkdir(sessions, {recursive: true})
+    await fs.writeFile(path.join(sessions, 'session-codex.json'), JSON.stringify({kind: 'codex', sessionId: 'old-session', updatedAt: new Date().toISOString()}), 'utf8')
+    await expect(readExternalAgentHistory(project, 'codex')).resolves.toBe('')
+    await expect(fs.stat(path.join(sessions, 'session-codex.json'))).rejects.toThrow()
   })
 
   it('does not classify ordinary stderr output as an error', () => {
@@ -49,26 +439,126 @@ describe('ModMind external agent MCP bridge', () => {
     })
   })
 
-  it('lists and routes Todo and mappings tools', async () => {
-    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-external-agent-'))
+  it('forwards Codex command execution events to the AI output timeline', () => {
+    const started = parseExternalAgentOutputLine(JSON.stringify({
+      type: 'item.started',
+      item: {type: 'command_execution', command: 'Get-Content -Raw src/main.java', status: 'in_progress'}
+    }), 'stdout')
+    expect(started).toMatchObject({kind: 'tool', agentMessage: false})
+    expect(started?.content).toContain('正在执行命令')
+    expect(started?.content).toContain('Get-Content -Raw src/main.java')
+
+    const completed = parseExternalAgentOutputLine(JSON.stringify({
+      type: 'item.completed',
+      item: {type: 'command_execution', command: 'Get-Content -Raw src/main.java', aggregated_output: 'class Example {}', exit_code: 0, status: 'completed'}
+    }), 'stdout')
+    expect(completed).toMatchObject({kind: 'tool', agentMessage: false})
+    expect(completed?.content).toContain('命令已完成')
+    expect(completed?.content).toContain('class Example {}')
+
+    const failed = parseExternalAgentOutputLine(JSON.stringify({
+      type: 'item.completed',
+      item: {type: 'command_execution', command: 'gradlew.bat build', aggregated_output: 'BUILD FAILED', exit_code: 1, status: 'failed'}
+    }), 'stdout')
+    expect(failed).toMatchObject({kind: 'error', agentMessage: false})
+  })
+
+  it('recognizes the response_item events emitted by the hosted Codex CLI', () => {
+    const commentary = parseExternalAgentOutputLine(JSON.stringify({
+      type: 'response_item',
+      payload: {type: 'message', role: 'assistant', content: [{type: 'output_text', text: '我会先核对现有修改。'}]}
+    }), 'stdout')
+    expect(commentary).toMatchObject({kind: 'response', content: '我会先核对现有修改。', agentMessage: true})
+
+    const call = parseExternalAgentOutputLine(JSON.stringify({
+      type: 'response_item',
+      payload: {type: 'custom_tool_call', name: 'exec', input: 'Get-Content src/main/java/Example.java'}
+    }), 'stdout')
+    expect(call).toMatchObject({kind: 'tool', agentMessage: false})
+    expect(call?.content).toContain('exec')
+
+    const output = parseExternalAgentOutputLine(JSON.stringify({
+      type: 'response_item',
+      payload: {type: 'custom_tool_call_output', output: [{type: 'input_text', text: 'Exit code: 0'}]}
+    }), 'stdout')
+    expect(output).toMatchObject({kind: 'tool', agentMessage: false})
+    expect(output?.content).toContain('Exit code: 0')
+  })
+
+  it('recognizes generic text events and nested Codex agent messages as final replies', () => {
+    expect(parseExternalAgentOutputLine('{"type":"text","part":{"type":"text","text":"完整回答"}}', 'stdout')).toMatchObject({
+      kind: 'response', content: '完整回答', agentMessage: true
+    })
+    expect(parseExternalAgentOutputLine('{"type":"event_msg","payload":{"type":"agent_message","message":"Codex 的完整回答"}}', 'stdout')).toMatchObject({
+      kind: 'response', content: 'Codex 的完整回答', agentMessage: true
+    })
+  })
+
+  it('reports backend readiness only after the Agent process really spawns', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-agent-started-'))
     temporaryRoots.push(root)
     const project: ProjectInfo = {
-      name: 'MCP Smoke Test', path: root, loader: 'fabric', minecraftVersion: '1.21.1',
-      namespace: 'mcp_smoke', createdAt: new Date().toISOString()
+      name: 'Agent Started', path: root, loader: 'fabric', minecraftVersion: '1.21.1',
+      namespace: 'agent_started', createdAt: new Date().toISOString()
     }
-    let mappingQuery = ''
-    let todoCount = 0
-    let classifiedIntent = ''
-    let editPath = ''
+    const script = path.join(root, process.platform === 'win32' ? 'fake-codex.cmd' : 'fake-codex.sh')
+    const lines = [
+      '{"type":"item.completed","item":{"type":"agent_message","text":"ready"}}',
+      '{"type":"turn.completed"}'
+    ]
+    await fs.writeFile(script, process.platform === 'win32'
+      ? `@echo off\r\n${lines.map((line) => `echo ${line}`).join('\r\n')}\r\n`
+      : `#!/bin/sh\n${lines.map((line) => `printf '%s\\n' '${line}'`).join('\n')}\n`, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(script, 0o755)
+
+    let started = 0
+    await runExternalAgent({
+      kind: 'codex', executable: script, project, prompt: 'start handshake',
+      signal: new AbortController().signal,
+      onStarted: () => { started += 1 },
+      onOutput: () => undefined,
+      onProgress: () => undefined,
+      bridge: stubBridgeHandlers(project)
+    })
+    expect(started).toBe(1)
+
+    started = 0
+    await expect(runExternalAgent({
+      kind: 'codex', executable: path.join(root, 'missing-agent.exe'), project, prompt: 'must not start',
+      signal: new AbortController().signal,
+      onStarted: () => { started += 1 },
+      onOutput: () => undefined,
+      onProgress: () => undefined,
+      bridge: stubBridgeHandlers(project)
+    })).rejects.toThrow()
+    expect(started).toBe(0)
+  })
+
+  it('persists a Codex thread id even when thread.started has no text', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-codex-session-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {
+      name: 'Codex Session', path: root, loader: 'fabric', minecraftVersion: '1.21.1',
+      namespace: 'codex_session', createdAt: new Date().toISOString()
+    }
+    const script = path.join(root, process.platform === 'win32' ? 'fake-codex.cmd' : 'fake-codex.sh')
+    const lines = [
+      '{"type":"thread.started","thread_id":"thread-test"}',
+      '{"type":"item.completed","item":{"type":"agent_message","text":"done"}}'
+    ]
+    const content = process.platform === 'win32'
+      ? `@echo off\r\n${lines.map((line) => `echo ${line}`).join('\r\n')}\r\n`
+      : `#!/bin/sh\n${lines.map((line) => `printf '%s\\n' '${line}'`).join('\n')}\n`
+    await fs.writeFile(script, content, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(script, 0o755)
+
     const handlers: ExternalAgentBridgeHandlers = {
       projectInfo: {name: project.name},
-      setIntent: async (intent) => { classifiedIntent = intent; return {intent} },
-      applyEdits: async (edits) => {
-        editPath = String((edits[0] as {path?: unknown} | undefined)?.path ?? '')
-        return {changedFiles: [editPath]}
-      },
-      updateTodo: async (tasks) => { todoCount = tasks.length; return {todoCount} },
-      mappingsSearch: async (query) => { mappingQuery = query; return {query} },
+      projectFiles: async () => ({files: ['README.md'], truncated: false}),
+      setIntent: async () => ({}),
+      applyEdits: async () => ({}),
+      updateTodo: async () => ({}),
+      mappingsSearch: async () => ({}),
       mappingsClass: async () => ({}),
       dependencySearch: async () => ({}),
       dependencyInstall: async () => ({}),
@@ -80,9 +570,447 @@ describe('ModMind external agent MCP bridge', () => {
       blockbenchActions: async () => ({}),
       runtimeState: async () => ({})
     }
-    const bridge = new ModMindBridge(project, handlers)
+
+    const result = await runExternalAgent({
+      kind: 'codex', executable: script, project, prompt: 'session test',
+      signal: new AbortController().signal,
+      onOutput: () => undefined,
+      onProgress: () => undefined,
+      bridge: handlers
+    })
+
+    expect(result.sessionId).toBe('thread-test')
+    await expect(fs.readFile(path.join(root, '.modmind', 'external-agents', 'session-codex.json'), 'utf8'))
+      .resolves.toContain('thread-test')
+  })
+
+  it('treats a Codex completion event as success even when wrapper exit is non-zero', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-codex-terminal-exit-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {
+      name: 'Codex Terminal Exit', path: root, loader: 'fabric', minecraftVersion: '1.21.1',
+      namespace: 'codex_terminal_exit', createdAt: new Date().toISOString()
+    }
+    const script = path.join(root, process.platform === 'win32' ? 'fake-codex.cmd' : 'fake-codex.sh')
+    const lines = [
+      '{"type":"item.completed","item":{"type":"agent_message","text":"完成答复"}}',
+      '{"type":"turn.completed"}'
+    ]
+    const content = process.platform === 'win32'
+      ? `@echo off\r\n${lines.map((line) => `echo ${line}`).join('\r\n')}\r\nexit /b 1\r\n`
+      : `#!/bin/sh\n${lines.map((line) => `printf '%s\\n' '${line}'`).join('\n')}\nexit 1\n`
+    await fs.writeFile(script, content, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(script, 0o755)
+    const handlers: ExternalAgentBridgeHandlers = {
+      projectInfo: {name: project.name},
+      projectFiles: async () => ({files: [], truncated: false}),
+      setIntent: async () => ({}),
+      applyEdits: async () => ({}),
+      updateTodo: async () => ({}),
+      mappingsSearch: async () => ({}),
+      mappingsClass: async () => ({}),
+      dependencySearch: async () => ({}),
+      dependencyInstall: async () => ({}),
+      contentValidate: async () => ({}),
+      testMatrix: async () => ({}),
+      releasePreflight: async () => ({}),
+      build: async () => ({}),
+      testMinecraft: async () => ({}),
+      blockbenchActions: async () => ({}),
+      runtimeState: async () => ({})
+    }
+
+    const result = await runExternalAgent({
+      kind: 'codex', executable: script, project, prompt: 'terminal completion test',
+      signal: new AbortController().signal,
+      onOutput: () => undefined,
+      onProgress: () => undefined,
+      bridge: handlers
+    })
+
+    expect(result.exitCode).toBe(0)
+    expect(result.summary).toContain('完成答复')
+  })
+
+  it('never retries after a terminal completion event, even when the wrapper hangs', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-terminal-cutoff-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {
+      name: 'Terminal Cutoff', path: root, loader: 'fabric', minecraftVersion: '1.21.1',
+      namespace: 'terminal_cutoff', createdAt: new Date().toISOString()
+    }
+    const script = path.join(root, process.platform === 'win32' ? 'fake-codex.cmd' : 'fake-codex.sh')
+    const lines = [
+      '{"type":"thread.started","thread_id":"thread-terminal-cutoff"}',
+      '{"type":"item.completed","item":{"type":"agent_message","text":"final response"}}',
+      '{"type":"turn.completed"}'
+    ]
+    const content = process.platform === 'win32'
+      ? `@echo off\r\n${lines.map((line) => `echo ${line}`).join('\r\n')}\r\nping 127.0.0.1 -n 6 >nul\r\n`
+      : `#!/bin/sh\n${lines.map((line) => `printf '%s\\n' '${line}'`).join('\n')}\nsleep 5\n`
+    await fs.writeFile(script, content, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(script, 0o755)
+    const outputs: Array<{kind: string; content: string}> = []
+    const audits: Array<{outcome: string; reason?: string}> = []
+    const started = Date.now()
+
+    const result = await runExternalAgent({
+      kind: 'codex', executable: script, project, prompt: 'finish and stop',
+      signal: new AbortController().signal, noOutputTimeoutMs: 10_000, maxAttempts: 3,
+      onOutput: (kind, message) => outputs.push({kind, content: message}),
+      onProgress: () => undefined,
+      onAttemptAudit: (audit) => audits.push({outcome: audit.outcome, reason: audit.completion?.reason}),
+      bridge: stubBridgeHandlers(project)
+    })
+
+    expect(Date.now() - started).toBeLessThan(4_000)
+    expect(result.summary).toBe('final response')
+    expect(result.sessionId).toBe('thread-terminal-cutoff')
+    expect(result.completionAudit.reason).toBe('terminal-event')
+    expect(outputs.filter((output) => output.kind === 'retry')).toHaveLength(0)
+    expect(audits).toEqual([{outcome: 'complete', reason: 'terminal-event'}])
+    await expect(fs.readFile(path.join(root, '.modmind', 'external-agents', 'session-codex.json'), 'utf8'))
+      .resolves.toContain('thread-terminal-cutoff')
+  }, 20_000)
+
+  it('forwards a final agent message only once', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-final-output-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {
+      name: 'Final Output', path: root, loader: 'fabric', minecraftVersion: '1.21.1',
+      namespace: 'final_output', createdAt: new Date().toISOString()
+    }
+    const script = path.join(root, process.platform === 'win32' ? 'fake-agent.cmd' : 'fake-agent.sh')
+    const line = '{"type":"text","part":{"type":"text","text":"final response"}}'
+    await fs.writeFile(script, process.platform === 'win32' ? `@echo off\r\necho ${line}\r\n` : `#!/bin/sh\nprintf '%s\\n' '${line}'\n`, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(script, 0o755)
+    const outputs: Array<{ kind: string; content: string }> = []
+    const handlers: ExternalAgentBridgeHandlers = {
+      projectInfo: { name: project.name },
+      setIntent: async () => ({}),
+      applyEdits: async () => ({}),
+      updateTodo: async () => ({}),
+      mappingsSearch: async () => ({}),
+      mappingsClass: async () => ({}),
+      dependencySearch: async () => ({}),
+      dependencyInstall: async () => ({}),
+      contentValidate: async () => ({}),
+      testMatrix: async () => ({}),
+      releasePreflight: async () => ({}),
+      build: async () => ({}),
+      testMinecraft: async () => ({}),
+      blockbenchActions: async () => ({}),
+      runtimeState: async () => ({})
+    }
+
+    const result = await runExternalAgent({
+      kind: 'codex', executable: script, project, prompt: '测试最终输出',
+      signal: new AbortController().signal,
+      onOutput: (kind, content) => outputs.push({ kind, content }),
+      onProgress: () => undefined,
+      bridge: handlers
+    })
+
+    expect(outputs.filter((output) => output.kind === 'response' && output.content === 'final response')).toHaveLength(1)
+    expect(result.summary).toBe('final response')
+  })
+
+  it('stops a silent upstream process without retrying it', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-agent-no-output-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {
+      name: 'No Output Retry', path: root, loader: 'fabric', minecraftVersion: '1.21.1',
+      namespace: 'no_output_retry', createdAt: new Date().toISOString()
+    }
+    const script = path.join(root, process.platform === 'win32' ? 'silent-agent.cmd' : 'silent-agent.sh')
+    const content = process.platform === 'win32'
+      ? '@echo off\r\nping 127.0.0.1 -n 2 >nul\r\n'
+      : '#!/bin/sh\nsleep 1\n'
+    await fs.writeFile(script, content, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(script, 0o755)
+    const outputs: string[] = []
+    const handlers: ExternalAgentBridgeHandlers = {
+      projectInfo: {name: project.name},
+      setIntent: async () => ({}),
+      applyEdits: async () => ({}),
+      updateTodo: async () => ({}),
+      mappingsSearch: async () => ({}),
+      mappingsClass: async () => ({}),
+      dependencySearch: async () => ({}),
+      dependencyInstall: async () => ({}),
+      contentValidate: async () => ({}),
+      testMatrix: async () => ({}),
+      releasePreflight: async () => ({}),
+      build: async () => ({}),
+      testMinecraft: async () => ({}),
+      blockbenchActions: async () => ({}),
+      runtimeState: async () => ({})
+    }
+
+    await expect(runExternalAgent({
+      kind: 'codex', executable: script, project, prompt: 'silent upstream test',
+      signal: new AbortController().signal, noOutputTimeoutMs: 40, maxAttempts: 3,
+      onOutput: (_kind, message) => outputs.push(message),
+      onProgress: () => undefined,
+      bridge: handlers
+    })).rejects.toMatchObject({
+      name: 'ExternalAgentNoOutputTimeoutError',
+      message: expect.stringContaining('上游模型仍未返回任何内容')
+    })
+    expect(outputs.filter((message) => message === '继续')).toHaveLength(0)
+  }, 20_000)
+
+  it.each([
+    {kind: 'codex' as const, sessionEvent: '{"type":"thread.started","thread_id":"native-session-test"}', successEvents: ['{"type":"item.completed","item":{"type":"agent_message","text":"resumed"}}', '{"type":"turn.completed"}']},
+    {kind: 'claude' as const, sessionEvent: '{"type":"system","subtype":"init","session_id":"native-session-test"}', successEvents: ['{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"resumed"}]},"session_id":"native-session-test"}', '{"type":"result","subtype":"success","is_error":false,"result":"resumed","session_id":"native-session-test"}']}
+  ])('does not restart the discovered $kind session after process failure', async ({kind, sessionEvent, successEvents}) => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), `modmind-${kind}-retry-session-`))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {name: 'Retry Session', path: root, loader: 'fabric', minecraftVersion: '1.21.1', namespace: 'retry_session', createdAt: new Date().toISOString()}
+    const runner = path.join(root, 'fake-agent.mjs')
+    const attempts = path.join(root, 'attempts.jsonl')
+    await fs.writeFile(runner, [
+      "import fs from 'node:fs';",
+      `const attempts = ${JSON.stringify(attempts)};`,
+      "const previous = fs.existsSync(attempts) ? fs.readFileSync(attempts, 'utf8').trim().split(/\\r?\\n/).filter(Boolean).length : 0;",
+      "fs.appendFileSync(attempts, JSON.stringify(process.argv.slice(2)) + '\\n');",
+      `if (previous === 0) { console.log(${JSON.stringify(sessionEvent)}); process.exit(1); }`,
+      "if (!process.argv.includes('native-session-test')) process.exit(2);",
+      ...successEvents.map((event) => `console.log(${JSON.stringify(event)});`)
+    ].join('\n'), 'utf8')
+    const executable = process.platform === 'win32' ? path.join(root, 'fake-agent.cmd') : path.join(root, 'fake-agent.sh')
+    await fs.writeFile(executable, process.platform === 'win32'
+      ? `@echo off\r\nnode "%~dp0fake-agent.mjs" %*\r\n`
+      : `#!/bin/sh\nnode "$(dirname "$0")/fake-agent.mjs" "$@"\n`, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(executable, 0o755)
+    await expect(runExternalAgent({
+      kind, executable, project, prompt: 'original request', maxAttempts: 2,
+      signal: new AbortController().signal, onOutput: () => undefined, onProgress: () => undefined,
+      bridge: stubBridgeHandlers(project)
+    })).rejects.toThrow()
+    const calls = (await fs.readFile(attempts, 'utf8')).trim().split(/\r?\n/).map((line) => JSON.parse(line) as string[])
+    expect(calls).toHaveLength(1)
+  })
+
+  it('drops a server-rejected resumed Codex thread and restarts fresh with the original request', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-invalid-resume-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {name: 'Invalid Resume', path: root, loader: 'fabric', minecraftVersion: '1.21.1', namespace: 'invalid_resume', createdAt: new Date().toISOString()}
+    // Seed the persisted session the way a previous run would have.
+    const sessionFile = path.join(root, '.modmind', 'external-agents', 'session-codex.json')
+    await fs.mkdir(path.dirname(sessionFile), {recursive: true})
+    await fs.writeFile(sessionFile, JSON.stringify({kind: 'codex', sessionId: 'broken-thread', projectPath: root, updatedAt: new Date().toISOString()}), 'utf8')
+    // The resume guard only keeps sessions with readable local history, so
+    // provide a rollout file inside an isolated CLI home.
+    const sessionHome = path.join(root, 'codex-home')
+    const rollout = path.join(sessionHome, 'sessions', '2026', '08', '26', 'rollout-2026-08-26T10-00-00-broken-thread.jsonl')
+    await fs.mkdir(path.dirname(rollout), {recursive: true})
+    await fs.writeFile(rollout, `${JSON.stringify({type: 'event_msg', payload: {type: 'user_message', message: '原始任务：实现新方块'}})}\n`, 'utf8')
+    const runner = path.join(root, 'fake-agent.mjs')
+    const attempts = path.join(root, 'attempts.jsonl')
+    await fs.writeFile(runner, [
+      "import fs from 'node:fs';",
+      `const attempts = ${JSON.stringify(attempts)};`,
+      "const args = process.argv.slice(2);",
+      "let stdin = '';",
+      "process.stdin.on('data', (chunk) => { stdin += chunk });",
+      "process.stdin.on('end', () => {",
+      "  fs.appendFileSync(attempts, JSON.stringify([...args, '--PROMPT--', stdin]) + '\\n');",
+      "  if (args.includes('resume')) {",
+      "    console.log(JSON.stringify({type:'thread.started', thread_id:'broken-thread'}));",
+      "    console.log(JSON.stringify({type:'item.completed', item:{id:'item_0', type:'error', message:'stream error: Invalid Responses API request'}}));",
+      "    process.exit(1);",
+      "  }",
+      "  console.log(JSON.stringify({type:'thread.started', thread_id:'fresh-thread'}));",
+      "  console.log(JSON.stringify({type:'item.completed', item:{type:'agent_message', text:'restarted with original request'}}));",
+      "  console.log(JSON.stringify({type:'turn.completed'}));",
+      "});"
+    ].join('\n'), 'utf8')
+    const executable = process.platform === 'win32' ? path.join(root, 'fake-agent.cmd') : path.join(root, 'fake-agent.sh')
+    await fs.writeFile(executable, process.platform === 'win32'
+      ? `@echo off\r\nnode "%~dp0fake-agent.mjs" %*\r\n`
+      : `#!/bin/sh\nnode "$(dirname "$0")/fake-agent.mjs" "$@"\n`, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(executable, 0o755)
+    const outputs: Array<{kind: string; content: string}> = []
+    const audits: Array<{attempt: number; outcome: string}> = []
+
+    const result = await runExternalAgent({
+      kind: 'codex', executable, project,
+      prompt: '继续', fallbackPrompt: '原始任务：实现新方块',
+      resumeSession: true,
+      sessionHome,
+      signal: new AbortController().signal,
+      onOutput: (kind, content) => outputs.push({kind, content}),
+      onProgress: () => undefined,
+      onAttemptAudit: (audit) => audits.push({attempt: audit.attempt, outcome: audit.outcome}),
+      bridge: stubBridgeHandlers(project)
+    })
+
+    expect(result.summary).toBe('restarted with original request')
+    expect(result.sessionId).toBe('fresh-thread')
+    const calls = (await fs.readFile(attempts, 'utf8')).trim().split(/\r?\n/).map((line) => JSON.parse(line) as string[])
+    expect(calls).toHaveLength(2)
+    expect(calls[0]).toContain('resume')
+    expect(calls[1]).not.toContain('resume')
+    // The recovery turn carries the original request, not a bare "continue".
+    expect(calls[1].at(-1)).toContain('原始任务：实现新方块')
+    expect(calls[0].at(-1)).not.toBe('继续')
+    // The broken session file was replaced by the recovered thread's.
+    await expect(fs.readFile(sessionFile, 'utf8')).resolves.toContain('fresh-thread')
+    expect(audits).toEqual([
+      {attempt: 1, outcome: 'retry'},
+      {attempt: 2, outcome: 'complete'}
+    ])
+  })
+
+  it('does not mask unrelated resume failures as session rejections', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-resume-other-error-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {name: 'Resume Other Error', path: root, loader: 'fabric', minecraftVersion: '1.21.1', namespace: 'resume_other_error', createdAt: new Date().toISOString()}
+    const runner = path.join(root, 'fake-agent.mjs')
+    const attempts = path.join(root, 'attempts.jsonl')
+    await fs.writeFile(runner, [
+      "import fs from 'node:fs';",
+      `const attempts = ${JSON.stringify(attempts)};`,
+      "fs.appendFileSync(attempts, JSON.stringify(process.argv.slice(2)) + '\\n');",
+      "console.log(JSON.stringify({type:'thread.started', thread_id:'some-thread'}));",
+      "console.log(JSON.stringify({type:'item.completed', item:{id:'item_0', type:'error', message:'upstream 429 Too Many Requests'}}));",
+      "process.exit(1);"
+    ].join('\n'), 'utf8')
+    const executable = process.platform === 'win32' ? path.join(root, 'fake-agent.cmd') : path.join(root, 'fake-agent.sh')
+    await fs.writeFile(executable, process.platform === 'win32'
+      ? `@echo off\r\nnode "%~dp0fake-agent.mjs" %*\r\n`
+      : `#!/bin/sh\nnode "$(dirname "$0")/fake-agent.mjs" "$@"\n`, 'utf8')
+    if (process.platform !== 'win32') await fs.chmod(executable, 0o755)
+    await expect(runExternalAgent({
+      kind: 'codex', executable, project, prompt: '原始任务', fallbackPrompt: '备用任务',
+      resumeSession: true, sessionId: 'some-session',
+      signal: new AbortController().signal, onOutput: () => undefined, onProgress: () => undefined,
+      bridge: stubBridgeHandlers(project)
+    })).rejects.toThrow('退出码 1')
+    const calls = (await fs.readFile(attempts, 'utf8')).trim().split(/\r?\n/)
+    expect(calls).toHaveLength(1)
+  })
+
+  it('isolates concurrent run bridges and only removes its own directory', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-run-bridge-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {name: 'Run Bridge', path: root, loader: 'fabric', minecraftVersion: '1.21.1', namespace: 'run_bridge', createdAt: new Date().toISOString()}
+    const first = new ModMindBridge(project, stubBridgeHandlers(project), 'test', undefined, false, 'run-a')
+    const second = new ModMindBridge(project, stubBridgeHandlers(project), 'test', undefined, true, 'run-b')
+    bridges.push(first, second)
+    const firstPaths = await first.start()
+    const secondPaths = await second.start()
+    await first.writeMcpConfig(firstPaths.mcpConfigPath)
+    await second.writeMcpConfig(secondPaths.mcpConfigPath)
+    expect(firstPaths.mcpConfigPath).not.toBe(secondPaths.mcpConfigPath)
+    expect(await fs.readFile(path.join(path.dirname(firstPaths.mcpConfigPath), 'bridge.json'), 'utf8')).not.toBe(await fs.readFile(path.join(path.dirname(secondPaths.mcpConfigPath), 'bridge.json'), 'utf8'))
+    await first.stop()
+    await expect(fs.stat(path.join(path.dirname(firstPaths.mcpConfigPath), 'bridge.json'))).rejects.toThrow()
+    await expect(fs.stat(path.join(path.dirname(secondPaths.mcpConfigPath), 'bridge.json'))).resolves.toBeTruthy()
+  })
+
+  it('syncs workflows and routes optional Todo, edit, and mappings tools', async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), 'modmind-external-agent-'))
+    temporaryRoots.push(root)
+    const project: ProjectInfo = {
+      name: 'MCP Smoke Test', path: root, loader: 'fabric', minecraftVersion: '1.21.1',
+      namespace: 'mcp_smoke', createdAt: new Date().toISOString()
+    }
+    let mappingQuery = ''
+    let todoCount = 0
+    let classifiedIntent = ''
+    let editPath = ''
+    let imagePrompt = ''
+    let renamedProject = ''
+    let mavenCoordinate = ''
+    let downloadedContentUrl = ''
+    let addonTarget = ''
+    let compiledIntentName = ''
+    let previewedIntentRevision = ''
+    let appliedIntentRevision = ''
+    let compiledRefinementName = ''
+    let previewedRefinementRevision = ''
+    let appliedRefinementRevision = ''
+    const handlers: ExternalAgentBridgeHandlers = {
+      projectInfo: {name: project.name},
+      renameProject: async (name, namespace) => { renamedProject = `${name}:${namespace}`; return {name, namespace} },
+      projectFiles: async () => ({files: ['README.md'], truncated: false}),
+      setIntent: async (intent) => { classifiedIntent = intent; return {intent} },
+      applyEdits: async (edits) => {
+        editPath = String((edits[0] as {path?: unknown} | undefined)?.path ?? '')
+        return {changedFiles: [editPath]}
+      },
+      updateTodo: async (tasks) => { todoCount = tasks.length; return {todoCount} },
+      mappingsSearch: async (query) => { mappingQuery = query; return {query} },
+      mappingsClass: async () => ({}),
+      dependencySearch: async () => ({}),
+      dependencyInstall: async () => ({}),
+      mavenDependencyInstall: async (input) => { mavenCoordinate = String(input.coordinate ?? ''); return {coordinate: mavenCoordinate} },
+      addonRelationships: async () => ({relationships: []}),
+      addonPrepare: async (input) => { addonTarget = String(Array.isArray(input.required) ? input.required[0] ?? '' : ''); return {target: addonTarget} },
+      addonImport: async () => ({}),
+      addonLinkProject: async () => ({}),
+      modpackDownloadContent: async (input) => { downloadedContentUrl = String(input.url ?? ''); return {url: downloadedContentUrl} },
+      contentValidate: async () => ({}),
+      testMatrix: async () => ({}),
+      releasePreflight: async () => ({}),
+      build: async () => ({}),
+      testMinecraft: async () => ({}),
+      blockbenchActions: async () => ({}),
+      blockbenchProjectState: async () => ({revision: `sha256:${'b'.repeat(64)}`, counts: {cubes: 1}}),
+      blockbenchValidate: async () => ({valid: true, findings: []}),
+      blockbenchCaptureViews: async () => ({
+        revision: `sha256:${'b'.repeat(64)}`,
+        captures: [{view: 'north', width: 128, height: 128, dataUrl: 'data:image/png;base64,AA=='}]
+      }),
+      assetCompileIntent: async (input) => {
+        compiledIntentName = String((input as {metadata?: {name?: unknown}}).metadata?.name ?? '')
+        return {intentHash: 'candidate', actions: []}
+      },
+      assetPreviewIntent: async (input, _capture, expectedRevision) => {
+        compiledIntentName = String((input as {metadata?: {name?: unknown}}).metadata?.name ?? '')
+        previewedIntentRevision = expectedRevision ?? ''
+        return {
+          intentHash: 'preview', revision: `sha256:${'d'.repeat(64)}`,
+          captures: [{view: 'north', width: 128, height: 128, dataUrl: 'data:image/png;base64,AA=='}]
+        }
+      },
+      assetApplyIntent: async (input, expectedRevision) => {
+        compiledIntentName = String((input as {metadata?: {name?: unknown}}).metadata?.name ?? '')
+        appliedIntentRevision = expectedRevision ?? ''
+        return {intentHash: 'applied'}
+      },
+      assetCompileRefinement: async (input) => {
+        compiledRefinementName = String((input as {metadata?: {name?: unknown}}).metadata?.name ?? '')
+        return {intentHash: 'refinement-candidate', actions: []}
+      },
+      assetPreviewRefinement: async (input, _capture, expectedRevision) => {
+        compiledRefinementName = String((input as {metadata?: {name?: unknown}}).metadata?.name ?? '')
+        previewedRefinementRevision = expectedRevision ?? ''
+        return {
+          intentHash: 'refinement-preview', revision: `sha256:${'f'.repeat(64)}`,
+          captures: [{view: 'north', width: 128, height: 128, dataUrl: 'data:image/png;base64,AA=='}]
+        }
+      },
+      assetApplyRefinement: async (input, expectedRevision) => {
+        compiledRefinementName = String((input as {metadata?: {name?: unknown}}).metadata?.name ?? '')
+        appliedRefinementRevision = expectedRevision ?? ''
+        return {intentHash: 'refinement-applied'}
+      },
+      runtimeState: async () => ({}),
+      imageGenerate: async (input) => {
+        imagePrompt = String(input.prompt ?? '')
+        return { assets: [{ path: '.modmind/image-studio/generated/example.png', dataUrl: 'data:image/png;base64,AA==', handoffAvailable: true }] }
+      }
+    }
+    const workflowSource = path.join(root, 'bundled-workflows')
+    await fs.mkdir(path.join(workflowSource, 'sample-workflow'), {recursive: true})
+    await fs.writeFile(path.join(workflowSource, 'sample-workflow', 'SKILL.md'), '# Sample workflow\n')
+    const bridge = new ModMindBridge(project, handlers, 'test', workflowSource)
     bridges.push(bridge)
     const {mcpConfigPath} = await bridge.start()
+    await expect(fs.readFile(path.join(root, '.modmind', 'external-agents', 'skills', 'sample-workflow', 'SKILL.md'), 'utf8')).resolves.toContain('Sample workflow')
     await bridge.writeMcpConfig(mcpConfigPath)
     const config = JSON.parse(await fs.readFile(mcpConfigPath, 'utf8')) as {mcpServers: {modmind: {command: string; args: string[]; env?: Record<string, string>}}}
     const child = spawn(config.mcpServers.modmind.command, config.mcpServers.modmind.args, {
@@ -91,15 +1019,41 @@ describe('ModMind external agent MCP bridge', () => {
     children.push(child)
 
     const listed = await rpc(child, {jsonrpc: '2.0', id: 1, method: 'tools/list'})
-    const tools = (listed.result as {tools: Array<{name: string; annotations?: Record<string, boolean>}>}).tools
+    const tools = (listed.result as {tools: Array<{name: string; annotations?: Record<string, boolean>; inputSchema?: Record<string, unknown>}>}).tools
     const toolNames = tools.map((tool) => tool.name)
     expect(toolNames).toContain('modmind_update_todo')
+    expect(toolNames).toContain('modmind_project_files')
+    expect(toolNames).toContain('modmind_rename_project')
     expect(toolNames).toContain('modmind_set_intent')
     expect(toolNames).toContain('modmind_apply_edits')
     expect(toolNames).toContain('modmind_mapping_search')
     expect(toolNames).toContain('modmind_dependency_search')
     expect(toolNames).toContain('modmind_dependency_install')
+    expect(toolNames).toContain('modmind_maven_dependency_install')
+    expect(toolNames).toContain('modmind_addon_relationships')
+    expect(toolNames).toContain('modmind_addon_prepare')
+    expect(toolNames).toContain('modmind_addon_import')
+    expect(toolNames).toContain('modmind_addon_link_project')
+    expect(toolNames).toContain('modmind_modpack_download_content')
     expect(toolNames).toContain('modmind_validate_content')
+    expect(toolNames).toContain('modmind_image_generate')
+    expect(toolNames).toContain('modmind_blockbench_project_state')
+    expect(toolNames).toContain('modmind_blockbench_validate')
+    expect(toolNames).toContain('modmind_blockbench_capture_views')
+    expect(toolNames).toContain('modmind_asset_compile_intent')
+    expect(toolNames).toContain('modmind_asset_preview_intent')
+    expect(toolNames).toContain('modmind_asset_apply_intent')
+    expect(toolNames).toContain('modmind_asset_compile_refinement')
+    expect(toolNames).toContain('modmind_asset_preview_refinement')
+    expect(toolNames).toContain('modmind_asset_apply_refinement')
+    expect(tools.find((tool) => tool.name === 'modmind_blockbench_actions')?.inputSchema).toMatchObject({
+      additionalProperties: false,
+      properties: {actions: {type: 'array', minItems: 1, maxItems: 500}}
+    })
+    const actionSchema = JSON.stringify(tools.find((tool) => tool.name === 'modmind_blockbench_actions')?.inputSchema)
+    expect(actionSchema).toContain('update-cube')
+    expect(actionSchema).toContain('update-group')
+    expect(actionSchema).not.toContain('set-asset-metadata')
     expect(toolNames).toContain('modmind_test_matrix')
     expect(toolNames).toContain('modmind_release_preflight')
     expect(toolNames).not.toContain('modmind_publish_release')
@@ -114,13 +1068,56 @@ describe('ModMind external agent MCP bridge', () => {
     })
 
     await rpc(child, {jsonrpc: '2.0', id: 2, method: 'tools/call', params: {name: 'modmind_set_intent', arguments: {intent: 'informational', reason: 'Greeting'}}})
+    const projectFiles = await rpc(child, {jsonrpc: '2.0', id: 10, method: 'tools/call', params: {name: 'modmind_project_files', arguments: {}}})
     await rpc(child, {jsonrpc: '2.0', id: 3, method: 'tools/call', params: {name: 'modmind_mapping_search', arguments: {query: 'LivingEntity'}}})
     await rpc(child, {jsonrpc: '2.0', id: 4, method: 'tools/call', params: {name: 'modmind_update_todo', arguments: {tasks: [{id: 'T1', title: 'Inspect', status: 'in_progress'}]}}})
     await rpc(child, {jsonrpc: '2.0', id: 5, method: 'tools/call', params: {name: 'modmind_apply_edits', arguments: {edits: [{path: 'src/main/java/Test.java', newText: 'class Test {}'}]}}})
+    await rpc(child, {jsonrpc: '2.0', id: 6, method: 'tools/call', params: {name: 'modmind_image_generate', arguments: {prompt: 'crystal item texture'}}})
+    await rpc(child, {jsonrpc: '2.0', id: 7, method: 'tools/call', params: {name: 'modmind_rename_project', arguments: {name: 'Renamed Project', namespace: 'renamed_project'}}})
+    await rpc(child, {jsonrpc: '2.0', id: 8, method: 'tools/call', params: {name: 'modmind_maven_dependency_install', arguments: {coordinate: 'org.example:demo:1.0.0'}}})
+    await rpc(child, {jsonrpc: '2.0', id: 9, method: 'tools/call', params: {name: 'modmind_modpack_download_content', arguments: {kind: 'config', url: 'https://example.test/config.zip'}}})
+    await rpc(child, {jsonrpc: '2.0', id: 11, method: 'tools/call', params: {name: 'modmind_addon_prepare', arguments: {required: ['Create']}}})
+    const blockbenchState = await rpc(child, {jsonrpc: '2.0', id: 12, method: 'tools/call', params: {name: 'modmind_blockbench_project_state', arguments: {}}})
+    const blockbenchValidation = await rpc(child, {jsonrpc: '2.0', id: 13, method: 'tools/call', params: {name: 'modmind_blockbench_validate', arguments: {}}})
+    const blockbenchCapture = await rpc(child, {jsonrpc: '2.0', id: 14, method: 'tools/call', params: {name: 'modmind_blockbench_capture_views', arguments: {views: ['north'], width: 128, height: 128}}})
+    const sampleIntent = {version: 1, metadata: {name: 'Intent Test'}, model: {format: 'java_block', parts: [{id: 'body', kind: 'body', size: [8, 8, 8]}]}}
+    await rpc(child, {jsonrpc: '2.0', id: 15, method: 'tools/call', params: {name: 'modmind_asset_compile_intent', arguments: sampleIntent}})
+    const assetPreview = await rpc(child, {jsonrpc: '2.0', id: 17, method: 'tools/call', params: {name: 'modmind_asset_preview_intent', arguments: {intent: sampleIntent, capture: {views: ['north'], width: 128, height: 128}, expectedRevision: `sha256:${'e'.repeat(64)}`}}})
+    await rpc(child, {jsonrpc: '2.0', id: 16, method: 'tools/call', params: {name: 'modmind_asset_apply_intent', arguments: {intent: sampleIntent, expectedRevision: `sha256:${'c'.repeat(64)}`}}})
+    const sampleRefinement = {version: 1, metadata: {name: 'Refinement Test'}, parts: [{id: 'body', size: [7, 8, 8]}]}
+    await rpc(child, {jsonrpc: '2.0', id: 18, method: 'tools/call', params: {name: 'modmind_asset_compile_refinement', arguments: sampleRefinement}})
+    const refinementPreview = await rpc(child, {jsonrpc: '2.0', id: 19, method: 'tools/call', params: {name: 'modmind_asset_preview_refinement', arguments: {refinement: sampleRefinement, capture: {views: ['north'], width: 128, height: 128}, expectedRevision: `sha256:${'1'.repeat(64)}`}}})
+    await rpc(child, {jsonrpc: '2.0', id: 20, method: 'tools/call', params: {name: 'modmind_asset_apply_refinement', arguments: {refinement: sampleRefinement, expectedRevision: `sha256:${'2'.repeat(64)}`}}})
     expect(classifiedIntent).toBe('informational')
+    expect(projectFiles.result).toEqual({content: [{type: 'text', text: JSON.stringify({files: ['README.md'], truncated: false})}]})
     expect(mappingQuery).toBe('LivingEntity')
     expect(todoCount).toBe(1)
     expect(editPath).toBe('src/main/java/Test.java')
+    expect(imagePrompt).toBe('crystal item texture')
+    expect(renamedProject).toBe('Renamed Project:renamed_project')
+    expect(mavenCoordinate).toBe('org.example:demo:1.0.0')
+    expect(downloadedContentUrl).toBe('https://example.test/config.zip')
+    expect(addonTarget).toBe('Create')
+    expect(JSON.parse((blockbenchState.result as {content: Array<{text: string}>}).content[0].text)).toMatchObject({counts: {cubes: 1}})
+    expect(JSON.parse((blockbenchValidation.result as {content: Array<{text: string}>}).content[0].text)).toMatchObject({valid: true})
+    expect((blockbenchCapture.result as {content: Array<{type: string; data?: string}>}).content).toEqual([
+      expect.objectContaining({type: 'text'}),
+      expect.objectContaining({type: 'image', data: 'AA=='})
+    ])
+    expect(compiledIntentName).toBe('Intent Test')
+    expect(previewedIntentRevision).toBe(`sha256:${'e'.repeat(64)}`)
+    expect((assetPreview.result as {content: Array<{type: string; data?: string}>}).content).toEqual([
+      expect.objectContaining({type: 'text'}),
+      expect.objectContaining({type: 'image', data: 'AA=='})
+    ])
+    expect(appliedIntentRevision).toBe(`sha256:${'c'.repeat(64)}`)
+    expect(compiledRefinementName).toBe('Refinement Test')
+    expect(previewedRefinementRevision).toBe(`sha256:${'1'.repeat(64)}`)
+    expect((refinementPreview.result as {content: Array<{type: string; data?: string}>}).content).toEqual([
+      expect.objectContaining({type: 'text'}),
+      expect.objectContaining({type: 'image', data: 'AA=='})
+    ])
+    expect(appliedRefinementRevision).toBe(`sha256:${'2'.repeat(64)}`)
   })
 
   it.runIf(process.env.MODMIND_LIVE_CODEX === '1')('lets Codex call ModMind tools without an approval prompt', async () => {
@@ -151,8 +1148,8 @@ describe('ModMind external agent MCP bridge', () => {
     const executable = process.env.MODMIND_CODEX_PATH
       ?? path.join(process.env.APPDATA ?? path.join(os.homedir(), 'AppData', 'Roaming'), 'npm', 'codex.cmd')
     const result = await runExternalAgent({
-      kind: 'codex', executable, project, settings: {} as AiSettings,
-      prompt: '这是一个信息查询。请声明 informational 意图，然后只回复“审批回归成功”，不要读取文件。',
+      kind: 'codex', executable, project,
+      prompt: '这是一个信息查询。请声明 informational 意图，然后只回复“审批回归成功”，不要读取文件',
       signal: new AbortController().signal,
       onOutput: () => undefined,
       onProgress: () => undefined,

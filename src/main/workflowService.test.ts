@@ -11,7 +11,7 @@ describe('generated mod CI workflow', () => {
 
   it('uses a compatible Gradle release for legacy Forge', () => {
     const result = githubWorkflow({ name: 'Legacy', path: '', loader: 'forge', minecraftVersion: '1.12.2', namespace: 'legacy_mod', createdAt: '', javaVersion: 8 })
-    expect(result).toContain("gradle-version: '4.10.3'")
+    expect(result).toContain("gradle-version: '4.9'")
   })
 
   it('pins Quilt 1.20.1 to its compatible Gradle generation', () => {

@@ -9,8 +9,7 @@ const version = packageJson.version
 const releaseRoot = path.join(root, 'release')
 const allowUnsigned = process.argv.includes('--allow-unsigned')
 const artifacts = [
-  path.join(releaseRoot, `ModMind Setup ${version}.exe`),
-  path.join(releaseRoot, `ModMind ${version}.exe`)
+  path.join(releaseRoot, `ModMind Setup ${version}.exe`)
 ]
 
 async function sha256(file) {

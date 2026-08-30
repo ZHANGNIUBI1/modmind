@@ -1,11 +1,16 @@
-import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useLayoutEffect, useMemo, useReducer, useRef, useState } from 'react'
+import type { ReactNode, SetStateAction } from 'react'
 import { marked } from 'marked'
 import {
   Archive,
+  ArrowRightLeft,
+  Binary,
+  BookOpen,
   Bot,
   Box,
   Check,
   ChevronDown,
+  Puzzle,
   ChevronRight,
   CircleAlert,
   Clock3,
@@ -15,91 +20,310 @@ import {
   Download,
   ExternalLink,
   File,
+  FileCog,
   FileCode2,
   FilePlus2,
   Folder,
   FolderOpen,
   FolderPlus,
+  Gauge,
   Gamepad2,
   Hammer,
   History,
+  Image,
+  Info,
   LoaderCircle,
+  RefreshCw,
   LibraryBig,
+  List,
   Lightbulb,
+  ListChecks,
+  Link2,
   MessageSquareText,
   Minus,
   MoreHorizontal,
   PanelLeft,
   PackageOpen,
+  PackagePlus,
   Pencil,
+  Pin,
+  PinOff,
   Play,
   Plus,
   RotateCcw,
   Save,
   Search,
   Send,
+  Server,
+  ServerCog,
   Settings,
   ShieldCheck,
   Square,
   Sparkles,
+  SlidersHorizontal,
   TerminalSquare,
   Trash2,
   UserRound,
-  X
+  WandSparkles,
+  X,
+  Zap
 } from 'lucide-react'
 import type {
   AiPlan,
+  AiAttachment,
+  AiOutputEvent,
+  CodingBackend,
   AiModelInfo,
   AiRecoveryInfo,
-  AiSettings,
+  AgentSettings,
+  AppUpdateState,
+  AppVersionCheckResult,
   ExternalAgentStatus,
-  BuildTrustRequest,
+  ExternalAgentConfiguration,
+  ExternalAgentKind,
   ExistingProjectAdoptInput,
   ExistingProjectAnalysis,
   FileNode,
+  DetectedJavaHome,
+  JavaPreferences,
   InspirationChatMessage,
+  JavaLoaderKind,
   LoaderKind,
   LoaderVersionOption,
   PipelineEvent,
   PreflightResult,
   ProjectInfo,
+  ProjectKind,
   ProjectMigrationPreview,
-  SnapshotInfo
+  SnapshotInfo,
+  UiMode,
+  BeginnerTaskState,
+  BeginnerAiPreferences,
+  BeginnerReasoningLevel,
+  DeviceConnectionState,
+  RemoteConnectionState,
+  McpBridgeState,
+  DiagnosticPageSnapshot,
+  SidebarViewId,
+  DetachedWindowTarget
 } from '../../shared/types'
 import type { MappingClassDetail, MappingClassResult } from '../../shared/mappings'
+import type { DecompileInspectResult, DecompileProgressEvent } from '../../shared/decompile'
+import type { DecompileTermsPayload } from '../../shared/decompileModuleExport'
+import type { GiteeBuildResult, GiteeBuildSettings, GiteeBuildValidation } from '../../shared/production'
+import type { ImageStudioSettings } from '../../shared/imageStudio'
+import { AI_CONTINUATION_PROMPT, aiPromptFingerprint, isRepeatedAiPrompt } from '../../shared/aiPrompt'
+import { describeAiFailureForUser } from '../../shared/aiFailure'
 import { appendMinecraftRuntimeEvent, type MinecraftRuntimeEvent } from '../../shared/minecraft'
+import { isJavaLoader, platformLabel } from '../../shared/projectPlatform'
 import BlockbenchWorkspace from './components/BlockbenchWorkspace'
+import AiAttachmentPicker, { formatAiAttachmentContext } from './components/AiAttachmentPicker'
 import GitWorkspace from './components/GitWorkspace'
 import MinecraftTestWorkspace from './components/MinecraftTestWorkspace'
+import ModpackToolsWorkspace from './components/ModpackToolsWorkspace'
+import ModpackMigrationWorkspace from './components/ModpackMigrationWorkspace'
+import DecompileWorkspace from './components/DecompileWorkspace'
+import FtbQuestEditor from './components/FtbQuestEditor'
+import PatchouliBookEditor from './components/PatchouliBookEditor'
+import ModpackModListWorkspace from './components/ModpackModListWorkspace'
+import ModpackContentWorkspace from './components/ModpackContentWorkspace'
+import ModpackKeybindWorkspace from './components/ModpackKeybindWorkspace'
+import ThirdPartyModsWorkspace from './components/ThirdPartyModsWorkspace'
+import { useConfirmDialog, usePromptDialog } from './components/InteractionDialogs'
 import ProductionWorkspace from './components/ProductionWorkspace'
+import GlobalDownloadIndicator from './components/GlobalDownloadIndicator'
+import AddonRelationshipsWorkspace from './components/AddonRelationshipsWorkspace'
+import ImageStudioWorkspace from './components/ImageStudioWorkspace'
+import AgentWorkbench from './components/AgentWorkbench'
+import { PluginPanelHost } from './components/PluginPanelHost'
+import { PluginsManager } from './components/PluginsManager'
+import type { PluginSnapshot } from '../../shared/plugins'
+import { appendUserTurn, normalizeStoredWorkbenchTimeline, reduceWorkbenchOutput, reduceWorkbenchProgress, settleWorkbenchActivity, type WorkbenchTimelineItem } from './workbenchTimeline'
+import {
+  createWorkbenchConversation,
+  isLegacyWorkbenchConversation,
+  migrateLegacyConversation,
+  normalizeWorkbenchConversations,
+  removeWorkbenchConversation,
+  touchWorkbenchConversation,
+  titleFromUserText,
+  WORKBENCH_LEGACY_SCOPE,
+  workbenchPromptHistoryStorageKey,
+  workbenchSessionScope,
+  type WorkbenchConversation
+} from './workbenchConversations'
 import appLogo from './assets/logo.png'
 
 const MonacoCodeEditor = lazy(() => import('./components/MonacoCodeEditor'))
 
-type ViewId = 'workspace' | 'inspiration' | 'blockbench' | 'minecraft' | 'mappings' | 'code' | 'build' | 'snapshots' | 'production' | 'settings'
+type ViewId = SidebarViewId
+type SidebarDragItem = { id: ViewId; groupKey: string; label: string }
+type SidebarDragPayload = SidebarDragItem
+
+function KeepAliveRoute({ active, children }: { active: boolean; children: ReactNode }): React.JSX.Element | null {
+  const [activated, setActivated] = useState(active)
+
+  useEffect(() => {
+    if (active) setActivated(true)
+  }, [active])
+
+  if (!active && !activated) return null
+  return <div className="keep-alive-route" hidden={!active}>{children}</div>
+}
+
+function detachedWindowView(): ViewId | null {
+  const params = new URLSearchParams(window.location.search)
+  if (params.get('detached') !== '1') return null
+  const view = params.get('view')
+  return view && /^[a-z0-9-]+$/.test(view) ? view as ViewId : null
+}
+
+function detachedWindowGroup(): string | null {
+  const params = new URLSearchParams(window.location.search)
+  if (params.get('detached') !== '1') return null
+  const group = params.get('group')
+  return group && /^\d{1,3}$/.test(group) ? group : null
+}
+
+function normalizeProjectPath(value: string): string {
+  const normalized = value.trim().replaceAll('\\', '/').replace(/\/+$/, '')
+  return navigator.platform.toLowerCase().includes('win') ? normalized.toLowerCase() : normalized
+}
+
+const initialDetachedView = detachedWindowView()
+const initialDetachedGroup = detachedWindowGroup()
+const isDetachedWindow = initialDetachedView !== null || initialDetachedGroup !== null
+
+function readSidebarDragPayload(dataTransfer: DataTransfer): SidebarDragPayload | null {
+  const raw = dataTransfer.getData('application/x-modmind-sidebar-item')
+  if (!raw) return null
+  try {
+    const parsed = JSON.parse(raw) as Partial<SidebarDragPayload>
+    if (typeof parsed.id !== 'string' || typeof parsed.groupKey !== 'string' || typeof parsed.label !== 'string') return null
+    return { id: parsed.id as ViewId, groupKey: parsed.groupKey, label: parsed.label }
+  } catch {
+    return null
+  }
+}
+
+type InspirationTimelineRow = { id: string; kind: 'tool-group'; items: InspirationChatMessage[] }
+
+function InspirationStepGroup({ items }: { items: InspirationChatMessage[] }): React.JSX.Element {
+  const [expanded, setExpanded] = useState(items.some((item) => item.status === 'streaming'))
+  useEffect(() => { if (items.some((item) => item.status === 'streaming')) setExpanded(true) }, [items])
+  return <section className="agent-tool-group">
+    <button type="button" className="agent-disclosure-header" onClick={() => setExpanded((value) => !value)}>
+      <span className="agent-disclosure-icon">{items.some((item) => item.status === 'streaming') ? <LoaderCircle className="spin" size={12} /> : <ListChecks size={14} />}</span>
+      <span>查看步骤{items.length ? ` · ${items.length}` : ''}</span>
+      <ChevronRight className={expanded ? 'expanded' : ''} size={12} />
+    </button>
+    {expanded ? <div className="agent-tool-group-body">{items.map((item) => (
+      <div className="agent-tool-row" key={item.id || `${item.time || ''}-${item.content}`}>
+        <span className={`agent-tool-dot ${item.status === 'error' || item.status === 'cancelled' ? 'warning' : 'done'}`} />
+        <div><strong>{item.content.split('\n')[0] || '工具调用'}</strong>{item.content.includes('\n') ? <span>{item.content.split('\n').slice(1).join(' ')}</span> : null}</div>
+      </div>
+    ))}</div> : null}
+  </section>
+}
+
 type InspirationConversation = { id: string; title: string; updatedAt: string; messages: InspirationChatMessage[] }
-type AiTimelineItem = {
-  id: string
-  kind: string
-  content: string
-  time: string
-  diff?: Array<{ path: string; added: number; removed: number; additions: string[]; removals: string[] }>
+type AiTimelineItem = WorkbenchTimelineItem
+
+type WorkbenchUiState = {
+  prompt: string
+  attachments: AiAttachment[]
+  plan: AiPlan | null
+  todo: Array<{ id: string; title: string; status: 'pending' | 'in_progress' | 'completed' }>
+  planning: boolean
+  processingStartedAt?: string
+  taskState: BeginnerTaskState
+  timeline: AiTimelineItem[]
+  outputStatus: 'idle' | 'running' | 'success' | 'error'
+  recovery: AiRecoveryInfo | null
 }
 
-function aiTimelineOutput(items: AiTimelineItem[]): string {
-  const labels: Record<string, string> = { history: '已恢复上下文', start: '任务开始', retry: '重试', tool: '工具结果', warning: '警告', error: '错误', diff: '代码修改', status: '状态' }
-  return items.map((item) => `${labels[item.kind] ? `[${labels[item.kind]}]\n` : ''}${item.content}`).join('\n\n')
+type WorkbenchUiAction = { key: keyof WorkbenchUiState; value: unknown }
+
+const initialWorkbenchUiState: WorkbenchUiState = {
+  prompt: '',
+  attachments: [],
+  plan: null,
+  todo: [],
+  planning: false,
+  processingStartedAt: undefined,
+  taskState: 'idle',
+  timeline: [],
+  outputStatus: 'idle',
+  recovery: null
 }
 
-function timelineLabel(kind: string): string {
-  return { history: '已恢复上下文', start: '任务开始', retry: '重试', tool: '工具结果', warning: '警告', error: '错误', diff: '代码修改' }[kind] ?? ''
+function workbenchUiReducer(state: WorkbenchUiState, action: WorkbenchUiAction): WorkbenchUiState {
+  const current: unknown = state[action.key]
+  const value = typeof action.value === 'function'
+    ? (action.value as (current: unknown) => unknown)(current)
+    : action.value
+  return { ...state, [action.key]: value }
+}
+
+type ProjectWorkbenchState = {
+  prompt: string
+  attachments: AiAttachment[]
+  events: PipelineEvent[]
+  aiPlan: AiPlan | null
+  aiTodo: Array<{ id: string; title: string; status: 'pending' | 'in_progress' | 'completed' }>
+  planning: boolean
+  processingStartedAt?: string
+  runningBackend?: CodingBackend
+  switchingBackend?: CodingBackend | null
+  workspaceSession: string
+  conversations: WorkbenchConversation[]
+  activeConversationId: string
+  aiTimeline: AiTimelineItem[]
+  aiOutputStatus: 'idle' | 'running' | 'success' | 'error'
+  aiRecovery: AiRecoveryInfo | null
+  beginnerTaskState: BeginnerTaskState
+  files: FileNode[]
+  selectedFile: string
+  editorContent: string
+  editorDirty: boolean
+  buildResult: PreflightResult | null
+  buildError: string
+  building: boolean
+  snapshots: SnapshotInfo[]
+  exportArtifactAvailable: boolean
+  minecraftEvents: MinecraftRuntimeEvent[]
+}
+
+type PendingBackendSwitch = {
+  generation: number
+  backend: CodingBackend
+  previousBackend: CodingBackend
+  accepted: boolean
+}
+
+type WorkbenchPersistenceState = 'loading' | 'ready' | 'saving' | 'saved' | 'degraded' | 'error'
+
+function emptyProjectWorkbenchState(): ProjectWorkbenchState {
+  return {
+    prompt: '', attachments: [], events: [], aiPlan: null, aiTodo: [], planning: false, processingStartedAt: undefined,
+    workspaceSession: '', conversations: [], activeConversationId: '', aiTimeline: [], aiOutputStatus: 'idle', runningBackend: undefined, switchingBackend: null,
+    aiRecovery: null, beginnerTaskState: 'idle', files: [], selectedFile: '', editorContent: '', editorDirty: false,
+    buildResult: null, buildError: '', building: false, snapshots: [], exportArtifactAvailable: false, minecraftEvents: []
+  }
 }
 
 function normalizeStoredTimelineItem(item: AiTimelineItem): AiTimelineItem {
-  if (item.kind !== 'error') return item
-  if (/(?:warning|warn|deprecated|deprecation|警告|重试|重新连接)/i.test(item.content)) return {...item, kind: 'warning'}
-  if (/(?:error|fatal|exception|failed|forbidden|unauthorized|timed out|timeout|错误|失败|异常|无法|超时|退出码|拒绝)/i.test(item.content)) return item
-  return {...item, kind: 'tool'}
+  return normalizeStoredWorkbenchTimeline(item)
+}
+
+/** Shared parsing for persisted workbench timelines (legacy and per-conversation files). */
+export function parseStoredWorkbenchTimeline(value: unknown): AiTimelineItem[] {
+  if (!Array.isArray(value)) return []
+  let history = value
+  .filter((item): item is AiTimelineItem => Boolean(item && typeof item === 'object' && typeof (item as AiTimelineItem).id === 'string' && typeof (item as AiTimelineItem).content === 'string' && typeof (item as AiTimelineItem).kind === 'string' && typeof (item as AiTimelineItem).time === 'string'))
+  .map(normalizeStoredTimelineItem)
+  history = history.filter((item) => item.kind !== 'history' || item.content.length <= 200)
+  return settleWorkbenchActivity(history)
 }
 
 marked.setOptions({ gfm: true, breaks: true })
@@ -120,24 +344,151 @@ function MarkdownMessage({ content }: { content: string }): React.JSX.Element {
 
 const MAX_AUTO_REPAIR_ROUNDS = 3
 
-const initialSettings: AiSettings = {
-  provider: 'openai-compatible',
-  codingBackend: 'internal',
-  baseUrl: 'https://api.openai.com/v1',
-  model: '',
-  apiKey: '',
-  parallelism: 2,
-  agentMaxSteps: 0,
-  maxBuilds: 0,
+const initialSettings: AgentSettings = {
+  codingBackend: 'codex',
   allowBuildScriptChanges: true,
   preferLocalGradle: false,
   gradleExecutable: '',
   gradleDownloadSource: 'auto',
-  darkMode: false
+  networkProxyUrl: '',
+  javaPreferences: { game: '', build: '', tools: '' },
+  darkMode: false,
+  closeBehavior: 'ask',
+  notificationsEnabled: true
+}
+
+type JavaProbeDisplayState = { status: 'idle' | 'checking' | 'valid' | 'invalid'; major: number }
+
+function JavaHomePreferenceRow({ label, description, value, homes, scanning, onChange }: {
+  label: string
+  description: string
+  value: string
+  homes: DetectedJavaHome[]
+  scanning: boolean
+  onChange: (value: string) => void
+}) {
+  const [probe, setProbe] = useState<JavaProbeDisplayState>({ status: 'idle', major: 0 })
+
+  useEffect(() => {
+    const home = value.trim()
+    if (!home) {
+      setProbe({ status: 'idle', major: 0 })
+      return
+    }
+    setProbe({ status: 'checking', major: 0 })
+    let cancelled = false
+    const timer = setTimeout(() => {
+      window.modmind.settings.probeJavaHome(home)
+        .then((result) => { if (!cancelled) setProbe({ status: result.valid ? 'valid' : 'invalid', major: result.major }) })
+        .catch(() => { if (!cancelled) setProbe({ status: 'invalid', major: 0 }) })
+    }, 400)
+    return () => { cancelled = true; clearTimeout(timer) }
+  }, [value])
+
+  const normalizedValue = value.trim()
+  const knownHomes = homes.filter((home) => home.home !== normalizedValue)
+  const customNotListed = Boolean(normalizedValue) && !homes.some((home) => home.home === normalizedValue)
+  const statusText = probe.status === 'idle'
+    ? `当前使用：${normalizedValue ? '此路径' : 'ModMind 自动配置（托管运行时）'}`
+    : probe.status === 'checking'
+      ? '正在检测该 Java 是否可用…'
+      : probe.status === 'valid'
+        ? `可用：检测到 Java ${probe.major}`
+        : '无法运行该 Java 或版本不合规；运行时会自动回退到托管运行时'
+
+  return (
+    <div className="settings-java-row">
+      <div className="appearance-row"><div><strong>{label}</strong><p>{description}</p></div><span className={`status-dot ${probe.status === 'invalid' ? 'warning' : 'success'}`} /></div>
+      <label className="field-label">自动检测
+        <select
+          value={knownHomes.some((home) => home.home === normalizedValue) ? normalizedValue : ''}
+          onChange={(event) => onChange(event.target.value)}
+          disabled={scanning}
+        >
+          <option value="">自动（推荐）</option>
+          {knownHomes.map((home) => <option key={home.home} value={home.home}>Java {home.major} · {home.home}</option>)}
+          {customNotListed ? <option value={normalizedValue}>{`自定义路径 · ${normalizedValue}`}</option> : null}
+        </select>
+      </label>
+      <label className="field-label">Java 目录（留空则自动配置）
+        <input value={value} onChange={(event) => onChange(event.target.value)} placeholder="例如 C:\Program Files\Eclipse Adoptium\jdk-21" />
+      </label>
+      <div className="settings-actions">
+        <span><Info size={14} />{statusText}</span>
+        <button className="secondary-button compact" type="button" onClick={() => void window.modmind.settings.pickJavaHome().then((picked) => { if (picked) onChange(picked) })}>
+          浏览…
+        </button>
+      </div>
+    </div>
+  )
 }
 
 function formatTime(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(new Date(value))
+}
+
+function formatBalanceCents(value?: string): string {
+  if (!value || !/^\d+$/.test(value)) return '—'
+  const cents = BigInt(value)
+  return `¥${cents / 100n}.${String(cents % 100n).padStart(2, '0')}`
+}
+
+const EXTERNAL_AGENT_OPTIONS: Array<{kind: ExternalAgentKind; label: string; detail: string; managedService: boolean}> = [
+  {kind: 'codex', label: 'Codex', detail: '使用 ModMind 托管的稳定版 Codex；需要时可在此配置中转服务', managedService: true},
+  {kind: 'claude', label: 'Claude Code', detail: '读取本机 Claude Code 配置；需要时可在此配置中转服务', managedService: true}
+]
+
+function externalAgentLabel(kind: ExternalAgentKind): string {
+  return EXTERNAL_AGENT_OPTIONS.find((agent) => agent.kind === kind)?.label ?? kind
+}
+
+function externalAgentIcon(kind: ExternalAgentKind, size = 13): React.JSX.Element {
+  if (kind === 'codex') return <Code2 size={size} />
+  if (kind === 'claude') return <Sparkles size={size} />
+  return <Zap size={size} />
+}
+
+type ProductionSettingsPanelProps = {
+  aiSettings: BeginnerAiPreferences
+  deviceState: DeviceConnectionState
+  availableModels: AiModelInfo[]
+  scanningModels: boolean
+  savingAiPreferences: boolean
+  modelScanMessage: string
+  onScanModels: () => void
+  onModelChange: (model: string) => void
+  onReasoningLevelChange: (reasoningLevel: BeginnerReasoningLevel) => void
+  onFastModeChange: (fastMode: boolean) => void
+}
+
+function ProductionSettingsPanel({
+  aiSettings,
+  deviceState,
+  availableModels,
+  scanningModels,
+  savingAiPreferences,
+  modelScanMessage,
+  onScanModels,
+  onModelChange,
+  onReasoningLevelChange,
+  onFastModeChange
+}: ProductionSettingsPanelProps): React.JSX.Element {
+  const modelOptions = availableModels.some((model) => model.id === aiSettings.model)
+    ? availableModels
+    : [{ id: aiSettings.model }, ...availableModels]
+
+  return <div className="production-settings-panel">
+    <section className="beginner-ai-preferences">
+      <div className="beginner-ai-preferences-heading"><Bot size={17} /><div><strong>智能引擎</strong><small>选择制作使用的模型、思考强度和响应速度</small></div></div>
+      <label className="beginner-model-control"><span>模型 <InfoTooltip className="model-info"><span>gpt-5.6-sol：能力最强，消耗较高</span><span>gpt-5.6-terra：均衡、较省额度</span><span>gpt-5.6-luna：响应较快、成本较低</span></InfoTooltip></span><div><select value={aiSettings.model} disabled={savingAiPreferences} onChange={(event) => onModelChange(event.target.value)}>{modelOptions.map((model) => <option key={model.id} value={model.id}>{model.id}</option>)}</select><button className="icon-button" type="button" title="刷新模型列表" disabled={scanningModels || savingAiPreferences || deviceState.status !== 'connected'} onClick={onScanModels}>{scanningModels ? <LoaderCircle className="spin" size={14} /> : <RotateCcw size={14} />}</button></div><small>{modelScanMessage}</small></label>
+      <div className="beginner-reasoning-control"><span>思考强度 <InfoTooltip><span>强度越高，推理更充分，但额度消耗更快</span></InfoTooltip></span><div role="group" aria-label="思考强度">{([['low', '低'], ['medium', '中'], ['high', '高'], ['extreme', '极高']] as const).map(([value, label]) => <button type="button" className={aiSettings.reasoningLevel === value ? 'active' : ''} disabled={savingAiPreferences} key={value} onClick={() => onReasoningLevelChange(value)}>{label}</button>)}</div></div>
+      <div className="beginner-fast-control"><span>Fast 模式</span><label className="switch-control"><input type="checkbox" checked={aiSettings.fastMode} disabled={savingAiPreferences} onChange={(event) => onFastModeChange(event.target.checked)} /><span aria-hidden="true" /></label><InfoTooltip><span>同步 ModMind 账号的 Fast 服务设置</span></InfoTooltip></div>
+    </section>
+    <section className="beginner-image-permissions">
+      <div className="beginner-image-permissions-heading"><WandSparkles size={17} /><div><strong>图片能力</strong><small>制作过程中需要生图时才会使用额度</small></div></div>
+      <div className="beginner-permission-row"><span>AI 可直接生成图片 <InfoTooltip><span>外部 Agent 可以使用生图和图像处理工具，额度由已配置的服务决定</span></InfoTooltip></span></div>
+    </section>
+  </div>
 }
 
 function formatDate(value: string): string {
@@ -147,28 +498,42 @@ function formatDate(value: string): string {
 }
 
 function errorMessage(error: unknown): string {
-  return error instanceof Error ? error.message : String(error)
+  return (error instanceof Error ? error.message : String(error))
+    .replace(/blocked\s+by\s+policy/gi, '服务限制')
+    .replace(/content\s+policy/gi, '服务限制')
+    .replace(/policy\s+violation/gi, '服务限制')
+    .replace(/safety\s+policy/gi, '服务限制')
+}
+
+function aiFailureMessage(error: unknown): string {
+  return describeAiFailureForUser(errorMessage(error))
 }
 
 function editorLanguage(relativePath: string): string {
   const extension = relativePath.split('.').at(-1)?.toLowerCase() ?? ''
   return {
     java: 'java', kt: 'kotlin', kts: 'kotlin', gradle: 'groovy', groovy: 'groovy',
-    json: 'json', mcmeta: 'json', md: 'markdown', html: 'html', htm: 'html',
+    json: 'json', json5: 'json', mcmeta: 'json', md: 'markdown', html: 'html', htm: 'html',
     xml: 'xml', yaml: 'yaml', yml: 'yaml', js: 'javascript', jsx: 'javascript',
-    ts: 'typescript', tsx: 'typescript', css: 'css', scss: 'scss', properties: 'ini'
+    ts: 'typescript', tsx: 'typescript', py: 'python', css: 'css', scss: 'scss', properties: 'ini', ini: 'ini', cfg: 'ini', conf: 'ini',
+    lang: 'plaintext', mcfunction: 'plaintext', snbt: 'plaintext', toml: 'plaintext', zs: 'javascript'
   }[extension] ?? 'plaintext'
 }
 
 function isEditablePath(relativePath: string): boolean {
   const name = relativePath.split('/').at(-1)?.toLowerCase() ?? ''
   if (['gradlew', 'license', 'copying'].includes(name)) return true
-  return /\.(?:java|kt|kts|gradle|groovy|json|mcmeta|md|txt|toml|html?|xml|ya?ml|js|jsx|ts|tsx|css|scss|properties|bat|cmd|sh|gitignore)$/i.test(name)
+  return /\.(?:java|kt|kts|gradle|groovy|json5?|mcmeta|md|txt|toml|html?|xml|ya?ml|js|jsx|mjs|ts|tsx|py|lang|mcfunction|css|scss|properties|ini|cfg|conf|snbt|zs|bat|cmd|sh|gitignore)$/i.test(name)
 }
 
 function shouldOfferAiRecovery(error: unknown): boolean {
   const message = errorMessage(error)
-  return /recovery snapshot was preserved|safety stop|interrupted|中断|安全停止|恢复快照/i.test(message)
+  if (/(?:^|\D)(?:401|402|403|404|429|500|502|503|504)(?:\D|$)|API Key|timed out|timeout|stream disconnected|connection (?:reset|closed|refused)|ECONNRESET|ETIMEDOUT|ENOTFOUND|线路繁忙|连接中断|响应超时|会话.{0,20}拒绝|凭证已失效|额度不足|模型接口或所选模型不存在/i.test(message)) return true
+  return /recovery snapshot was preserved|safety stop|interrupted|Review Agent rejected completion|Mandatory workflow incomplete|连续 .*没有任何操作|切换线路后重试|中断|安全停止|恢复快照/i.test(message)
+}
+
+function isWorkflowAuditRejection(error: unknown): boolean {
+  return /Review Agent rejected completion|Mandatory workflow incomplete|ModMind 完成检查未通过|审计|工作流未完成/i.test(errorMessage(error))
 }
 
 function FileTree({
@@ -234,7 +599,7 @@ function EmptyState({ onCreate, onOpen }: { onCreate: () => void; onOpen: () => 
     <main className="empty-state">
       <div className="empty-icon"><Box size={30} /></div>
       <h1>开始一个 Minecraft Mod</h1>
-      <p>创建新工程，或打开之前由 ModMind 管理的项目。</p>
+      <p>创建新工程，或打开之前由 ModMind 管理的项目</p>
       <div className="empty-actions">
         <button className="primary-button" onClick={onCreate}><Plus size={16} />新建项目</button>
         <button className="secondary-button" onClick={onOpen}><FolderOpen size={16} />打开项目</button>
@@ -252,16 +617,33 @@ function ProjectLauncher({
   onCreate,
   onOpen,
   onAdopt,
+  onImportModJar,
   onSelect,
-  onRemove
+  onRemove,
+  onRename
 }: {
   projects: ProjectInfo[]
   onCreate: () => void
   onOpen: () => void
   onAdopt: () => void
+  onImportModJar: () => void
   onSelect: (project: ProjectInfo) => void
   onRemove: (project: ProjectInfo) => void
+  onRename: (project: ProjectInfo) => void
 }): React.JSX.Element {
+  const [menu, setMenu] = useState<{ project: ProjectInfo; x: number; y: number } | null>(null)
+
+  useEffect(() => {
+    if (!menu) return
+    const close = (): void => setMenu(null)
+    window.addEventListener('pointerdown', close)
+    window.addEventListener('blur', close)
+    return () => {
+      window.removeEventListener('pointerdown', close)
+      window.removeEventListener('blur', close)
+    }
+  }, [menu])
+
   return (
     <main className="project-launcher">
       <div className="project-launcher-header">
@@ -270,7 +652,7 @@ function ProjectLauncher({
       <div className="project-launcher-list">
         <button className="project-launcher-action" type="button" onClick={onCreate}>
           <span className="project-launcher-icon new"><Plus size={20} /></span>
-          <span><strong>新建项目</strong><small>创建新的 Minecraft Mod 工程</small></span>
+          <span><strong>新建项目</strong><small>创建 Minecraft Mod 工程或整合包</small></span>
           <ChevronRight size={17} />
         </button>
         <button className="project-launcher-action" type="button" onClick={onOpen}>
@@ -280,7 +662,12 @@ function ProjectLauncher({
         </button>
         <button className="project-launcher-action" type="button" onClick={onAdopt}>
           <span className="project-launcher-icon adopt"><PackageOpen size={19} /></span>
-          <span><strong>接管现有项目</strong><small>支持项目文件夹或 ZIP，识别完整工程、残缺源码或 API 文档</small></span>
+          <span><strong>接管现有项目</strong><small>支持项目文件夹或压缩包（ZIP、MRPack），识别完整工程、残缺源码或 API 文档</small></span>
+          <ChevronRight size={17} />
+        </button>
+        <button className="project-launcher-action" type="button" onClick={onImportModJar}>
+          <span className="project-launcher-icon adopt"><Binary size={19} /></span>
+          <span><strong>接管现成模组 <i className="sidebar-beta-badge" title="新功能测试中">Beta</i></strong><small>识别 JAR 的加载器与 Minecraft 版本，反编译后直接创建 ModMind 项目</small></span>
           <ChevronRight size={17} />
         </button>
       </div>
@@ -289,20 +676,53 @@ function ProjectLauncher({
           <h2>最近项目</h2>
           <div className="recent-project-list">
             {projects.map((recent) => (
-              <div className="recent-project-row" key={recent.path}>
+              <div className="recent-project-row" key={recent.path} onContextMenu={(event) => { event.preventDefault(); setMenu({ project: recent, x: Math.min(event.clientX, window.innerWidth - 190), y: Math.min(event.clientY, window.innerHeight - 92) }) }}>
                 <button className="recent-project-main" type="button" onClick={() => onSelect(recent)}>
                   <span className="project-launcher-icon project"><Box size={18} /></span>
                   <span><strong>{recent.name}</strong><small>{recent.path}</small></span>
-                  <span className="recent-project-meta">{recent.loader} · {recent.minecraftVersion}</span>
+                  <span className="recent-project-meta">{platformLabel(recent.loader)} · {recent.minecraftVersion}</span>
                 </button>
-                <button className="recent-project-remove" type="button" title="从最近项目中移除" onClick={() => onRemove(recent)}><X size={15} /></button>
+                <button className="recent-project-remove" type="button" title="删除项目" onClick={() => onRemove(recent)}><X size={15} /></button>
               </div>
             ))}
           </div>
         </section>
       ) : null}
+      {menu ? <div className="project-context-menu" role="menu" style={{ left: menu.x, top: menu.y }} onPointerDown={(event) => event.stopPropagation()}>
+        <button type="button" role="menuitem" onClick={() => { onRename(menu.project); setMenu(null) }}><Pencil size={14} />重命名项目</button>
+        <button type="button" role="menuitem" onClick={() => { onRemove(menu.project); setMenu(null) }}><X size={14} />删除项目</button>
+      </div> : null}
     </main>
   )
+}
+
+function RenameProjectDialog({ project, onClose, onRenamed }: { project: ProjectInfo; onClose: () => void; onRenamed: (project: ProjectInfo) => void }): React.JSX.Element {
+  const [name, setName] = useState(project.name)
+  const [namespace, setNamespace] = useState(project.namespace)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+
+  const rename = async (): Promise<void> => {
+    setBusy(true)
+    setError('')
+    try {
+      const renamed = await window.modmind.project.rename({ name, namespace, projectPath: project.path })
+      onRenamed(renamed)
+    } catch (reason) {
+      setError(errorMessage(reason))
+      setBusy(false)
+    }
+  }
+
+  return <div className="modal-backdrop" role="presentation" onMouseDown={busy ? undefined : onClose}>
+    <div className="dialog rename-project-dialog" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+      <div className="dialog-header"><div><h2>重命名项目</h2><p>{project.path}</p></div><button className="icon-button" type="button" title="关闭" disabled={busy} onClick={onClose}><X size={17} /></button></div>
+      <label className="field-label">项目名称<input autoFocus value={name} onChange={(event) => setName(event.target.value)} /></label>
+      <label className="field-label">命名空间<input value={namespace} onChange={(event) => setNamespace(event.target.value)} /><small>只允许 Minecraft 标识符；输入中的空格和大写字母会自动规范化</small></label>
+      {error ? <div className="inline-error"><CircleAlert size={15} />{error}</div> : null}
+      <div className="dialog-footer"><button className="secondary-button" type="button" disabled={busy} onClick={onClose}>取消</button><button className="primary-button" type="button" disabled={busy || !name.trim() || !namespace.trim()} onClick={() => void rename()}>{busy ? <LoaderCircle className="spin" size={16} /> : <Pencil size={16} />}保存重命名</button></div>
+    </div>
+  </div>
 }
 
 function AdoptProjectDialog({
@@ -317,7 +737,13 @@ function AdoptProjectDialog({
   const [form, setForm] = useState<ExistingProjectAdoptInput>({ sourcePath: analysis.sourcePath, ...analysis.inferred })
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState('')
-  const kindLabel = analysis.kind === 'complete' ? '完整工程' : analysis.kind === 'partial' ? '残缺源码' : 'API 文档'
+  const kindLabel = analysis.kind === 'complete'
+    ? '完整工程'
+    : analysis.kind === 'partial'
+      ? '残缺源码'
+      : analysis.kind === 'modpack'
+        ? '整合包实例'
+        : 'API 文档'
 
   const adopt = async (): Promise<void> => {
     setBusy(true)
@@ -343,20 +769,136 @@ function AdoptProjectDialog({
           <span className={`adopt-kind ${analysis.kind}`}>{kindLabel}</span>
           <div><strong>{analysis.fileCount} 个文件</strong><small>{analysis.sourceFileCount} 个源码文件 · {analysis.documentCount} 个文档</small></div>
         </div>
+        {analysis.modpack?.loaderVersion ? <div className="adapter-note"><PackageOpen size={16} /><p><strong>已识别 Loader 版本</strong><span>{platformLabel(analysis.inferred.loader)} {analysis.modpack.loaderVersion}</span></p></div> : null}
         <div className="adopt-reasons">{analysis.reasons.map((reason) => <p key={reason}>{reason}</p>)}</div>
         <div className="adopt-fields">
           <label className="field-label">项目名称<input value={form.name} onChange={(event) => setForm({ ...form, name: event.target.value })} /></label>
           <label className="field-label">命名空间<input value={form.namespace} onChange={(event) => setForm({ ...form, namespace: event.target.value })} /></label>
           <label className="field-label">Minecraft 版本<input value={form.minecraftVersion} onChange={(event) => setForm({ ...form, minecraftVersion: event.target.value })} /></label>
-          <label className="field-label">加载器<select value={form.loader} disabled={analysis.kind !== 'complete'} onChange={(event) => setForm({ ...form, loader: event.target.value as ExistingProjectAdoptInput['loader'] })}><option value="fabric">Fabric</option><option value="quilt">Quilt</option><option value="forge">Forge</option><option value="neoforge">NeoForge</option></select></label>
+          <label className="field-label">加载器<select value={form.loader} disabled={analysis.kind === 'complete'} onChange={(event) => setForm({ ...form, loader: event.target.value as ExistingProjectAdoptInput['loader'] })}><option value="fabric">Fabric</option><option value="quilt">Quilt</option><option value="forge">Forge</option><option value="neoforge">NeoForge</option></select></label>
         </div>
         {analysis.detectedFiles.length ? <div className="adopt-files"><span>检测到的关键文件</span><code>{analysis.detectedFiles.slice(0, 8).join('\n')}</code></div> : null}
         {error ? <div className="inline-error"><CircleAlert size={15} />{error}</div> : null}
         <div className="dialog-footer">
           <button className="secondary-button" disabled={busy} onClick={onClose}>取消</button>
           <button className="primary-button" disabled={busy || !form.name.trim() || !form.namespace.trim()} onClick={() => void adopt()}>
-            {busy ? <LoaderCircle className="spin" size={16} /> : <PackageOpen size={16} />}{analysis.kind === 'complete' ? '接管此项目' : '创建项目并导入'}
+            {busy ? <LoaderCircle className="spin" size={16} /> : <PackageOpen size={16} />}{analysis.kind === 'complete' ? '接管此项目' : analysis.kind === 'modpack' ? '接管此整合包' : '创建项目并导入'}
           </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function AdoptModJarDialog({
+  inspection,
+  onClose,
+  onAdopted
+}: {
+  inspection: DecompileInspectResult
+  onClose: () => void
+  onAdopted: (project: ProjectInfo) => void
+}): React.JSX.Element {
+  const [name, setName] = useState(inspection.displayName?.trim() || inspection.fileName.replace(/\.jar$/i, ''))
+  const [loader, setLoader] = useState<JavaLoaderKind>(inspection.loader ?? 'fabric')
+  const [minecraftVersion, setMinecraftVersion] = useState(inspection.minecraftVersions[0] ?? '')
+  const [stage, setStage] = useState<'confirm' | 'terms'>('confirm')
+  const [terms, setTerms] = useState<DecompileTermsPayload | null>(null)
+  const [sourceSha256, setSourceSha256] = useState(inspection.sha256)
+  const [progress, setProgress] = useState<DecompileProgressEvent | null>(null)
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState('')
+  const sizeLabel = inspection.size < 1024 * 1024
+    ? `${(inspection.size / 1024).toFixed(1)} KB`
+    : `${(inspection.size / 1024 / 1024).toFixed(1)} MB`
+
+  useEffect(() => window.modmind.decompile.onProgress(setProgress), [])
+
+  const startDecompile = async (): Promise<void> => {
+    if (!name.trim() || !minecraftVersion.trim()) return
+    setBusy(true)
+    setError('')
+    setProgress({ jarSha256: inspection.sha256, phase: 'hashing', message: '正在准备反编译' })
+    try {
+      const result = await window.modmind.decompile.start({
+        jarPath: inspection.filePath,
+        minecraftVersion: minecraftVersion.trim()
+      })
+      setSourceSha256(result.sha256)
+      setTerms(await window.modmind.decompile.getTerms(inspection.fileName))
+      setStage('terms')
+    } catch (reason) {
+      setError(errorMessage(reason))
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  const adopt = async (): Promise<void> => {
+    if (!terms) return
+    setBusy(true)
+    setError('')
+    try {
+      const project = await window.modmind.decompile.createProjectFromJar({
+        sourceSha256,
+        name,
+        loader,
+        minecraftVersion: minecraftVersion.trim(),
+        termsAcknowledgement: { termsVersion: terms.version, acknowledged: true, origin: 'user-workspace' }
+      })
+      if (project) onAdopted(project)
+      else setBusy(false)
+    } catch (reason) {
+      setError(errorMessage(reason))
+      setBusy(false)
+    }
+  }
+
+  const reasons = [
+    `已识别 ${platformLabel(loader)} 模组描述文件`,
+    inspection.minecraftVersions.length
+      ? `已自动识别 Minecraft ${inspection.minecraftVersions.join(' / ')}`
+      : '未能自动识别 Minecraft 版本，请手动确认',
+    ...inspection.warnings
+  ]
+
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={busy ? undefined : onClose}>
+      <div className="dialog adopt-dialog mod-jar-adopt-dialog" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="dialog-header">
+          <div><h2>接管现成模组 <span className="sidebar-beta-badge" title="新功能测试中">Beta</span></h2><p>{inspection.filePath}</p></div>
+          <button className="icon-button" title="关闭" disabled={busy} onClick={onClose}><X size={17} /></button>
+        </div>
+        <div className="adopt-detection">
+          <span className="adopt-kind complete">JAR 模组</span>
+          <div><strong>{inspection.classCount} 个类</strong><small>{platformLabel(loader)} · {sizeLabel} · sha256 {inspection.sha256.slice(0, 12)}…</small></div>
+        </div>
+        {busy ? <div className="adapter-note"><LoaderCircle className="spin" size={16} /><p><strong>正在反编译</strong><span>{progress?.message ?? '正在准备受控反编译环境'}</span></p></div> : null}
+        {stage === 'confirm' ? <>
+          <div className="adopt-reasons">{reasons.map((reason) => <p key={reason}>{reason}</p>)}</div>
+          <div className="adopt-fields">
+            <label className="field-label">项目名称<input autoFocus value={name} onChange={(event) => setName(event.target.value)} /></label>
+            <label className="field-label">Minecraft 版本
+              <input list={`decompile-versions-${inspection.sha256.slice(0, 8)}`} value={minecraftVersion} onChange={(event) => setMinecraftVersion(event.target.value)} placeholder="例如：1.21.1" />
+              <datalist id={`decompile-versions-${inspection.sha256.slice(0, 8)}`}>{inspection.minecraftVersions.map((version) => <option key={version} value={version} />)}</datalist>
+            </label>
+            <label className="field-label">加载器<select value={loader} onChange={(event) => setLoader(event.target.value as JavaLoaderKind)}><option value="fabric">Fabric</option><option value="quilt">Quilt</option><option value="forge">Forge</option><option value="neoforge">NeoForge</option></select></label>
+          </div>
+          <div className="adopt-files"><span>检测到的模组文件</span><code>{inspection.fileName}</code></div>
+        </> : terms ? <>
+          <div className="decompile-terms-body">
+            {terms.sections.map((section) => <section key={section.heading}><h4>{section.heading}</h4>{section.body.map((paragraph, index) => <p key={index}>{paragraph}</p>)}</section>)}
+            <p className="decompile-terms-source">来源 JAR：{inspection.fileName}（sha256: {sourceSha256.slice(0, 16)}…）。接受记录会写入生成的项目目录。</p>
+          </div>
+        </> : null}
+        {error ? <div className="inline-error"><CircleAlert size={15} />{error}</div> : null}
+        <div className="dialog-footer">
+          <button className="secondary-button" disabled={busy} onClick={stage === 'terms' ? () => setStage('confirm') : onClose}>{stage === 'terms' ? '返回' : '取消'}</button>
+          {stage === 'confirm' ? <button className="primary-button" disabled={busy || !name.trim() || !minecraftVersion.trim()} onClick={() => void startDecompile()}>
+            {busy ? <LoaderCircle className="spin" size={16} /> : <Binary size={16} />}反编译并接管
+          </button> : <button className="primary-button decompile-danger-confirm" disabled={busy || !terms} onClick={() => void adopt()}>
+            {busy ? <LoaderCircle className="spin" size={16} /> : <PackageOpen size={16} />}我已阅读并同意，创建项目
+          </button>}
         </div>
       </div>
     </div>
@@ -377,9 +919,9 @@ function ExistingImportPicker({ onClose, onSelect }: { onClose: () => void; onSe
             <span><strong>项目文件夹</strong><small>选择已经解压的源码或工程目录</small></span>
             <ChevronRight size={17} />
           </button>
-          <button className="project-launcher-action" type="button" onClick={() => onSelect('zip')}>
+          <button className="project-launcher-action archive-picker-action" type="button" onClick={() => onSelect('zip')}>
             <span className="project-launcher-icon adopt"><PackageOpen size={19} /></span>
-            <span><strong>ZIP 压缩包</strong><small>自动解压后识别并导入项目内容</small></span>
+            <span><strong>压缩包</strong><small>支持 ZIP、MRPack 格式，自动解压后识别并导入项目内容</small></span>
             <ChevronRight size={17} />
           </button>
         </div>
@@ -388,121 +930,337 @@ function ExistingImportPicker({ onClose, onSelect }: { onClose: () => void; onSe
   )
 }
 
-function InspirationWorkspace({ project, visible, onSendToCoding }: { project: ProjectInfo; visible: boolean; onSendToCoding: (prompt: string) => void }): React.JSX.Element {
-  const [messages, setMessages] = useState<InspirationChatMessage[]>([])
+function ProjectInspectionDialog({ kind }: { kind: 'project' | 'mod' }): React.JSX.Element {
+  const title = kind === 'mod' ? '接管现成模组' : '接管现有项目'
+  const detail = kind === 'mod'
+    ? '正在读取 JAR 描述文件、识别加载器与 Minecraft 版本，请稍候…'
+    : '正在扫描文件、读取构建配置并识别项目类型，请稍候…'
+  return (
+    <div className="modal-backdrop" role="presentation">
+      <div className="dialog adopt-dialog inspection-dialog" role="dialog" aria-modal="true" aria-busy="true">
+        <div className="dialog-header">
+          <div><h2>{title}</h2><p>正在识别</p></div>
+        </div>
+        <div className="inspection-status" role="status">
+          <LoaderCircle className="spin" size={22} />
+          <div><strong>{kind === 'mod' ? '正在识别模组' : '正在识别项目'}</strong><span>{detail}</span></div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+function dedupeInspirationMessages(messages: InspirationChatMessage[]): InspirationChatMessage[] {
+  return messages.reduce<InspirationChatMessage[]>((result, message) => {
+    if (message.role !== 'assistant' || message.kind === 'tool') {
+      result.push(message)
+      return result
+    }
+    if (!message.content.trim()) return result
+    let targetIndex = -1
+    for (let index = result.length - 1; index >= 0; index -= 1) {
+      const candidate = result[index]
+      if (candidate.role === 'user') break
+      if (candidate.role === 'assistant' && candidate.kind !== 'tool') {
+        targetIndex = index
+        break
+      }
+    }
+    if (targetIndex < 0) {
+      result.push(message)
+      return result
+    }
+    const existing = result[targetIndex]
+    if (!existing.content.includes(message.content) && !message.content.includes(existing.content)) {
+      result.push(message)
+      return result
+    }
+    result[targetIndex] = {
+      ...existing,
+      ...message,
+      content: message.content.length >= existing.content.length ? message.content : existing.content,
+      status: message.status === 'error' || message.status === 'cancelled' ? message.status : message.isFinal ? message.status : existing.status,
+      isFinal: message.isFinal ?? existing.isFinal
+    }
+    return result
+  }, [])
+}
+
+function InspirationWorkspace({ project, visible, uiMode, deviceState, codingBackend, onBusyChange, onConnectionRequired, onSendToCoding }: {
+  project: ProjectInfo
+  visible: boolean
+  uiMode: UiMode
+  deviceState: DeviceConnectionState
+  codingBackend: AgentSettings['codingBackend']
+  onBusyChange: (busy: boolean) => void
+  onConnectionRequired: () => void
+  onSendToCoding: (prompt: string) => void
+}): React.JSX.Element {
   const [conversations, setConversations] = useState<InspirationConversation[]>([])
   const [activeConversationId, setActiveConversationId] = useState('')
   const [hydrated, setHydrated] = useState(false)
   const [draft, setDraft] = useState('')
+  const [attachments, setAttachments] = useState<AiAttachment[]>([])
   const [busy, setBusy] = useState(false)
+  const [thinkingSeconds, setThinkingSeconds] = useState(0)
+  const sendTokenRef = useRef(0)
+  const inspirationSessionRef = useRef('')
+  const inspirationConversationRef = useRef('')
+  const responseContentRef = useRef('')
+  const thinkingStartedAtRef = useRef<number | null>(null)
   const endRef = useRef<HTMLDivElement | null>(null)
   const quickPrompts = [
-    '分析当前项目结构，指出已经实现的内容、缺口和最值得优先处理的风险。',
-    '结合现有代码，给我三个能融入当前模组的 Boss 设计，并说明战斗阶段和实现难点。',
-    '阅读导入的源码或 API 文档，告诉我可以利用哪些能力，以及它们适合做什么玩法。',
-    '基于当前项目给出下一步开发路线，按价值和工作量排序。'
+    '分析当前项目结构，指出已经实现的内容、缺口和最值得优先处理的风险',
+    '结合现有代码，给我三个能融入当前模组的 Boss 设计，并说明战斗阶段和实现难点',
+    '阅读导入的源码或 API 文档，告诉我可以利用哪些能力，以及它们适合做什么玩法',
+    '基于当前项目给出下一步开发路线，按价值和工作量排序'
   ]
   const storageKey = `modmind-inspiration:${project.path}`
+  const messages = conversations.find((conversation) => conversation.id === activeConversationId)?.messages ?? []
+  const inspirationTimeline = messages.filter((message) => message.kind === 'tool')
+  const inspirationRows: InspirationTimelineRow[] = inspirationTimeline.length ? [{ id: 'inspiration-steps', kind: 'tool-group', items: inspirationTimeline }] : []
+
+  const updateConversationMessages = (conversationId: string, updater: (messages: InspirationChatMessage[]) => InspirationChatMessage[]): void => {
+    if (!conversationId) return
+    setConversations((current) => current.map((conversation) => conversation.id === conversationId
+      ? { ...conversation, messages: updater(conversation.messages).slice(-100), updatedAt: new Date().toISOString() }
+      : conversation))
+  }
+
+  const updateActiveMessages = (updater: (messages: InspirationChatMessage[]) => InspirationChatMessage[]): void => {
+    updateConversationMessages(activeConversationId, updater)
+  }
+
+  useEffect(() => {
+    if (!activeConversationId) return
+    return window.modmind.ai.onOutput((event) => {
+      if (event.projectPath && normalizeProjectPath(event.projectPath) !== normalizeProjectPath(project.path)) return
+      if (event.sessionId !== inspirationSessionRef.current || !event.content.trim()) return
+      if (event.kind === 'answer') {
+        responseContentRef.current = ''
+        updateConversationMessages(inspirationConversationRef.current, (current) => {
+          const hasStreaming = current.some((message) => message.role === 'assistant' && message.status === 'streaming')
+          return hasStreaming
+            ? current.map((message) => message.role === 'assistant' && message.status === 'streaming'
+              ? { ...message, content: event.content, status: 'completed', isFinal: true }
+              : message)
+            : [...current, { role: 'assistant', content: event.content, status: 'completed', isFinal: true }]
+        })
+        return
+      }
+      if (event.kind === 'response') {
+        responseContentRef.current = event.content
+        updateConversationMessages(inspirationConversationRef.current, (current) => {
+          const index = [...current].reverse().findIndex((message) => message.role === 'assistant' && message.status === 'streaming')
+          if (index < 0) return current
+          const target = current.length - 1 - index
+          const existing = current[target]
+          if (existing.content === event.content) return current
+          return current.flatMap((message, messageIndex) => messageIndex === target
+            ? [
+                ...(message.content.trim() ? [{ ...message, status: 'completed' as const, isFinal: false }] : []),
+                { role: 'assistant' as const, content: event.content, status: 'streaming' as const, isFinal: false }
+              ]
+            : [message])
+        })
+        return
+      }
+      if (event.kind === 'retry' || event.kind === 'tool' || event.kind === 'warning') {
+        updateConversationMessages(inspirationConversationRef.current, (current) => {
+          const index = [...current].reverse().findIndex((message) => message.role === 'assistant' && message.status === 'streaming')
+          const target = index < 0 ? current.length : current.length - 1 - index
+          return [...current.slice(0, target), { role: 'assistant', kind: 'tool', id: `inspiration-step-${Date.now()}-${crypto.randomUUID()}`, content: event.content, time: new Date().toISOString(), status: 'completed', isFinal: false }, ...current.slice(target)]
+        })
+      }
+    })
+  }, [activeConversationId, project.path])
 
   useEffect(() => {
     try {
       const saved = JSON.parse(localStorage.getItem(storageKey) ?? 'null') as { activeId?: string; conversations?: InspirationConversation[] } | null
-      const valid = Array.isArray(saved?.conversations) ? saved.conversations.filter((entry) => entry && typeof entry.id === 'string' && Array.isArray(entry.messages)) : []
+      const valid = Array.isArray(saved?.conversations) ? saved.conversations
+        .filter((entry) => entry && typeof entry.id === 'string' && Array.isArray(entry.messages))
+        .map((entry) => ({ ...entry, messages: dedupeInspirationMessages(entry.messages.map((message, index, allMessages) => {
+          if (message.role !== 'assistant' || message.isFinal !== undefined) return message
+          const nextUser = allMessages.findIndex((candidate, candidateIndex) => candidateIndex > index && candidate.role === 'user')
+          const nextAssistant = allMessages.findIndex((candidate, candidateIndex) => candidateIndex > index && candidate.role === 'assistant')
+          const isLastAssistantInTurn = nextAssistant < 0 || (nextUser >= 0 && nextAssistant > nextUser)
+          return { ...message, isFinal: isLastAssistantInTurn && message.status === 'completed' }
+        })) })) : []
       const fallback: InspirationConversation = { id: `${Date.now()}`, title: '新对话', updatedAt: new Date().toISOString(), messages: [] }
       const list = valid.length ? valid : [fallback]
       const active = list.find((entry) => entry.id === saved?.activeId) ?? list[0]
       setConversations(list)
       setActiveConversationId(active.id)
-      setMessages(active.messages)
     } catch {
       const fallback: InspirationConversation = { id: `${Date.now()}`, title: '新对话', updatedAt: new Date().toISOString(), messages: [] }
       setConversations([fallback])
       setActiveConversationId(fallback.id)
-      setMessages([])
     }
     setHydrated(true)
   }, [storageKey])
 
   useEffect(() => {
     if (!hydrated || !activeConversationId) return
-    const updated = conversations.map((conversation) => conversation.id === activeConversationId ? { ...conversation, messages: messages.slice(-100), updatedAt: new Date().toISOString() } : conversation)
-    setConversations(updated)
-    localStorage.setItem(storageKey, JSON.stringify({ activeId: activeConversationId, conversations: updated }))
-  }, [messages, activeConversationId, hydrated, storageKey])
+    localStorage.setItem(storageKey, JSON.stringify({ activeId: activeConversationId, conversations }))
+  }, [conversations, activeConversationId, hydrated, storageKey])
 
   useEffect(() => {
     endRef.current?.scrollIntoView({ behavior: 'smooth', block: 'end' })
   }, [messages, busy])
 
+  useEffect(() => {
+    if (!busy || thinkingStartedAtRef.current === null) return
+    const updateElapsed = (): void => setThinkingSeconds(Math.max(0, Math.floor((Date.now() - thinkingStartedAtRef.current!) / 1_000)))
+    updateElapsed()
+    const timer = window.setInterval(updateElapsed, 1_000)
+    return () => window.clearInterval(timer)
+  }, [busy])
+
   const send = async (value = draft): Promise<void> => {
-    const content = value.trim()
-    if (!content || busy) return
-    const history = messages.slice(-20)
-    setMessages((current) => [...current, { role: 'user', content }])
+    const requestedContent = value.trim()
+    if ((!requestedContent && !attachments.length) || busy) return
+    const content = requestedContent || '请分析我上传的附件'
+    const attachmentContext = formatAiAttachmentContext(attachments)
+    const selectedBackend: AgentSettings['codingBackend'] = uiMode === 'beginner' ? 'quota' : codingBackend
+    const usesQuota = selectedBackend === 'quota'
+    if (usesQuota && deviceState.status !== 'connected') {
+      onConnectionRequired()
+      return
+    }
+    const conversationId = activeConversationId
+    const attachmentKeys = attachments.map((attachment) => `${attachment.path}:${attachment.size}`)
+    const dedupeKey = aiPromptFingerprint(content, attachmentKeys)
+    const sendToken = ++sendTokenRef.current
+    const sessionId = `inspiration-${conversationId}-${Date.now()}-${sendToken}-${crypto.randomUUID()}`
+    inspirationConversationRef.current = conversationId
+    inspirationSessionRef.current = sessionId
+    responseContentRef.current = ''
+    updateActiveMessages((current) => [...current,
+      { role: 'user', content: `${content}${attachments.length ? `\n\n已附 ${attachments.length} 个文件` : ''}`, status: 'completed' },
+      { role: 'assistant', content: '', status: 'streaming', isFinal: false }
+    ])
+    updateConversationMessages(conversationId, (current) => current.map((message, index) => index === current.length - 2 ? { ...message, dedupeKey } : message))
     setDraft('')
+    thinkingStartedAtRef.current = Date.now()
+    setThinkingSeconds(0)
     setBusy(true)
+    onBusyChange(true)
     try {
-      const reply = await window.modmind.ai.inspire(content, history)
-      setMessages((current) => [...current, { role: 'assistant', content: reply }])
+      if (usesQuota && deviceState.keyStatus === 'FROZEN') {
+        throw new Error('当前账号暂不可用，请前往网站查看账号状态后再继续')
+      }
+      const result = await window.modmind.ai.createCode(
+        `Use the project context and any useful workflows or tools to answer the user's latest inspiration question in Simplified Chinese with concrete suggestions grounded in the current mod. Do not modify files for this inspiration task.\n\nLATEST QUESTION\n${content}${attachmentContext}`,
+        sessionId,
+        selectedBackend,
+        usesQuota ? 'beginner-unlimited' : 'standard',
+        { surface: 'inspiration', sessionScope: `inspiration/${conversationId}`, resumeSession: messages.length > 0, projectPath: project.path, fallbackPrompt: `Use the project context and any useful workflows or tools to answer the user's latest inspiration question in Simplified Chinese with concrete suggestions grounded in the current mod. Do not modify files for this inspiration task.\n\nLATEST QUESTION\n${content}${attachmentContext}` }
+      )
+      if (sendToken !== sendTokenRef.current) return
+      const reply = result.finalResponse ?? result.summary ?? responseContentRef.current
+      if (reply) {
+        responseContentRef.current = ''
+        updateConversationMessages(conversationId, (current) => current.map((message) => message.status === 'streaming' && message.role === 'assistant'
+          ? { ...message, content: reply, status: 'completed', isFinal: true }
+          : message))
+      } else {
+        updateConversationMessages(conversationId, (current) => current.map((message) => message.status === 'streaming' && message.role === 'assistant'
+          ? { ...message, content: '上游模型完成了请求，但没有返回可显示的回答。请重试或切换线路。', status: 'error', isFinal: true, time: new Date().toISOString() }
+          : message))
+      }
+      setAttachments([])
     } catch (error) {
-      setMessages((current) => [...current, { role: 'assistant', content: `无法完成分析：${errorMessage(error)}` }])
+      if (sendToken !== sendTokenRef.current) return
+      const failure = aiFailureMessage(error)
+      responseContentRef.current = ''
+      updateConversationMessages(conversationId, (current) => current.flatMap((message) => {
+        if (message.role !== 'assistant' || message.status !== 'streaming') return [message]
+        if (!message.content.trim()) return [{ ...message, content: failure, status: 'error' as const, isFinal: true, time: new Date().toISOString() }]
+        return [
+          { ...message, status: 'completed' as const, isFinal: true, time: new Date().toISOString() },
+          { role: 'assistant' as const, content: failure, status: 'error' as const, isFinal: true, time: new Date().toISOString() }
+        ]
+      }))
     } finally {
       setBusy(false)
+      thinkingStartedAtRef.current = null
+      onBusyChange(false)
     }
   }
 
+  const cancelInspiration = (): void => {
+    const conversationId = inspirationConversationRef.current
+    sendTokenRef.current += 1
+    updateConversationMessages(conversationId, (current) => current.map((message) => message.status === 'streaming'
+      ? { ...message, content: message.content || '请求已暂停', status: 'cancelled' }
+      : message))
+    setBusy(false)
+    thinkingStartedAtRef.current = null
+    onBusyChange(false)
+    void window.modmind.ai.cancelCode(inspirationSessionRef.current || undefined, project.path)
+  }
+
   const startNewConversation = (): void => {
-    if (messages.length && !window.confirm('清空当前灵感对话并开始新对话吗？')) return
+    if (busy) return
     const conversation: InspirationConversation = { id: `${Date.now()}`, title: '新对话', updatedAt: new Date().toISOString(), messages: [] }
     setConversations((current) => [conversation, ...current])
     setActiveConversationId(conversation.id)
-    setMessages([])
+    inspirationConversationRef.current = conversation.id
+    inspirationSessionRef.current = ''
+    responseContentRef.current = ''
     setDraft('')
   }
 
   const selectConversation = (conversation: InspirationConversation): void => {
     setActiveConversationId(conversation.id)
-    setMessages(conversation.messages)
+    if (!busy) {
+      inspirationConversationRef.current = conversation.id
+      inspirationSessionRef.current = ''
+      responseContentRef.current = ''
+    }
     setDraft('')
   }
 
-  return (
+  return <>
     <div className="inspiration-page" hidden={!visible}>
       <div className="content-toolbar">
-        <div><h1>灵感台</h1><p>只读分析与创意讨论，不执行编程</p></div>
-        <div className="inspiration-toolbar"><span className="inspiration-model-state"><Lightbulb size={15} />项目顾问</span><button className="secondary-button compact" type="button" onClick={startNewConversation}><Plus size={14} />新对话</button></div>
+        <div><h1>{uiMode === 'beginner' ? '灵感' : '灵感台'}</h1><p>只读分析与创意讨论，不执行编程</p></div>
+        <div className="inspiration-toolbar"><span className="inspiration-model-state"><Lightbulb size={15} />{uiMode === 'beginner' ? '智能灵感顾问' : '项目顾问'}</span><button className="secondary-button compact" type="button" onClick={startNewConversation}><Plus size={14} />新对话</button></div>
       </div>
       <div className="inspiration-layout">
         <aside className="inspiration-sidebar">
-          <div className="inspiration-project"><span className="project-launcher-icon project"><Box size={18} /></span><div><strong>{project.name}</strong><small>{project.loader} · {project.minecraftVersion}</small></div></div>
+          <div className="inspiration-project"><span className="project-launcher-icon project"><Box size={18} /></span><div><strong>{project.name}</strong><small>{platformLabel(project.loader)} · {project.minecraftVersion}</small></div></div>
           <dl><div><dt>命名空间</dt><dd>{project.namespace}</dd></div><div><dt>项目位置</dt><dd title={project.path}>{project.path}</dd></div></dl>
            <div className="inspiration-quick"><span>快速提问</span>{quickPrompts.map((prompt) => <button key={prompt} type="button" onClick={() => void send(prompt)}>{prompt}<ChevronRight size={14} /></button>)}</div>
            <div className="inspiration-history"><span>历史对话</span>{conversations.slice(0, 8).map((conversation) => <button key={conversation.id} className={conversation.id === activeConversationId ? 'active' : ''} type="button" onClick={() => selectConversation(conversation)}>{conversation.title}<small>{conversation.messages.length} 条消息</small></button>)}</div>
         </aside>
         <section className="inspiration-chat">
           <div className="inspiration-messages">
-            {!messages.length ? <div className="inspiration-empty"><Lightbulb size={30} /><h2>从项目本身开始思考</h2><p>询问现有实现、技术风险、API 用法或玩法灵感。</p></div> : null}
-            {messages.map((message, index) => (
+            {!messages.length ? <div className="inspiration-empty"><Lightbulb size={30} /><h2>从项目本身开始思考</h2><p>询问现有实现、技术风险、API 用法或玩法灵感</p></div> : null}
+            {messages.filter((message) => message.role === 'user' || (message.role === 'assistant' && (message.isFinal || message.status === 'streaming'))).map((message, index) => (
               <div className={`inspiration-message ${message.role}`} key={`${message.role}-${index}`}>
                 <span>{message.role === 'assistant' ? <Bot size={16} /> : <UserRound size={16} />}</span>
-                <div><strong>{message.role === 'assistant' ? '灵感台' : '你'}</strong>{message.role === 'assistant' ? <><MarkdownMessage content={message.content} /><button className="message-action" type="button" onClick={() => onSendToCoding(message.content)}><Code2 size={13} />交给工作台</button></> : <p>{message.content}</p>}</div>
+                <div><strong>{message.role === 'assistant' ? '灵感台' : '你'}</strong>{message.role === 'assistant' ? <><MarkdownMessage content={message.content} />{message.isFinal && message.status === 'completed' && !busy ? <button className="message-action" type="button" onClick={() => onSendToCoding(message.content)}><Code2 size={13} />交给工作台</button> : null}</> : <p>{message.content}</p>}</div>
               </div>
             ))}
-            {busy ? <div className="inspiration-message assistant"><span><Bot size={16} /></span><div><strong>灵感台</strong><p className="inspiration-thinking"><LoaderCircle className="spin" size={15} />正在阅读项目并整理思路</p></div></div> : null}
+            {busy ? <div className="inspiration-thinking-status" role="status"><span>灵感台思考中</span><time>{thinkingSeconds}s</time></div> : null}
             <div ref={endRef} />
           </div>
           <div className="inspiration-composer">
-            <textarea value={draft} disabled={busy} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.key === 'Enter' && !event.shiftKey) { event.preventDefault(); void send() } }} placeholder="询问项目结构、API 用法或玩法灵感" />
-             <div className="inspiration-composer-actions"><button className="secondary-button compact" type="button" title="发送到工作台" disabled={!draft.trim()} onClick={() => onSendToCoding(draft.trim())}><Code2 size={14} />交给工作台</button><button className="send-button" title="发送" disabled={busy || !draft.trim()} onClick={() => void send()}>{busy ? <LoaderCircle className="spin" size={17} /> : <Send size={17} />}</button></div>
+            <textarea value={draft} disabled={busy} onChange={(event) => setDraft(event.target.value)} onKeyDown={(event) => { if (event.nativeEvent.isComposing || event.keyCode === 229) return; if (event.key === 'Enter' && !(event.shiftKey || event.ctrlKey || event.metaKey)) { event.preventDefault(); void send() } }} placeholder="询问项目结构、API 用法或玩法灵感" />
+             <div className="inspiration-composer-actions"><AiAttachmentPicker attachments={attachments} onChange={setAttachments} disabled={busy} onError={(error) => { if (uiMode !== 'advanced') updateActiveMessages((current) => [...current, { role: 'assistant', content: `无法添加附件：${errorMessage(error)}`, status: 'error' }]) }} />{busy ? <button className="secondary-button compact" type="button" onClick={cancelInspiration}><X size={14} />暂停任务</button> : null}<button className="send-button" title="发送" disabled={busy || (!draft.trim() && !attachments.length)} onClick={() => void send()}>{busy ? <LoaderCircle className="spin" size={17} /> : <Send size={17} />}</button></div>
           </div>
         </section>
       </div>
     </div>
-  )
+  </>
 }
 
 function CreateProjectDialog({ onClose, onCreated }: { onClose: () => void; onCreated: (project: ProjectInfo) => void }): React.JSX.Element {
   const [name, setName] = useState('')
+  const [projectKind, setProjectKind] = useState<ProjectKind>('mod')
+  const [edition, setEdition] = useState<'java' | 'bedrock' | 'netease'>('java')
   const [loader, setLoader] = useState<LoaderKind>('fabric')
   const [version, setVersion] = useState('1.21.1')
   const [catalog, setCatalog] = useState<LoaderVersionOption[]>([])
@@ -521,6 +1279,13 @@ function CreateProjectDialog({ onClose, onCreated }: { onClose: () => void; onCr
   }, [])
 
   const availableVersions = catalog.filter((option) => option.loader === loader)
+  const selectedOption = availableVersions.find((option) => option.minecraftVersion === version)
+
+  const selectEdition = (next: 'java' | 'bedrock' | 'netease'): void => {
+    setEdition(next)
+    setLoader(next === 'java' ? 'fabric' : next === 'bedrock' ? 'bedrock' : 'netease-mobile')
+    setVersion('')
+  }
 
   useEffect(() => {
     if (!availableVersions.length || availableVersions.some((option) => option.minecraftVersion === version)) return
@@ -532,7 +1297,7 @@ function CreateProjectDialog({ onClose, onCreated }: { onClose: () => void; onCr
     setBusy(true)
     setError('')
     try {
-      const project = await window.modmind.project.create({ name, loader, minecraftVersion: version })
+      const project = await window.modmind.project.create({ name, loader, minecraftVersion: version, kind: projectKind })
       if (project) onCreated(project)
       else setBusy(false)
     } catch (reason) {
@@ -546,8 +1311,8 @@ function CreateProjectDialog({ onClose, onCreated }: { onClose: () => void; onCr
       <div className="dialog" role="dialog" aria-modal="true" onMouseDown={(event) => event.stopPropagation()}>
         <div className="dialog-header">
           <div>
-            <h2>新建 Mod 项目</h2>
-            <p>选择基础环境，ModMind 将生成可编辑工程。</p>
+            <h2>新建 Minecraft 项目</h2>
+            <p>先选择你实际游玩的版本，ModMind 将生成对应的完整工程</p>
           </div>
           <button className="icon-button" title="关闭" onClick={onClose}><X size={17} /></button>
         </div>
@@ -556,20 +1321,37 @@ function CreateProjectDialog({ onClose, onCreated }: { onClose: () => void; onCr
           <input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：经验水晶" />
         </label>
         <div className="field-label">
-          加载器
+          项目类型
           <div className="segmented-control">
-            <button className={loader === 'fabric' ? 'active' : ''} onClick={() => setLoader('fabric')}>Fabric</button>
-            <button className={loader === 'quilt' ? 'active' : ''} onClick={() => setLoader('quilt')}>Quilt</button>
-            <button className={loader === 'forge' ? 'active' : ''} onClick={() => setLoader('forge')}>Forge</button>
-            <button className={loader === 'neoforge' ? 'active' : ''} onClick={() => setLoader('neoforge')}>NeoForge</button>
+            <button className={projectKind === 'mod' ? 'active' : ''} onClick={() => setProjectKind('mod')}>自制 Mod</button>
+            <button className={projectKind === 'modpack' ? 'active' : ''} onClick={() => { setProjectKind('modpack'); selectEdition('java') }}>整合包</button>
           </div>
         </div>
+        <div className="field-label">
+          游戏平台
+          <div className="segmented-control">
+            <button className={edition === 'java' ? 'active' : ''} onClick={() => selectEdition('java')}>Java 版</button>
+            <button disabled={projectKind === 'modpack'} className={edition === 'bedrock' ? 'active' : ''} onClick={() => selectEdition('bedrock')}>国际基岩版</button>
+            <button disabled={projectKind === 'modpack'} className={edition === 'netease' ? 'active' : ''} onClick={() => selectEdition('netease')}>网易版</button>
+          </div>
+        </div>
+        {edition === 'java' ? <div className="field-label">加载器<div className="segmented-control">
+          <button className={loader === 'fabric' ? 'active' : ''} onClick={() => setLoader('fabric')}>Fabric</button>
+          <button className={loader === 'quilt' ? 'active' : ''} onClick={() => setLoader('quilt')}>Quilt</button>
+          <button className={loader === 'forge' ? 'active' : ''} onClick={() => setLoader('forge')}>Forge</button>
+          <button className={loader === 'neoforge' ? 'active' : ''} onClick={() => setLoader('neoforge')}>NeoForge</button>
+        </div></div> : null}
+        {edition === 'netease' ? <div className="field-label">运行目标<div className="segmented-control">
+          <button className={loader === 'netease-mobile' ? 'active' : ''} onClick={() => { setLoader('netease-mobile'); setVersion('') }}>网易手游</button>
+          <button className={loader === 'netease-pc' ? 'active' : ''} onClick={() => { setLoader('netease-pc'); setVersion('') }}>网易 PC</button>
+        </div></div> : null}
         <label className="field-label">
-          Minecraft 版本
+          {edition === 'java' ? 'Minecraft 版本' : edition === 'bedrock' ? '最低兼容基岩版本' : 'Mod SDK 版本'}
           <select value={version} disabled={catalogBusy || !availableVersions.length} onChange={(event) => setVersion(event.target.value)}>
             {availableVersions.map((option) => <option key={`${option.loader}-${option.minecraftVersion}`} value={option.minecraftVersion}>{option.minecraftVersion}{option.supportTier === 'experimental' ? '（实验性）' : ''}</option>)}
           </select>
           {catalogBusy ? <small>正在读取加载器兼容目录…</small> : null}
+          {selectedOption?.notes.map((note) => <small key={note}>{note}</small>)}
         </label>
         {error ? <div className="inline-error"><CircleAlert size={15} />{error}</div> : null}
         <div className="dialog-footer">
@@ -583,19 +1365,149 @@ function CreateProjectDialog({ onClose, onCreated }: { onClose: () => void; onCr
   )
 }
 
+type DeviceAccountDialogProps = {
+  state: DeviceConnectionState
+  remoteState: RemoteConnectionState
+  busy: boolean
+  remoteBusy: boolean
+  onClose: () => void
+  onAuthorize: () => void
+  onCancel: () => void
+  onDisconnect: () => void
+  onRefresh: () => void
+  onOpenSite: () => void
+  onRemoteToggle: () => void
+}
+
+function DeviceAccountDialog({ state, remoteState, busy, remoteBusy, onClose, onAuthorize, onCancel, onDisconnect, onRefresh, onOpenSite, onRemoteToggle }: DeviceAccountDialogProps): React.JSX.Element {
+  const balance = formatBalanceCents(state.balanceCents)
+  return (
+    <div className="modal-backdrop" role="presentation" onMouseDown={onClose}>
+      <div className="dialog hosted-account-dialog" role="dialog" aria-modal="true" aria-labelledby="device-account-title" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="dialog-header"><div><h2 id="device-account-title">ModMind 设备连接</h2><p>管理本机授权凭证和站内余额</p></div><button className="icon-button" type="button" title="关闭" onClick={onClose}><X size={17} /></button></div>
+        {state.status === 'connected' ? (
+          <>
+            <div className="hosted-dialog-profile"><span className="hosted-account-avatar"><UserRound size={16} /></span><div><strong>{state.username ?? '已连接账号'}</strong><small>{state.keyStatus === 'FROZEN' ? (state.frozenReason ?? 'Key 已冻结') : '设备已安全连接'}</small></div><button className="text-button" type="button" disabled={busy} onClick={onDisconnect}>断开设备</button></div>
+            <div className="hosted-dialog-balance"><span>站内余额</span><div><strong>{balance}</strong></div></div>
+            <div className="hosted-dialog-balance"><span className="remote-workbench-label">远程工作台<small className="remote-workbench-beta">beta</small></span><div><strong>{remoteState.status === 'ready' ? '在线' : remoteState.status === 'connecting' || remoteState.status === 'authenticating' || remoteState.status === 'backoff' ? '连接中' : remoteState.status === 'error' ? '不可用' : '未启动'}</strong><button className={`remote-toggle-button${remoteState.enabled ? ' stop' : ''}`} type="button" disabled={busy || remoteBusy} onClick={onRemoteToggle}>{remoteBusy ? <LoaderCircle className="spin" size={12} /> : remoteState.enabled ? <Square size={11} fill="currentColor" /> : <Play size={12} />}{remoteBusy ? '处理中' : remoteState.enabled ? '断开' : '开启'}</button></div></div>
+            <div className="dialog-footer"><button className="secondary-button" type="button" disabled={busy} onClick={onRefresh}><RotateCcw size={15} />刷新用量</button><button className="primary-button" type="button" disabled={busy} onClick={onOpenSite}><ExternalLink size={15} />前往网站</button></div>
+          </>
+        ) : state.status === 'authorizing' ? (
+          <>
+            <p className="recovery-copy">{state.message ?? '请在浏览器中完成授权'}</p>
+            <div className="dialog-footer"><button className="secondary-button" type="button" disabled={busy} onClick={onCancel}><X size={15} />取消授权</button></div>
+          </>
+        ) : (
+          <div className="dialog-footer"><button className="secondary-button" type="button" disabled={busy || !state.configured} onClick={onOpenSite}><ExternalLink size={15} />前往网站</button><button className="primary-button" type="button" disabled={busy || !state.configured} onClick={onAuthorize}>{busy ? <LoaderCircle className="spin" size={15} /> : <UserRound size={15} />}打开浏览器连接</button></div>
+        )}
+        {state.message ? <p className="hosted-dialog-message">{state.message}</p> : null}
+      </div>
+    </div>
+  )
+}
+
+function InfoTooltip({ children, className = '' }: { children: React.ReactNode; className?: string }): React.JSX.Element {
+  return <span className={`info-tooltip ${className}`} tabIndex={0} aria-label="信息"><Info size={13} aria-hidden="true" /><span className="info-tooltip-content" role="tooltip">{children}</span></span>
+}
+
+function animateModeSurface(
+  element: HTMLElement | null,
+  animationRef: { current: Animation | null },
+  reducedMotion: boolean,
+  fromOpacity: string,
+  fromTransform: string,
+  duration: number
+): void {
+  if (!element) return
+  const activeAnimation = animationRef.current?.playState === 'running' ? animationRef.current : null
+  const computed = getComputedStyle(element)
+  const startOpacity = activeAnimation ? computed.opacity : fromOpacity
+  const startTransform = activeAnimation && computed.transform !== 'none' ? computed.transform : fromTransform
+  animationRef.current?.cancel()
+
+  const animation = element.animate(
+    reducedMotion
+      ? [{ opacity: startOpacity }, { opacity: '1' }]
+      : [{ opacity: startOpacity, transform: startTransform }, { opacity: '1', transform: 'translate(0, 0)' }],
+    { duration: reducedMotion ? 140 : duration, easing: 'cubic-bezier(0.23, 1, 0.32, 1)' }
+  )
+  animationRef.current = animation
+  void animation.finished.then(() => {
+    if (animationRef.current === animation) animationRef.current = null
+  }).catch(() => undefined)
+}
+
 export default function App(): React.JSX.Element {
-  const [view, setView] = useState<ViewId>('workspace')
+  const { confirm: requestConfirm, dialog: confirmDialog } = useConfirmDialog()
+  const { prompt: requestPrompt, dialog: promptDialog } = usePromptDialog()
+  const [view, setView] = useState<ViewId>(initialDetachedView ?? 'workspace')
+  // 用户插件系统：注册表快照（零插件时为空，侧边栏不加任何分组）
+  const [pluginSnapshot, setPluginSnapshot] = useState<PluginSnapshot>({ plugins: [] })
+  useEffect(() => {
+    let disposed = false
+    void window.modmind.plugins.list().then((snapshot) => {
+      if (!disposed) setPluginSnapshot(snapshot)
+    }).catch(() => undefined)
+    const unsubscribe = window.modmind.plugins.onChanged((snapshot) => setPluginSnapshot(snapshot))
+    return () => {
+      disposed = true
+      unsubscribe()
+    }
+  }, [])
+  const [uiMode, setUiMode] = useState<UiMode>(() => {
+    try {
+      return localStorage.getItem('modmind-ui-mode') === 'advanced' ? 'advanced' : 'beginner'
+    } catch {
+      return 'beginner'
+    }
+  })
+  const uiModeRef = useRef<UiMode>(uiMode)
+  uiModeRef.current = uiMode
+  const [lastAdvancedView, setLastAdvancedView] = useState<ViewId>('workspace')
   const [project, setProject] = useState<ProjectInfo | null>(null)
   const [recentProjects, setRecentProjects] = useState<ProjectInfo[]>([])
-  const [projectLauncherOpen, setProjectLauncherOpen] = useState(true)
+  const [projectLauncherOpen, setProjectLauncherOpen] = useState(() => !isDetachedWindow)
   const [existingAnalysis, setExistingAnalysis] = useState<ExistingProjectAnalysis | null>(null)
   const [existingImportPicker, setExistingImportPicker] = useState(false)
+  const [existingInspecting, setExistingInspecting] = useState(false)
+  const [decompileJarHandoff, setDecompileJarHandoff] = useState<string | null>(null)
+  const [modJarInspection, setModJarInspection] = useState<DecompileInspectResult | null>(null)
+  const [modJarInspecting, setModJarInspecting] = useState(false)
   const [showCreate, setShowCreate] = useState(false)
+  const [renamingProject, setRenamingProject] = useState<ProjectInfo | null>(null)
   const [files, setFiles] = useState<FileNode[]>([])
   const [selectedFile, setSelectedFile] = useState('')
   const [editorContent, setEditorContent] = useState('')
   const [editorDirty, setEditorDirty] = useState(false)
-  const [prompt, setPrompt] = useState('')
+  const [workbenchUi, dispatchWorkbenchUi] = useReducer(workbenchUiReducer, initialWorkbenchUiState)
+  const {
+    prompt,
+    attachments: aiAttachments,
+    plan: aiPlan,
+    todo: aiTodo,
+    planning,
+    processingStartedAt,
+    taskState: beginnerTaskState,
+    timeline: aiTimeline,
+    outputStatus: aiOutputStatus,
+    recovery: aiRecovery
+  } = workbenchUi
+  const setWorkbenchValue = <Key extends keyof WorkbenchUiState>(key: Key, value: SetStateAction<WorkbenchUiState[Key]>): void => {
+    dispatchWorkbenchUi({ key, value })
+  }
+  const setPrompt = (value: SetStateAction<string>): void => setWorkbenchValue('prompt', value)
+  const setAiAttachments = (value: SetStateAction<AiAttachment[]>): void => setWorkbenchValue('attachments', value)
+  const setAiPlan = (value: SetStateAction<AiPlan | null>): void => setWorkbenchValue('plan', value)
+  const setAiTodo = (value: SetStateAction<WorkbenchUiState['todo']>): void => setWorkbenchValue('todo', value)
+  const setProcessingStartedAt = (value: SetStateAction<string | undefined>): void => setWorkbenchValue('processingStartedAt', value)
+  const setPlanning = (value: SetStateAction<boolean>): void => {
+    setWorkbenchValue('planning', value)
+    if (typeof value === 'boolean') setProcessingStartedAt(value ? (current) => current ?? new Date().toISOString() : undefined)
+  }
+  const setBeginnerTaskState = (value: SetStateAction<BeginnerTaskState>): void => setWorkbenchValue('taskState', value)
+  const setAiTimeline = (value: SetStateAction<AiTimelineItem[]>): void => setWorkbenchValue('timeline', value)
+  const setAiOutputStatus = (value: SetStateAction<WorkbenchUiState['outputStatus']>): void => setWorkbenchValue('outputStatus', value)
+  const setAiRecovery = (value: SetStateAction<AiRecoveryInfo | null>): void => setWorkbenchValue('recovery', value)
   const [events, setEvents] = useState<PipelineEvent[]>([])
   const [buildResult, setBuildResult] = useState<PreflightResult | null>(null)
   const [buildError, setBuildError] = useState('')
@@ -609,27 +1521,532 @@ export default function App(): React.JSX.Element {
   const [migrationVersion, setMigrationVersion] = useState('')
   const [migrationPreview, setMigrationPreview] = useState<ProjectMigrationPreview | null>(null)
   const [migrationBusy, setMigrationBusy] = useState(false)
-  const [buildTrustRequest, setBuildTrustRequest] = useState<BuildTrustRequest | null>(null)
-  const [settings, setSettings] = useState<AiSettings>(initialSettings)
-  const [notice, setNotice] = useState('')
-  const [aiPlan, setAiPlan] = useState<AiPlan | null>(null)
-  const [aiTodo, setAiTodo] = useState<Array<{ id: string; title: string; status: 'pending' | 'in_progress' | 'completed' }>>([])
-  const [planning, setPlanning] = useState(false)
+  const [settings, setSettings] = useState<AgentSettings>(initialSettings)
+  const settingsRef = useRef<AgentSettings>(initialSettings)
+  settingsRef.current = settings
+  const settingsMutationRef = useRef(0)
+  const settingsSaveTailRef = useRef(Promise.resolve())
+  const [runningBackend, setRunningBackend] = useState<CodingBackend | undefined>(undefined)
+  const [switchingBackend, setSwitchingBackend] = useState<CodingBackend | null>(null)
+  const backendSwitchCounterRef = useRef(0)
+  const backendSwitchGenerationRef = useRef(0)
+  const switchingBackendRef = useRef<CodingBackend | null>(null)
+  const pendingBackendSwitchRef = useRef<PendingBackendSwitch | null>(null)
+  const backendSwitchRequestsRef = useRef(new Map<number, PendingBackendSwitch>())
+  switchingBackendRef.current = switchingBackend
+  const [detectedJavaHomes, setDetectedJavaHomes] = useState<DetectedJavaHome[]>([])
+  const [javaScanState, setJavaScanState] = useState<'idle' | 'scanning' | 'done' | 'failed'>('idle')
+  const javaScanRequestedRef = useRef(false)
+  const [imageStudioSettings, setImageStudioSettings] = useState<ImageStudioSettings>({ baseUrl: 'https://ai.soulecho.cc/v1', model: 'gpt-image-2', hasStoredKey: false, allowAgentImages: true, autoApproveAgentImages: true, manualHostedConsent: true })
+  const [imageApiKey, setImageApiKey] = useState('')
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(false)
+  const [sidebarOrders, setSidebarOrders] = useState<Record<string, string[]>>({})
+  const [sidebarGroupOrder, setSidebarGroupOrder] = useState<string[]>([])
+  const [detachedSidebarItemIds, setDetachedSidebarItemIds] = useState<Set<ViewId>>(() => new Set())
+  const [detachedSidebarGroupKeys, setDetachedSidebarGroupKeys] = useState<Set<string>>(() => new Set())
+  const [sidebarDraggedId, setSidebarDraggedId] = useState<ViewId | null>(null)
+  const [sidebarDropTargetId, setSidebarDropTargetId] = useState<ViewId | null>(null)
+  const [sidebarDraggedGroupKey, setSidebarDraggedGroupKey] = useState<string | null>(null)
+  const [sidebarGroupDropTargetKey, setSidebarGroupDropTargetKey] = useState<string | null>(null)
+  const [detachedAlwaysOnTop, setDetachedAlwaysOnTop] = useState(false)
+  const [titlebarMenuOpen, setTitlebarMenuOpen] = useState(false)
+  const titlebarMenuRef = useRef<HTMLDivElement | null>(null)
+  const mainContentRef = useRef<HTMLElement | null>(null)
+  const viewScrollPositionsRef = useRef<Record<string, number>>({})
+  const modeAnimationRef = useRef<Animation | null>(null)
+  const sidebarNavRef = useRef<HTMLElement | null>(null)
+  const sidebarAnimationRef = useRef<Animation | null>(null)
+  const sidebarDragItemRef = useRef<SidebarDragItem | null>(null)
+  const sidebarDragGroupKeyRef = useRef<string | null>(null)
+  const sidebarDropHandledRef = useRef(false)
+  const sidebarDragScrollFrameRef = useRef<number | null>(null)
+  const sidebarDragScrollVelocityRef = useRef(0)
+  const sidebarLayoutSnapshotRef = useRef<Map<string, DOMRect>>(new Map())
+  const sidebarLayoutAnimationsRef = useRef<Map<string, Animation>>(new Map())
+  const pageSnapshotsRef = useRef<Map<string, DiagnosticPageSnapshot>>(new Map())
+  const previousUiModeRef = useRef(uiMode)
+  const [giteeSettings, setGiteeSettings] = useState<GiteeBuildSettings>({ repositoryUrl: '', branch: 'main', token: '' })
+  const [giteeValidation, setGiteeValidation] = useState<GiteeBuildValidation | null>(null)
+  const [giteeBuildResult, setGiteeBuildResult] = useState<GiteeBuildResult | null>(null)
+  const [giteeBuildBusy, setGiteeBuildBusy] = useState<'save' | 'validate' | 'build' | ''>('')
+  const [notice, setNoticeState] = useState('')
+  const setNotice = (message: string): void => {
+    // Advanced mode keeps failures available to the agent/diagnostics while
+    // removing noisy error toasts from the operator-facing surface.
+    if (uiModeRef.current === 'advanced' && /(failure|failed|error|unable|cannot|forbidden|timeout|insufficient|失败|错误|无法|不能|不足|异常|拒绝|超时|未通过|未完成)/i.test(message)) {
+      setNoticeState('')
+      return
+    }
+    setNoticeState(message)
+  }
+  const setErrorNotice = (message: string): void => {
+    if (uiModeRef.current !== 'advanced') setNoticeState(message)
+  }
+
+  const capturePageSnapshot = (): DiagnosticPageSnapshot | null => {
+    if (typeof document === 'undefined' || !document.documentElement) return null
+    const root = document.documentElement.cloneNode(true) as HTMLElement
+    root.querySelectorAll('script').forEach((script) => script.remove())
+    const originalControls = Array.from(document.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>('input, textarea, select'))
+    const clonedControls = Array.from(root.querySelectorAll<HTMLInputElement | HTMLTextAreaElement | HTMLSelectElement>('input, textarea, select'))
+    originalControls.forEach((original, index) => {
+      const clone = clonedControls[index]
+      if (!clone) return
+      if (original instanceof HTMLInputElement && original.type === 'password') {
+        clone.value = ''
+        clone.removeAttribute('value')
+        clone.setAttribute('data-modmind-redacted', 'true')
+      } else if (original instanceof HTMLInputElement) {
+        clone.setAttribute('value', original.value)
+        if (original.checked) clone.setAttribute('checked', 'checked')
+        else clone.removeAttribute('checked')
+      } else if (original instanceof HTMLTextAreaElement) {
+        clone.textContent = original.value
+      } else if (original instanceof HTMLSelectElement) {
+        const clonedSelect = clone as HTMLSelectElement
+        Array.from(clonedSelect.options).forEach((option, optionIndex) => {
+          if (original.options[optionIndex]?.selected) option.setAttribute('selected', 'selected')
+          else option.removeAttribute('selected')
+        })
+      }
+    })
+    root.querySelectorAll('.keep-alive-route[hidden]').forEach((route) => route.remove())
+    const snapshot: DiagnosticPageSnapshot = {
+      view,
+      title: document.title,
+      url: window.location.href,
+      capturedAt: new Date().toISOString(),
+      html: `<!doctype html>\n${root.outerHTML}`
+    }
+    pageSnapshotsRef.current.set(view, snapshot)
+    return snapshot
+  }
+
+  useEffect(() => {
+    pageSnapshotsRef.current.clear()
+  }, [project?.path])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => capturePageSnapshot(), 250)
+    return () => window.clearTimeout(timer)
+  }, [view, project?.path, uiMode])
+
+  useEffect(() => {
+    if (!isDetachedWindow) return
+    void window.modmind.app.getDetachedWindowState()
+      .then((state) => {
+        if (state) setDetachedAlwaysOnTop(state.alwaysOnTop)
+      })
+      .catch(() => undefined)
+  }, [])
+
+  useEffect(() => {
+    if (isDetachedWindow && !initialDetachedGroup) return
+    return window.modmind.app.onDetachedWindowClosed((closedTarget: DetachedWindowTarget) => {
+      if (closedTarget.startsWith('group:')) {
+        if (initialDetachedGroup) return
+        const groupKey = closedTarget.slice('group:'.length)
+        setDetachedSidebarGroupKeys((current) => {
+          if (!current.has(groupKey)) return current
+          const next = new Set(current)
+          next.delete(groupKey)
+          return next
+        })
+        return
+      }
+      const closedView = closedTarget as ViewId
+      setDetachedSidebarItemIds((current) => {
+        if (!current.has(closedView)) return current
+        const next = new Set(current)
+        next.delete(closedView)
+        return next
+      })
+    })
+  }, [])
+
+  useLayoutEffect(() => {
+    if (previousUiModeRef.current === uiMode) return
+    previousUiModeRef.current = uiMode
+    const element = mainContentRef.current
+    const reducedMotion = window.matchMedia?.('(prefers-reduced-motion: reduce)').matches ?? false
+    animateModeSurface(element, modeAnimationRef, reducedMotion, '0.78', 'translateY(5px)', 300)
+    animateModeSurface(sidebarNavRef.current, sidebarAnimationRef, reducedMotion, '0.86', 'translateX(-4px)', 260)
+  }, [uiMode])
+
+  useLayoutEffect(() => {
+    const element = mainContentRef.current
+    if (!element) return
+    const key = `${project?.path ?? 'launcher'}:${view}`
+    element.scrollTop = viewScrollPositionsRef.current[key] ?? 0
+    const rememberScroll = (): void => {
+      viewScrollPositionsRef.current[key] = element.scrollTop
+    }
+    element.addEventListener('scroll', rememberScroll, { passive: true })
+    return () => element.removeEventListener('scroll', rememberScroll)
+  }, [project?.path, projectLauncherOpen, view])
+
+  const navigateToView = (nextView: ViewId): void => {
+    const element = mainContentRef.current
+    if (element) {
+      const key = `${project?.path ?? 'launcher'}:${view}`
+      viewScrollPositionsRef.current[key] = element.scrollTop
+    }
+    setView(nextView)
+  }
+
+  useEffect(() => () => {
+    modeAnimationRef.current?.cancel()
+    sidebarAnimationRef.current?.cancel()
+  }, [])
+
+  const aiRunTokensRef = useRef<Map<string, number>>(new Map())
+  const nextAiRunToken = (projectPath: string): number => {
+    const key = normalizeProjectPath(projectPath)
+    const token = (aiRunTokensRef.current.get(key) ?? 0) + 1
+    aiRunTokensRef.current.set(key, token)
+    return token
+  }
+  const isCurrentAiRunToken = (projectPath: string, token: number): boolean => aiRunTokensRef.current.get(normalizeProjectPath(projectPath)) === token
+  const workspaceSessionRef = useRef('')
+  const [workbenchConversations, setWorkbenchConversations] = useState<WorkbenchConversation[]>([])
+  const [activeWorkbenchConversationId, setActiveWorkbenchConversationId] = useState('')
+  const activeWorkbenchConversationIdRef = useRef('')
+  activeWorkbenchConversationIdRef.current = activeWorkbenchConversationId
+  const workbenchConversationsLoadedRef = useRef(false)
+  const aiTimelineRef = useRef<AiTimelineItem[]>([])
+  aiTimelineRef.current = aiTimeline
+  const persistedWorkbenchIndexRef = useRef<Map<string, string>>(new Map())
+  const requestedWorkbenchIndexRef = useRef<Map<string, string>>(new Map())
+  const persistedWorkbenchTimelineRef = useRef<Map<string, string>>(new Map())
+  const requestedWorkbenchTimelineRef = useRef<Map<string, string>>(new Map())
+  const workbenchPersistenceGenerationRef = useRef(0)
+  const projectPathRef = useRef('')
+  projectPathRef.current = project?.path ?? ''
+  useEffect(() => {
+    let disposed = false
+    const projectPath = project?.path
+    if (!projectPath) {
+      workspaceSessionRef.current = ''
+      setPlanning(false)
+      setAiRecovery(null)
+      return () => { disposed = true }
+    }
+    workspaceSessionRef.current = ''
+    void Promise.all([
+      window.modmind.ai.getProjectTaskState(projectPath).catch(() => ({ codingSessionId: undefined, startedAt: undefined, backend: undefined, readOnlyTaskCount: 0 })),
+      window.modmind.ai.getRecovery(projectPath).catch(() => ({ pending: false, snapshot: null, sessionId: undefined, backend: undefined }))
+    ]).then(([taskState, recovery]) => {
+      if (disposed || projectPathRef.current !== projectPath) return
+      workspaceSessionRef.current = taskState.codingSessionId ?? recovery.sessionId ?? ''
+      setRunningBackend(taskState.backend ?? recovery.backend)
+      setPlanning(Boolean(taskState.startedAt))
+      setProcessingStartedAt(taskState.startedAt)
+      setAiOutputStatus(taskState.startedAt ? 'running' : 'idle')
+      setAiRecovery(recovery.pending ? recovery : null)
+    })
+    return () => { disposed = true }
+  }, [project?.path])
+  const workspacePromptHistoryRef = useRef<Map<string, string[]>>(new Map())
+  const cancelAi = (): void => {
+    // Pausing keeps the project checkpoint and Codex session for a later
+    // natural-language "继续" or explicit recovery.
+    setPlanning(false)
+    setRunningBackend(undefined)
+    setBeginnerTaskState('idle')
+    setAiOutputStatus('idle')
+    setAiTimeline((current) => settleWorkbenchActivity(current))
+    if (projectPathRef.current) nextAiRunToken(projectPathRef.current)
+    void window.modmind.ai.cancelCode(workspaceSessionRef.current || undefined, projectPathRef.current || undefined)
+  }
+  const activateWorkbenchConversation = (conversationId: string): void => {
+    setActiveWorkbenchConversationId(conversationId)
+    // Clearing the loaded key makes the timeline effect reload from the new
+    // conversation's own file; the plan/todo panel resets with it.
+    setAiHistoryLoadedKey('')
+    setAiTimeline([])
+    setAiPlan(null)
+    setAiTodo([])
+    workspaceSessionRef.current = ''
+    void window.modmind.ai.getProjectTaskState(projectPathRef.current || undefined).then((state) => {
+      if (state.activeConversationId && state.activeConversationId !== conversationId) return
+      if (state.codingSessionId) workspaceSessionRef.current = state.codingSessionId
+    }).catch(() => undefined)
+  }
+  const selectWorkbenchConversation = (conversationId: string): void => {
+    if (planning || conversationId === activeWorkbenchConversationId) return
+    if (!workbenchConversations.some((item) => item.id === conversationId)) return
+    activateWorkbenchConversation(conversationId)
+  }
+  const startWorkbenchConversation = async (): Promise<void> => {
+    if (planning) return
+    const created = createWorkbenchConversation(workbenchConversations)
+    const projectPath = projectPathRef.current
+    if (!projectPath) return
+    try {
+      await requireRedundantWorkbenchWrite(() => persistWorkbenchIndexNow(projectPath, created.conversations), '新对话索引')
+      setWorkbenchConversations(created.conversations)
+      // The new id is not present in this render's conversation array yet, so it
+      // must bypass selectWorkbenchConversation's stale-array membership guard.
+      activateWorkbenchConversation(created.conversation.id)
+    } catch (error) {
+      setNotice(`新建对话失败，未安全保存：${errorMessage(error)}`)
+    }
+  }
+  const deleteWorkbenchConversation = async (conversationId: string): Promise<void> => {
+    if (planning) return
+    const target = workbenchConversations.find((item) => item.id === conversationId)
+    if (!target) return
+    const remaining = removeWorkbenchConversation(workbenchConversations, conversationId)
+    if (!remaining.length) return
+    const projectPath = projectPathRef.current
+    if (!projectPath) return
+    try {
+      await requireRedundantWorkbenchWrite(() => persistWorkbenchIndexNow(projectPath, remaining), '删除后的对话索引')
+    } catch (error) {
+      setNotice(`删除对话已取消：无法安全保存索引（${errorMessage(error)}）`)
+      return
+    }
+    setWorkbenchConversations(remaining)
+    if (conversationId === activeWorkbenchConversationId) {
+      setActiveWorkbenchConversationId('')
+      setAiHistoryLoadedKey('')
+      setAiTimeline([])
+      setAiPlan(null)
+      setAiTodo([])
+      workspaceSessionRef.current = ''
+      window.setTimeout(() => {
+        setActiveWorkbenchConversationId(remaining[0].id)
+        void window.modmind.ai.getProjectTaskState(projectPathRef.current || undefined).then((state) => {
+          if (state.activeConversationId && state.activeConversationId !== remaining[0].id) return
+          if (state.codingSessionId) workspaceSessionRef.current = state.codingSessionId
+        }).catch(() => undefined)
+      }, 0)
+    }
+    if (projectPath) {
+      void window.modmind.project.deleteWorkbenchData(`.modmind/workbench-timeline-${conversationId}.json`, projectPath).catch(() => undefined)
+      if (isLegacyWorkbenchConversation(target)) {
+        // The original conversation keeps the pre-beta 'workspace' scope: its
+        // timeline and session pointer still live in the legacy single files.
+        void window.modmind.project.deleteWorkbenchData('.modmind/workbench-timeline.json', projectPath).catch(() => undefined)
+        void window.modmind.project.deleteWorkbenchData('.modmind/external-agents/session-codex.json', projectPath).catch(() => undefined)
+        void window.modmind.project.deleteWorkbenchData('.modmind/external-agents/session-claude.json', projectPath).catch(() => undefined)
+        try {
+          for (const backend of ['quota', 'codex', 'claude']) localStorage.removeItem(`${projectPath}:${backend}`)
+        } catch { /* storage is optional */ }
+      } else {
+        void window.modmind.project.deleteWorkbenchData(`.modmind/external-agents/sessions/workspace/${conversationId}`, projectPath).catch(() => undefined)
+      }
+      try { localStorage.removeItem(`${projectPath}:${settings.codingBackend}:${conversationId}`) } catch { /* storage is optional */ }
+    }
+  }
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape' || !planning) return
+      event.preventDefault()
+      cancelAi()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [planning])
+
+  useEffect(() => {
+    if (!planning) setAiTimeline((current) => settleWorkbenchActivity(current))
+  }, [planning])
+  const [deviceState, setDeviceState] = useState<DeviceConnectionState>({ status: 'disconnected', configured: false })
+  const [remoteState, setRemoteState] = useState<RemoteConnectionState>({ status: 'disabled', enabled: false })
+  const [mcpBridgeState, setMcpBridgeState] = useState<McpBridgeState>({ enabled: false, running: false, projectPath: null, projectName: null, mcpConfigPath: null, startedAt: null })
+  const [mcpBridgeBusy, setMcpBridgeBusy] = useState(false)
+  const [deviceBusy, setDeviceBusy] = useState(false)
+  const [remoteBusy, setRemoteBusy] = useState(false)
+  const [deviceAccountOpen, setDeviceAccountOpen] = useState(false)
+  const [beginnerAiPreferences, setBeginnerAiPreferences] = useState<BeginnerAiPreferences>({ model: 'gpt-5.6-sol', reasoningLevel: 'medium', fastMode: false })
+  const [beginnerAvailableModels, setBeginnerAvailableModels] = useState<AiModelInfo[]>([])
+  const [scanningBeginnerModels, setScanningBeginnerModels] = useState(false)
+  const [beginnerModelScanMessage, setBeginnerModelScanMessage] = useState('连接账号后扫描可用模型')
   const [availableModels, setAvailableModels] = useState<AiModelInfo[]>([])
   const [modelSearch, setModelSearch] = useState('')
   const [scanningModels, setScanningModels] = useState(false)
-  const [modelScanMessage, setModelScanMessage] = useState('输入 API Key 后自动扫描')
-  const [aiOutput, setAiOutput] = useState('AI 的结构化响应会显示在这里。')
-  const [aiTimeline, setAiTimeline] = useState<AiTimelineItem[]>([])
-  const [aiOutputStatus, setAiOutputStatus] = useState<'idle' | 'running' | 'success' | 'error'>('idle')
+  const [savingAiPreferences, setSavingAiPreferences] = useState(false)
+  const [exportArtifactAvailable, setExportArtifactAvailable] = useState(false)
+  const [diagnosticExporting, setDiagnosticExporting] = useState(false)
+  const [updateInfo, setUpdateInfo] = useState<AppVersionCheckResult | null>(null)
+  const [appUpdateState, setAppUpdateState] = useState<AppUpdateState>({ phase: 'idle', currentVersion: '' })
+  const [updateDownloadedOpen, setUpdateDownloadedOpen] = useState(false)
+  const [updateActionBusy, setUpdateActionBusy] = useState(false)
+  const [modelScanMessage, setModelScanMessage] = useState('输入 API Key 后扫描')
   const [externalAgents, setExternalAgents] = useState<ExternalAgentStatus[]>([])
   const [externalAgentsReady, setExternalAgentsReady] = useState(false)
-  const [installingAgents, setInstallingAgents] = useState<Partial<Record<'codex' | 'claude', boolean>>>({})
-  const aiFollowBottomRef = useRef(true)
+  const [installingAgents, setInstallingAgents] = useState<Partial<Record<ExternalAgentKind, boolean>>>({})
+  const [configuringAgents, setConfiguringAgents] = useState<Partial<Record<ExternalAgentKind, boolean>>>({})
+  const [editingAgent, setEditingAgent] = useState<ExternalAgentKind | null>(null)
+  const [agentDraft, setAgentDraft] = useState<ExternalAgentConfiguration>({})
   const [aiHistoryLoadedKey, setAiHistoryLoadedKey] = useState('')
-  const aiOutputHistoryKey = project ? `modmind-ai-output:${project.path}:${settings.codingBackend}` : ''
+  const [workbenchPersistenceState, setWorkbenchPersistenceState] = useState<WorkbenchPersistenceState>('loading')
+  const [workbenchPersistenceMessage, setWorkbenchPersistenceMessage] = useState('正在读取对话')
+  const aiOutputHistoryPath = project && activeWorkbenchConversationId ? `.modmind/workbench-timeline-${activeWorkbenchConversationId}.json` : ''
+  // One conversation has one timeline across all execution backends.
+  const aiOutputHistoryKey = project && activeWorkbenchConversationId ? `${project.path}:${activeWorkbenchConversationId}` : ''
+  const workbenchConversationsFile = '.modmind/workbench-conversations.json'
+  const legacyWorkbenchTimelineFile = '.modmind/workbench-timeline.json'
+  const applyWorkbenchWriteResult = (result: Awaited<ReturnType<typeof window.modmind.project.writeWorkbenchData>>, generation: number): void => {
+    if (generation !== workbenchPersistenceGenerationRef.current) return
+    if (result.durability === 'redundant') {
+      setWorkbenchPersistenceState('saved')
+      setWorkbenchPersistenceMessage('已双重保存')
+      return
+    }
+    setWorkbenchPersistenceState('degraded')
+    setWorkbenchPersistenceMessage(result.warning ?? '对话已保存，但冗余备份未全部完成')
+  }
+  const persistWorkbenchIndexNow = async (projectPath: string, conversations: WorkbenchConversation[]): Promise<Awaited<ReturnType<typeof window.modmind.project.writeWorkbenchData>>> => {
+    const content = JSON.stringify(conversations)
+    const key = `${projectPath}\n${workbenchConversationsFile}`
+    requestedWorkbenchIndexRef.current.set(key, content)
+    const generation = ++workbenchPersistenceGenerationRef.current
+    setWorkbenchPersistenceState('saving')
+    setWorkbenchPersistenceMessage('正在保存对话索引')
+    try {
+      const result = await window.modmind.project.writeWorkbenchData(workbenchConversationsFile, content, projectPath)
+      if (requestedWorkbenchIndexRef.current.get(key) === content) persistedWorkbenchIndexRef.current.set(key, content)
+      applyWorkbenchWriteResult(result, generation)
+      return result
+    } catch (error) {
+      if (requestedWorkbenchIndexRef.current.get(key) === content) requestedWorkbenchIndexRef.current.delete(key)
+      if (generation === workbenchPersistenceGenerationRef.current) {
+        setWorkbenchPersistenceState('error')
+        setWorkbenchPersistenceMessage(`对话索引保存失败：${errorMessage(error)}`)
+      }
+      throw error
+    }
+  }
+  const persistWorkbenchTimelineNow = async (
+    projectPath: string,
+    historyPath: string,
+    historyKey: string,
+    timeline: AiTimelineItem[]
+  ): Promise<Awaited<ReturnType<typeof window.modmind.project.writeWorkbenchData>>> => {
+    const content = JSON.stringify(timeline)
+    const key = `${projectPath}\n${historyKey}`
+    requestedWorkbenchTimelineRef.current.set(key, content)
+    const generation = ++workbenchPersistenceGenerationRef.current
+    setWorkbenchPersistenceState('saving')
+    setWorkbenchPersistenceMessage('正在保存对话')
+    try {
+      const result = await window.modmind.project.writeWorkbenchData(historyPath, content, projectPath)
+      if (requestedWorkbenchTimelineRef.current.get(key) === content) persistedWorkbenchTimelineRef.current.set(key, content)
+      applyWorkbenchWriteResult(result, generation)
+      return result
+    } catch (error) {
+      if (requestedWorkbenchTimelineRef.current.get(key) === content) requestedWorkbenchTimelineRef.current.delete(key)
+      if (generation === workbenchPersistenceGenerationRef.current) {
+        setWorkbenchPersistenceState('error')
+        setWorkbenchPersistenceMessage(`对话保存失败：${errorMessage(error)}`)
+      }
+      throw error
+    }
+  }
+  const requireRedundantWorkbenchWrite = async (
+    operation: () => Promise<Awaited<ReturnType<typeof window.modmind.project.writeWorkbenchData>>>,
+    label: string
+  ): Promise<void> => {
+    let lastWarning = ''
+    for (let attempt = 0; attempt < 3; attempt += 1) {
+      const result = await operation()
+      if (result.durability === 'redundant') return
+      lastWarning = result.warning ?? '冗余副本未完成'
+      await new Promise((resolve) => window.setTimeout(resolve, 150 * (attempt + 1)))
+    }
+    throw new Error(`${label}未完成双重落盘：${lastWarning}`)
+  }
+  // Load the conversation index when a project opens. Legacy projects with a
+  // single anonymous workspace thread become one conversation that keeps the
+  // legacy 'workspace' scope so its CLI session pointer still resumes.
+  //
+  // Migration renders first: the legacy timeline is shown immediately, adopted
+  // by the per-conversation load path below, and the legacy file is deleted
+  // only after the new per-conversation file has been written successfully.
+  // If the index load fails, the active conversation stays hidden so the
+  // timeline save effect cannot overwrite anything.
+  useEffect(() => {
+    workbenchConversationsLoadedRef.current = false
+    setWorkbenchConversations([])
+    setActiveWorkbenchConversationId('')
+    setWorkbenchPersistenceState('loading')
+    setWorkbenchPersistenceMessage('正在读取对话索引')
+    if (!project?.path) return
+    let cancelled = false
+    const projectPath = project.path
+    const readOptionalLocalStorage = (key: string): string => {
+      try { return localStorage.getItem(key) ?? '' } catch { return '' }
+    }
+    const readLegacyTimeline = async (): Promise<{ history: AiTimelineItem[]; durable: boolean }> => {
+      const stored = await window.modmind.project.readWorkbenchData(legacyWorkbenchTimelineFile, projectPath)
+      if (stored.status === 'unavailable') throw new Error(stored.message ?? '旧版对话无法安全读取')
+      const fallback = stored.status === 'missing' ? readOptionalLocalStorage(`${projectPath}:${settings.codingBackend}`) : ''
+      const raw = stored.status === 'ok' ? stored.content ?? '' : fallback
+      if (!raw) return { history: [], durable: stored.status === 'ok' }
+      const parsed = JSON.parse(raw) as unknown
+      if (!Array.isArray(parsed)) throw new Error('旧版对话数据格式无效')
+      return { history: parseStoredWorkbenchTimeline(parsed), durable: stored.status === 'ok' }
+    }
+    const loadIndex = async (): Promise<void> => {
+      try {
+        const stored = await window.modmind.project.readWorkbenchData(workbenchConversationsFile, projectPath)
+        if (stored.status === 'unavailable') throw new Error(stored.message ?? '对话索引无法安全读取')
+        const fallback = stored.status === 'missing' ? readOptionalLocalStorage(`modmind-workbench-conversations:${projectPath}`) : ''
+        const raw = stored.status === 'ok' ? stored.content ?? '' : fallback
+        let conversations: WorkbenchConversation[] = []
+        if (raw) {
+          const parsed = JSON.parse(raw) as unknown
+          if (!Array.isArray(parsed)) throw new Error('对话索引格式无效')
+          conversations = normalizeWorkbenchConversations(parsed)
+          if (parsed.length > 0 && conversations.length === 0) throw new Error('对话索引中没有可安全恢复的条目')
+        }
+        const indexPersistenceKey = `${projectPath}\n${workbenchConversationsFile}`
+        if (stored.status === 'ok') persistedWorkbenchIndexRef.current.set(indexPersistenceKey, JSON.stringify(conversations))
+        else persistedWorkbenchIndexRef.current.delete(indexPersistenceKey)
+        if (!conversations.length) {
+          const legacy = await readLegacyTimeline()
+          if (cancelled) return
+          setAiTimeline(legacy.history)
+          conversations = [migrateLegacyConversation(legacy.history.length)]
+        }
+        const activeId = conversations[0]?.id ?? ''
+        if (cancelled) return
+        setWorkbenchConversations(conversations)
+        setActiveWorkbenchConversationId(activeId)
+        workbenchConversationsLoadedRef.current = true
+        setWorkbenchPersistenceState('ready')
+        setWorkbenchPersistenceMessage(stored.recovered ? stored.warning ?? '对话已恢复' : '对话索引已加载')
+      } catch (error) {
+        if (cancelled) return
+        workbenchConversationsLoadedRef.current = false
+        setWorkbenchPersistenceState('error')
+        setWorkbenchPersistenceMessage(`对话索引加载失败：${errorMessage(error)}`)
+      }
+    }
+    void loadIndex()
+    return () => { cancelled = true }
+  }, [project?.path])
+  useEffect(() => {
+    if (!project?.path || !workbenchConversationsLoadedRef.current) return
+    const content = JSON.stringify(workbenchConversations)
+    const key = `${project.path}\n${workbenchConversationsFile}`
+    if (persistedWorkbenchIndexRef.current.get(key) === content || requestedWorkbenchIndexRef.current.get(key) === content) return
+    void persistWorkbenchIndexNow(project.path, workbenchConversations).catch(() => undefined)
+  }, [workbenchConversations, project?.path])
+  useEffect(() => {
+    if (!titlebarMenuOpen) return
+    const closeOnOutsidePointer = (event: PointerEvent): void => {
+      const target = event.target
+      if (target instanceof Node && !titlebarMenuRef.current?.contains(target)) setTitlebarMenuOpen(false)
+    }
+    document.addEventListener('pointerdown', closeOnOutsidePointer)
+    return () => document.removeEventListener('pointerdown', closeOnOutsidePointer)
+  }, [titlebarMenuOpen])
 
-  const humanizeActivity = (value: string): string => value
+  const humanizeActivity = (value: string): string => {
+    const humanized = value
     .replaceAll('Agent analyzing the project', 'AI 正在分析项目')
     .replaceAll('Reading files and planning tool calls', '读取文件并规划下一步操作')
     .replaceAll('Agent task started; inspecting the project', 'AI 已开始检查项目')
@@ -643,30 +2060,176 @@ export default function App(): React.JSX.Element {
     .replaceAll('Passed build after', '构建验证通过，已完成')
     .replaceAll('tool steps', '个操作')
     .replaceAll('Agent step', 'AI 操作')
+    return uiMode === 'beginner'
+      ? humanized.replaceAll('Codex', '智能开发引擎').replaceAll('Claude Code', '智能开发引擎')
+      : humanized
+  }
 
-  const humanizeOutput = (value: string): string => value
-    .replaceAll('Invalid Agent response; requesting one valid action:', 'AI 返回格式需要调整，正在重试：')
-    .replaceAll('The model failed the Agent protocol 3 times:', 'AI 连续 3 次没有按要求返回操作：')
-    .replaceAll('The AI model did not respond within 10 minutes.', 'AI 超过 10 分钟没有响应。')
-    .replaceAll('Unable to connect to the AI service:', '无法连接 AI 服务：')
-  const [aiRecovery, setAiRecovery] = useState<AiRecoveryInfo | null>(null)
-  const [recoveryBusy, setRecoveryBusy] = useState(false)
+  const humanizeOutput = (value: string): string => {
+    const humanized = value
+      .replaceAll('Invalid Agent response; requesting one valid action:', '上游没有按 Agent 协议返回可执行操作，正在重试：')
+      .replaceAll('The model failed the Agent protocol 3 times:', '上游连续 3 次没有按 Agent 协议返回可执行操作：')
+      .replaceAll('The AI model did not respond within 10 minutes.', '上游模型在等待 10 分钟后没有返回任何内容，请稍后重试或切换线路')
+      .replaceAll('Unable to connect to the AI service:', '无法连接 AI 服务：')
+    return /(?:上游模型|模型服务|Codex|Claude|AI 服务).*(?:失败|拒绝|不可用|超时|中断|参数|额度|凭证|没有返回|429|4\d\d|5\d\d)/i.test(humanized)
+      ? aiFailureMessage(humanized)
+      : humanized
+  }
+  const projectWorkbenchCacheRef = useRef<Map<string, ProjectWorkbenchState>>(new Map())
+  const activeWorkbenchProjectRef = useRef('')
+  const currentWorkbenchStateRef = useRef<ProjectWorkbenchState | null>(null)
+  currentWorkbenchStateRef.current = {
+    prompt,
+    attachments: aiAttachments,
+    events,
+    aiPlan,
+    aiTodo,
+    planning,
+    processingStartedAt,
+    runningBackend,
+    switchingBackend,
+    workspaceSession: workspaceSessionRef.current,
+    conversations: workbenchConversations,
+    activeConversationId: activeWorkbenchConversationId,
+    aiTimeline,
+    aiOutputStatus,
+    aiRecovery,
+    beginnerTaskState,
+    files,
+    selectedFile,
+    editorContent,
+    editorDirty,
+    buildResult,
+    buildError,
+    building,
+    snapshots,
+    exportArtifactAvailable,
+    minecraftEvents
+  }
+  useEffect(() => {
+    const nextProjectPath = project?.path ?? ''
+    const previousProjectPath = activeWorkbenchProjectRef.current
+    if (previousProjectPath && previousProjectPath !== nextProjectPath && currentWorkbenchStateRef.current) {
+      projectWorkbenchCacheRef.current.set(normalizeProjectPath(previousProjectPath), currentWorkbenchStateRef.current)
+    }
+    const cached = nextProjectPath ? projectWorkbenchCacheRef.current.get(normalizeProjectPath(nextProjectPath)) : undefined
+    const restored = cached ?? emptyProjectWorkbenchState()
+    setPrompt(restored.prompt)
+    setAiAttachments(restored.attachments)
+    setEvents(restored.events)
+    setAiPlan(restored.aiPlan)
+    setAiTodo(restored.aiTodo)
+    setPlanning(restored.planning)
+    setProcessingStartedAt(restored.processingStartedAt)
+    setRunningBackend(restored.runningBackend)
+    setSwitchingBackend(restored.switchingBackend ?? null)
+    workspaceSessionRef.current = restored.workspaceSession
+    if (restored.conversations.length) {
+      setWorkbenchConversations(restored.conversations)
+      workbenchConversationsLoadedRef.current = true
+      setActiveWorkbenchConversationId(restored.activeConversationId || restored.conversations[0].id)
+    }
+    setAiTimeline(restored.planning ? restored.aiTimeline : settleWorkbenchActivity(restored.aiTimeline))
+    setAiOutputStatus(restored.aiOutputStatus)
+    setAiRecovery(restored.aiRecovery)
+    setBeginnerTaskState(restored.beginnerTaskState)
+    setFiles(restored.files)
+    setSelectedFile(restored.selectedFile)
+    setEditorContent(restored.editorContent)
+    setEditorDirty(restored.editorDirty)
+    setBuildResult(restored.buildResult)
+    setBuildError(restored.buildError)
+    setBuilding(restored.building)
+    setSnapshots(restored.snapshots)
+    setExportArtifactAvailable(restored.exportArtifactAvailable)
+    setMinecraftEvents(restored.minecraftEvents)
+    activeWorkbenchProjectRef.current = nextProjectPath
+  }, [project?.path])
+  useEffect(() => () => {
+    const active = activeWorkbenchProjectRef.current
+    if (active && currentWorkbenchStateRef.current) projectWorkbenchCacheRef.current.set(normalizeProjectPath(active), currentWorkbenchStateRef.current)
+  }, [])
+  const isForegroundProject = (projectPath: string): boolean => normalizeProjectPath(projectPathRef.current) === normalizeProjectPath(projectPath)
+  const storeProjectPlan = (projectPath: string, plan: AiPlan & { todo?: ProjectWorkbenchState['aiTodo'] }): void => {
+    const todo = plan.todo ?? plan.tasks.map((task, index) => ({ id: `T${index + 1}`, title: task, status: 'completed' as const }))
+    if (isForegroundProject(projectPath)) {
+      setAiPlan(plan)
+      setAiTodo(todo)
+      setPrompt('')
+      setAiAttachments([])
+      setPlanning(false)
+      setAiOutputStatus('success')
+      setBeginnerTaskState('success')
+      return
+    }
+    const current = projectWorkbenchCacheRef.current.get(normalizeProjectPath(projectPath)) ?? emptyProjectWorkbenchState()
+    projectWorkbenchCacheRef.current.set(normalizeProjectPath(projectPath), {
+      ...current,
+      aiPlan: plan,
+      aiTodo: todo,
+      prompt: '',
+      attachments: [],
+      planning: false,
+      aiOutputStatus: 'success',
+      beginnerTaskState: 'success'
+    })
+  }
   const [mappingQuery, setMappingQuery] = useState('')
   const [mappingResults, setMappingResults] = useState<MappingClassResult[]>([])
   const [mappingDetail, setMappingDetail] = useState<MappingClassDetail | null>(null)
   const [mappingMemberQuery, setMappingMemberQuery] = useState('')
   const [mappingBusy, setMappingBusy] = useState(false)
-  const [mappingMessage, setMappingMessage] = useState('输入任意命名空间中的类名，例如 Item、class_1792 或 C_1381_。')
+  const [mappingMessage, setMappingMessage] = useState('输入任意命名空间中的类名，例如 Item、class_1792 或 C_1381_')
+
+  const refreshFilesFor = async (projectPath: string): Promise<void> => {
+    const nextFiles = await window.modmind.project.listFiles(projectPath)
+    if (normalizeProjectPath(projectPathRef.current) === normalizeProjectPath(projectPath)) setFiles(nextFiles)
+    else {
+      const key = normalizeProjectPath(projectPath)
+      const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+      projectWorkbenchCacheRef.current.set(key, {...current, files: nextFiles})
+    }
+  }
 
   const refreshFiles = async (): Promise<void> => {
-    if (!project) return
-    setFiles(await window.modmind.project.listFiles())
+    if (project) await refreshFilesFor(project.path)
+  }
+
+  const refreshSnapshotsFor = async (projectPath: string): Promise<void> => {
+    const nextSnapshots = await window.modmind.snapshots.list(projectPath)
+    if (isForegroundProject(projectPath)) setSnapshots(nextSnapshots)
+    else {
+      const key = normalizeProjectPath(projectPath)
+      const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+      projectWorkbenchCacheRef.current.set(key, {...current, snapshots: nextSnapshots})
+    }
   }
 
   const refreshSnapshots = async (): Promise<void> => {
-    if (!project) return
-    setSnapshots(await window.modmind.snapshots.list())
+    if (project) await refreshSnapshotsFor(project.path)
   }
+
+  const refreshExportArtifactFor = async (projectPath: string): Promise<void> => {
+    const available = await window.modmind.project.hasExportArtifact(projectPath).catch(() => false)
+    if (isForegroundProject(projectPath)) setExportArtifactAvailable(available)
+    else {
+      const key = normalizeProjectPath(projectPath)
+      const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+      projectWorkbenchCacheRef.current.set(key, {...current, exportArtifactAvailable: available})
+    }
+  }
+
+  const refreshExportArtifact = async (): Promise<void> => {
+    if (project) await refreshExportArtifactFor(project.path)
+  }
+
+  useEffect(() => {
+    if (!project) {
+      setExportArtifactAvailable(false)
+      return
+    }
+    void refreshExportArtifactFor(project.path)
+  }, [project?.path])
 
   const refreshRecentProjects = async (): Promise<void> => {
     setRecentProjects(await window.modmind.project.listRecent())
@@ -675,80 +2238,231 @@ export default function App(): React.JSX.Element {
   useEffect(() => {
     if (!aiOutputHistoryKey) {
       setAiTimeline([])
-      setAiOutput('AI 的结构化响应会显示在这里。')
       setAiHistoryLoadedKey('')
+      setWorkbenchPersistenceState('loading')
+      setWorkbenchPersistenceMessage('正在等待对话索引')
       return
     }
-    let history: AiTimelineItem[] = []
-    try {
-      const value = JSON.parse(localStorage.getItem(aiOutputHistoryKey) ?? '[]') as unknown
-      if (Array.isArray(value)) history = value
-        .filter((item): item is AiTimelineItem => Boolean(item && typeof item === 'object' && typeof (item as AiTimelineItem).id === 'string' && typeof (item as AiTimelineItem).content === 'string' && typeof (item as AiTimelineItem).kind === 'string' && typeof (item as AiTimelineItem).time === 'string'))
-        .map(normalizeStoredTimelineItem)
-    } catch {
-      history = []
-    }
-    aiFollowBottomRef.current = true
-    setAiTimeline(history)
-    setAiOutput(history.length ? aiTimelineOutput(history) : 'AI 的结构化响应会显示在这里。')
-    setAiHistoryLoadedKey(aiOutputHistoryKey)
     let cancelled = false
-    if (settings.codingBackend !== 'internal') {
-      void window.modmind.externalAgents.history(settings.codingBackend).then((context) => {
-        if (cancelled || !context.trim()) return
-        const label = settings.codingBackend === 'codex' ? 'Codex' : 'Claude Code'
-        const marker = `[已恢复的 ${label} 对话上下文]`
-        setAiOutput((current) => current.includes(marker) ? current : `${marker}\n${context}\n\n${current}`)
-        setAiTimeline((current) => {
-          if (current.some((item) => item.kind === 'history' && item.content.includes(marker))) return current
-          return [{ id: `history-${settings.codingBackend}-${Date.now()}`, kind: 'history', content: `${marker}\n${context}`, time: new Date().toISOString() }, ...current]
-        })
-      }).catch(() => undefined)
+    const historyProjectPath = project?.path ?? ''
+    const historyConversationId = activeWorkbenchConversationId
+    setWorkbenchPersistenceState('loading')
+    setWorkbenchPersistenceMessage('正在校验对话历史')
+    const loadHistory = async (): Promise<void> => {
+      try {
+        let stored = await window.modmind.project.readWorkbenchData(aiOutputHistoryPath, historyProjectPath)
+        if (stored.status === 'unavailable') throw new Error(stored.message ?? '对话历史无法通过完整性校验')
+        let migratedFromLegacy = false
+        if (stored.status === 'missing' && activeWorkbenchConversationId === WORKBENCH_LEGACY_SCOPE) {
+          const legacy = await window.modmind.project.readWorkbenchData(legacyWorkbenchTimelineFile, historyProjectPath)
+          if (legacy.status === 'unavailable') throw new Error(legacy.message ?? '旧版对话历史无法通过完整性校验')
+          if (legacy.status === 'ok') {
+            stored = legacy
+            migratedFromLegacy = true
+          }
+        }
+        const legacyBackendKey = project?.path ? `${project.path}:${settings.codingBackend}:${activeWorkbenchConversationId}` : ''
+        let localFallback = ''
+        if (stored.status === 'missing') {
+          try { localFallback = localStorage.getItem(aiOutputHistoryKey) || (legacyBackendKey ? localStorage.getItem(legacyBackendKey) : '') || '' } catch { /* migration source is optional */ }
+        }
+        const raw = stored.status === 'ok' ? stored.content ?? '' : localFallback
+        let history: AiTimelineItem[] = []
+        if (raw) {
+          const parsed = JSON.parse(raw) as unknown
+          if (!Array.isArray(parsed)) throw new Error('对话历史格式无效')
+          history = parseStoredWorkbenchTimeline(parsed)
+        }
+        if (cancelled || normalizeProjectPath(projectPathRef.current) !== normalizeProjectPath(historyProjectPath) || activeWorkbenchConversationIdRef.current !== historyConversationId) return
+        const persistenceKey = `${historyProjectPath}\n${aiOutputHistoryKey}`
+        const needsMigration = migratedFromLegacy || Boolean(localFallback)
+        if (stored.status === 'ok' && !needsMigration) persistedWorkbenchTimelineRef.current.set(persistenceKey, JSON.stringify(history))
+        else if (stored.status === 'missing' && !needsMigration) persistedWorkbenchTimelineRef.current.set(persistenceKey, '[]')
+        else persistedWorkbenchTimelineRef.current.delete(persistenceKey)
+        requestedWorkbenchTimelineRef.current.delete(persistenceKey)
+        setAiTimeline(history)
+        setAiHistoryLoadedKey(aiOutputHistoryKey)
+        setWorkbenchPersistenceState('ready')
+        setWorkbenchPersistenceMessage(stored.recovered ? stored.warning ?? '对话已从备份恢复' : needsMigration ? '正在迁移旧版对话' : '对话历史已校验')
+      } catch (error) {
+        if (cancelled || normalizeProjectPath(projectPathRef.current) !== normalizeProjectPath(historyProjectPath) || activeWorkbenchConversationIdRef.current !== historyConversationId) return
+        setAiHistoryLoadedKey('')
+        setWorkbenchPersistenceState('error')
+        setWorkbenchPersistenceMessage(`对话历史加载失败：${errorMessage(error)}；已阻止覆盖`)
+      }
     }
+    void loadHistory()
     return () => { cancelled = true }
-  }, [aiOutputHistoryKey])
+  }, [aiOutputHistoryKey, activeWorkbenchConversationId])
 
   useEffect(() => {
-    if (!aiOutputHistoryKey || aiHistoryLoadedKey !== aiOutputHistoryKey) return
-    try {
-      localStorage.setItem(aiOutputHistoryKey, JSON.stringify(aiTimeline))
-    } catch {
-      // Keep the live timeline even when the browser storage quota is full.
-    }
+    if (!project || !aiOutputHistoryKey || aiHistoryLoadedKey !== aiOutputHistoryKey) return
+    const content = JSON.stringify(aiTimeline)
+    const persistenceKey = `${project.path}\n${aiOutputHistoryKey}`
+    if (persistedWorkbenchTimelineRef.current.get(persistenceKey) === content || requestedWorkbenchTimelineRef.current.get(persistenceKey) === content) return
+    void persistWorkbenchTimelineNow(project.path, aiOutputHistoryPath, aiOutputHistoryKey, aiTimeline).then(async () => {
+      if (activeWorkbenchConversationId === WORKBENCH_LEGACY_SCOPE) {
+        await window.modmind.project.deleteWorkbenchData(legacyWorkbenchTimelineFile, project.path).catch(() => undefined)
+      }
+      try {
+        localStorage.removeItem(aiOutputHistoryKey)
+        localStorage.removeItem(`${project.path}:${settings.codingBackend}:${activeWorkbenchConversationId}`)
+        localStorage.removeItem(`${project.path}:${settings.codingBackend}`)
+      } catch { /* legacy browser storage is no longer authoritative */ }
+    }).catch(() => undefined)
   }, [aiTimeline, aiHistoryLoadedKey, aiOutputHistoryKey])
 
   useEffect(() => {
-    if (!aiFollowBottomRef.current) return
-    const element = document.querySelector<HTMLElement>('.ai-timeline')
-    if (!element) return
-    const frame = window.requestAnimationFrame(() => element.scrollTo({top: element.scrollHeight, behavior: 'smooth'}))
-    return () => window.cancelAnimationFrame(frame)
-  }, [aiTimeline])
-
+    if (settings.codingBackend === 'quota') return
+    const activeAgent = settings.codingBackend
+    void window.modmind.externalAgents.history(activeAgent).then(() => undefined).catch(() => undefined)
+  }, [settings.codingBackend])
   useEffect(() => {
-    const element = document.querySelector<HTMLElement>('.ai-timeline')
-    if (!element) return
-    const updateFollowState = (): void => {
-      aiFollowBottomRef.current = element.scrollHeight - element.scrollTop - element.clientHeight <= 24
+    const applyDeviceState = (state: DeviceConnectionState): void => {
+      setDeviceState(state)
+      if (state.status !== 'connected') {
+        setBeginnerAvailableModels([])
+        return
+      }
+      void Promise.all([
+        window.modmind.device.getAiPreferences(),
+        window.modmind.device.listModels().catch(() => [] as AiModelInfo[])
+      ]).then(([preferences, models]) => {
+        setBeginnerAiPreferences(preferences)
+        setBeginnerAvailableModels(models)
+        setBeginnerModelScanMessage(models.length ? `发现 ${models.length} 个可用模型` : '账号服务没有返回可用模型')
+      }).catch(() => undefined)
     }
-    element.addEventListener('scroll', updateFollowState, {passive: true})
-    return () => element.removeEventListener('scroll', updateFollowState)
-  }, [aiHistoryLoadedKey, view])
-
-  useEffect(() => {
     void Promise.all([window.modmind.project.current(), window.modmind.project.listRecent()]).then(([current, recent]) => {
       setProject(current)
       setRecentProjects(recent)
-      setProjectLauncherOpen(!current)
-      if (current) void window.modmind.ai.getRecovery().then((recovery) => { if (recovery.pending) setAiRecovery(recovery) })
+      setProjectLauncherOpen(isDetachedWindow ? false : !current)
+      if (current) void window.modmind.project.hasExportArtifact(current.path).then(setExportArtifactAvailable).catch(() => setExportArtifactAvailable(false))
     })
-    void window.modmind.settings.getAi().then(setSettings)
+    void window.modmind.settings.getAgent().then((value) => { settingsRef.current = value; setSettings(value) })
+    void window.modmind.imageStudio.getSettings().then(setImageStudioSettings).catch(() => undefined)
+    void window.modmind.device.getState().then(applyDeviceState).catch(() => undefined)
+    void window.modmind.remote.getState().then(setRemoteState).catch(() => undefined)
+    void window.modmind.mcpBridge.getState().then(setMcpBridgeState).catch(() => undefined)
+    void window.modmind.device.getAiPreferences().then(setBeginnerAiPreferences).catch(() => undefined)
+    if (!isDetachedWindow) {
+      void window.modmind.app.getUpdateState().then((state) => {
+        setAppUpdateState(state)
+        if (state.phase === 'downloaded') setUpdateDownloadedOpen(true)
+      }).catch(() => undefined)
+      void window.modmind.app.checkForUpdates().then((result) => { if (result?.updateAvailable) setUpdateInfo(result) }).catch(() => undefined)
+    }
+    void window.modmind.production.remoteBuild.getGiteeSettings().then(setGiteeSettings).catch(() => undefined)
     void window.modmind.project.listLoaderVersions().then(setLoaderCatalog).catch(() => undefined)
     void window.modmind.externalAgents.detect().then(setExternalAgents).catch(() => undefined).finally(() => setExternalAgentsReady(true))
-    const removeBuildListener = window.modmind.build.onProgress((event) => setEvents((current) => [event, ...current]))
-    const removeBuildTrustListener = window.modmind.build.onTrustRequired(setBuildTrustRequest)
+    const removeOpenSettingsListener = window.modmind.app.onOpenSettings(() => {
+      setProjectLauncherOpen(false)
+      setView('settings')
+    })
+    const removeOpenViewListener = window.modmind.app.onOpenView((nextView) => {
+      setProjectLauncherOpen(false)
+      setView(nextView)
+    })
+    const removeProjectChangedListener = window.modmind.project.onChanged((nextProject) => {
+      setProject(nextProject)
+      setProjectLauncherOpen(!nextProject)
+      if (nextProject) {
+        setExistingAnalysis(null)
+        setExistingImportPicker(false)
+      }
+      void window.modmind.project.listRecent().then(setRecentProjects).catch(() => undefined)
+    })
+    const removeAppUpdateListener = window.modmind.app.onUpdateState((state) => {
+      if (isDetachedWindow) return
+      setAppUpdateState(state)
+      if (state.phase === 'downloaded') {
+        setUpdateInfo(null)
+        setUpdateDownloadedOpen(true)
+      } else if (state.phase === 'error' && state.message) {
+        setNotice(`更新下载失败：${state.message}`)
+      }
+    })
+    const removeBuildListener = window.modmind.build.onProgress((event) => {
+      if (uiModeRef.current === 'advanced' && event.status === 'error') return
+      const safeEvent = event.status === 'error' && uiModeRef.current === 'beginner'
+        ? { ...event, status: 'warning' as const, title: '工具仍在处理中', detail: event.detail }
+        : event.status === 'error' ? { ...event, title: '制作状态已更新', detail: '详细信息已写入诊断日志' } : event
+      if (event.projectPath && normalizeProjectPath(event.projectPath) !== normalizeProjectPath(projectPathRef.current)) {
+        const key = normalizeProjectPath(event.projectPath)
+        const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+        projectWorkbenchCacheRef.current.set(key, {...current, events: [safeEvent, ...current.events].slice(0, 500)})
+        return
+      }
+      setEvents((current) => [safeEvent, ...current])
+    })
+    const removeDeviceListener = window.modmind.device.onState(applyDeviceState)
+    const removeRemoteListener = window.modmind.remote.onState(setRemoteState)
+    const removeMcpBridgeListener = window.modmind.mcpBridge.onState(setMcpBridgeState)
+    const removeBeginnerCodexListener = window.modmind.beginnerCodex.onProgress((progress) => {
+      // Preparation progress has no runId. During a handoff, only quota setup
+      // can belong to the selected target; all other setup events are stale.
+      if (switchingBackendRef.current && switchingBackendRef.current !== 'quota') return
+      if (uiModeRef.current === 'advanced' && progress.status === 'error') return
+      const safeProgress = progress.status === 'error' && uiModeRef.current === 'beginner'
+        ? { ...progress, stage: 'planning' as const, status: 'warning' as const, title: '工具仍在处理中', detail: progress.detail }
+        : progress.status === 'error'
+        ? { ...progress, title: '制作状态已更新', detail: '详细信息已写入诊断日志' }
+        : progress
+      const progressEvent: PipelineEvent = {
+        id: `codex-prepare-${Date.now()}`,
+        stage: safeProgress.stage === 'error' ? 'error' : 'planning',
+        title: safeProgress.title,
+        detail: safeProgress.detail,
+        status: safeProgress.status,
+        time: new Date().toISOString(),
+        ...(safeProgress.projectPath ? {projectPath: safeProgress.projectPath} : {})
+      }
+      if (safeProgress.projectPath && normalizeProjectPath(safeProgress.projectPath) !== normalizeProjectPath(projectPathRef.current)) {
+        const key = normalizeProjectPath(safeProgress.projectPath)
+        const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+        projectWorkbenchCacheRef.current.set(key, {...current, events: [progressEvent, ...current.events].slice(0, 500)})
+        return
+      }
+      setEvents((current) => [progressEvent, ...current])
+    })
+    const backgroundProjectPath = (eventProjectPath?: string): string | undefined => {
+      if (!eventProjectPath) return undefined
+      const normalized = normalizeProjectPath(eventProjectPath)
+      return normalizeProjectPath(projectPathRef.current) === normalized ? undefined : normalized
+    }
+    const storeBackgroundProgress = (event: PipelineEvent, key: string): void => {
+      const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+      const timeline = reduceWorkbenchProgress(current.aiTimeline, event, humanizeActivity)
+      projectWorkbenchCacheRef.current.set(key, {
+        ...current,
+        events: [event, ...current.events].slice(0, 500),
+        aiTimeline: timeline,
+        planning: event.stage === 'complete' || (event.status === 'error' && event.terminal === true) ? false : event.status === 'running' || current.planning,
+        aiOutputStatus: event.status === 'error' && event.terminal === true ? 'error' : event.status === 'success' ? 'success' : current.aiOutputStatus,
+        aiTodo: event.todo ?? current.aiTodo
+      })
+    }
+    const storeBackgroundOutput = (event: AiOutputEvent, key: string): void => {
+      const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+      const timeline = reduceWorkbenchOutput(current.aiTimeline, event, humanizeOutput)
+      projectWorkbenchCacheRef.current.set(key, {
+        ...current,
+        aiTimeline: timeline,
+        aiOutputStatus: event.kind === 'error' && event.terminal === true ? 'error' : event.kind === 'answer' ? 'success' : current.aiOutputStatus,
+        planning: event.kind !== 'answer' && (event.kind !== 'error' || event.terminal !== true)
+      })
+    }
     const removeAiListener = window.modmind.ai.onProgress((event) => {
+      const backgroundKey = backgroundProjectPath(event.projectPath)
+      if (event.sessionId?.startsWith('inspiration-')) return
+      if (backgroundKey) {
+        storeBackgroundProgress(event, backgroundKey)
+        return
+      }
+      if (switchingBackendRef.current && event.backend && event.backend !== switchingBackendRef.current) return
+      if (event.backend) setRunningBackend(event.backend)
       setEvents((current) => [event, ...current])
+      setAiTimeline((current) => reduceWorkbenchProgress(current, event, humanizeActivity))
       if (event.todo) {
         setAiTodo((current) => {
           if (!current.length || current.length !== event.todo!.length) return event.todo!
@@ -763,69 +2477,83 @@ export default function App(): React.JSX.Element {
       }
     })
     const removeAiOutputListener = window.modmind.ai.onOutput((event) => {
-      if (event.kind === 'start') {
-        const content = humanizeOutput(event.content)
-        const historyMarker = '\n\n[已恢复的 '
-        const historyIndex = content.indexOf(historyMarker)
-        const taskContent = historyIndex >= 0 ? content.slice(0, historyIndex).trim() : content
-        setAiOutput((current) => {
-          const displayContent = historyIndex >= 0 && current.includes('[已恢复的 ') ? taskContent : content
-          return current === 'AI 的结构化响应会显示在这里。' ? displayContent : `${current}\n\n[任务开始]\n${displayContent}`
-        })
-        setAiTimeline((current) => {
-          const displayContent = historyIndex >= 0 && current.some((item) => item.content.includes('[已恢复的 ')) ? taskContent : content
-          const item: AiTimelineItem = { id: `${event.time}-start-${Date.now()}`, kind: 'start', content: displayContent, time: event.time }
-          return [...current, item]
-        })
-        // Recovery progress sends the saved Todo immediately after start;
-        // keep the current list until a new plan arrives.
-        setAiOutputStatus('running')
+      const backgroundKey = backgroundProjectPath(event.projectPath)
+      if (event.sessionId?.startsWith('inspiration-')) return
+      if (backgroundKey) {
+        storeBackgroundOutput(event, backgroundKey)
         return
       }
-      if (event.kind === 'stream-start') {
-        setAiOutputStatus('running')
-        return
-      }
-      if (event.kind === 'delta') {
-        setAiOutputStatus('running')
-        return
-      }
-      if (event.kind === 'answer') {
-        const content = humanizeOutput(event.content)
-        const item: AiTimelineItem = { id: `${event.time}-answer-${Date.now()}`, kind: 'answer', content, time: event.time }
-        setAiOutput((current) => current === 'AI 的结构化响应会显示在这里。' ? content : `${current}\n\n${content}`)
-        setAiTimeline((current) => [...current, item])
-        setAiOutputStatus('success')
-        return
-      }
-      const label = event.kind === 'retry' ? '重试' : event.kind === 'tool' ? '操作' : event.kind === 'warning' ? '警告' : event.kind === 'error' ? '错误' : event.kind === 'response' ? '' : '状态'
-      const content = humanizeOutput(event.content)
-      setAiOutput((current) => `${current}\n\n${label ? `[${label}]\n` : ''}${content}`)
-      if (event.kind === 'response' || event.kind === 'retry' || event.kind === 'tool' || event.kind === 'warning' || event.kind === 'error') {
-        if (content.startsWith('__CODE_DIFF__')) {
-          try {
-            const diff = JSON.parse(content.slice('__CODE_DIFF__'.length)) as Array<{ path: string; added: number; removed: number; additions: string[]; removals: string[] }>
-            setAiTimeline((current) => [...current, { id: `${event.time}-${current.length}`, kind: 'diff', content: '代码修改已应用', time: event.time, diff }])
-          } catch {
-            setAiTimeline((current) => [...current, { id: `${event.time}-${current.length}`, kind: event.kind, content, time: event.time }])
-          }
-        } else {
-          setAiTimeline((current) => [...current, { id: `${event.time}-${current.length}`, kind: event.kind, content, time: event.time }])
-        }
-      }
-      if (event.kind === 'error') setAiOutputStatus('error')
+      if (switchingBackendRef.current && event.backend && event.backend !== switchingBackendRef.current) return
+      if (event.backend) setRunningBackend(event.backend)
+      setAiTimeline((current) => {
+        return reduceWorkbenchOutput(current, event, humanizeOutput)
+      })
+      if (event.kind === 'error' && event.terminal === true) setAiOutputStatus('error')
+      else if (event.kind === 'answer') setAiOutputStatus('success')
+      else setAiOutputStatus('running')
     })
     const removeMinecraftListener = window.modmind.minecraft.onEvent((event) => {
+      if (event.projectPath && normalizeProjectPath(event.projectPath) !== normalizeProjectPath(projectPathRef.current)) {
+        const key = normalizeProjectPath(event.projectPath)
+        const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+        projectWorkbenchCacheRef.current.set(key, {...current, minecraftEvents: appendMinecraftRuntimeEvent(current.minecraftEvents, event, 500)})
+        return
+      }
       setMinecraftEvents((current) => appendMinecraftRuntimeEvent(current, event, 500))
+    })
+    const removeBackendReadyListener = window.modmind.ai.onBackendReady((event) => {
+      if (normalizeProjectPath(event.projectPath) !== normalizeProjectPath(projectPathRef.current)) return
+      const pending = pendingBackendSwitchRef.current
+      if (!pending || pending.backend !== event.backend || (event.switchId !== undefined && pending.generation !== event.switchId)) return
+      pending.accepted = true
+      switchingBackendRef.current = null
+      setSwitchingBackend(null)
+      settingsRef.current = { ...settingsRef.current, codingBackend: event.backend }
+      setSettings((current) => ({ ...current, codingBackend: event.backend }))
+      setRunningBackend(event.backend)
+      setNotice(`已切换到 ${event.backend === 'quota' ? '智能引擎' : event.backend === 'codex' ? 'Codex' : 'Claude Code'}，正在继续当前任务`)
     })
     return () => {
       removeBuildListener()
-      removeBuildTrustListener()
+      removeOpenSettingsListener()
+      removeOpenViewListener()
+      removeProjectChangedListener()
+      removeAppUpdateListener()
+      removeDeviceListener()
+      removeRemoteListener()
+      removeMcpBridgeListener()
+      removeBeginnerCodexListener()
       removeAiListener()
       removeAiOutputListener()
       removeMinecraftListener()
+      removeBackendReadyListener()
     }
   }, [])
+
+  const downloadAppUpdate = (): void => {
+    setUpdateInfo(null)
+    setUpdateDownloadedOpen(false)
+    setUpdateActionBusy(true)
+    void window.modmind.app.downloadUpdate()
+      .catch((error) => setNotice(`更新下载失败：${errorMessage(error)}`))
+      .finally(() => setUpdateActionBusy(false))
+  }
+
+  const installAppUpdate = (): void => {
+    setUpdateActionBusy(true)
+    void window.modmind.app.installUpdate().then((started) => {
+      if (!started) throw new Error('已下载的安装包不可用，请重新下载')
+    }).catch((error) => {
+      setUpdateActionBusy(false)
+      setNotice(`无法启动安装程序：${errorMessage(error)}`)
+    })
+  }
+
+  useEffect(() => {
+    if (deviceState.status !== 'connected') return
+    const timer = window.setInterval(() => { void window.modmind.device.refreshUsage().then(setDeviceState).catch(() => undefined) }, 2 * 60_000)
+    return () => window.clearInterval(timer)
+  }, [deviceState.status])
 
   useEffect(() => {
     if (!project) return
@@ -834,6 +2562,8 @@ export default function App(): React.JSX.Element {
     setMigrationLoader(project.loader)
     setMigrationVersion('')
     setMigrationPreview(null)
+    if ((!isJavaLoader(project.loader) && ['minecraft', 'mappings', 'production', 'relationships'].includes(view))
+      || (project.kind === 'modpack' && ['blockbench', 'code', 'build', 'mappings'].includes(view))) setView('workspace')
   }, [project])
 
   useEffect(() => {
@@ -854,71 +2584,80 @@ export default function App(): React.JSX.Element {
         setView('workspace')
         setProjectLauncherOpen(false)
         void refreshRecentProjects()
-        const recovery = await window.modmind.ai.getRecovery()
-        setAiRecovery(recovery.pending ? recovery : null)
       }
     } catch (error) {
-      setNotice(errorMessage(error))
-    }
-  }
-
-  const restoreInterruptedAi = async (): Promise<void> => {
-    setRecoveryBusy(true)
-    try {
-      const backup = await window.modmind.ai.restoreRecovery()
-      setAiRecovery(null)
-      await refreshFiles()
-      await refreshSnapshots()
-      setNotice(backup ? `已恢复 AI 修改前状态，当前内容备份为 ${backup.id.slice(0, 19)}` : '没有找到可恢复的 AI 快照')
-    } catch (error) {
-      setNotice(`恢复失败：${errorMessage(error)}`)
-    } finally {
-      setRecoveryBusy(false)
+      setNotice(uiMode === 'beginner' ? '制作没有完成，可导出诊断日志' : errorMessage(error))
     }
   }
 
   const resumeInterruptedAi = async (): Promise<void> => {
-    setRecoveryBusy(true)
+    const taskProjectPath = project?.path
+    if (!taskProjectPath) return
+    const runToken = nextAiRunToken(taskProjectPath)
+    // Hide the banner immediately so it does not linger while the resume runs.
+    // A failed resume re-reads the checkpoint in the catch branch below and
+    // shows the banner again.
+    if (isForegroundProject(taskProjectPath)) {
+      setAiRecovery(null)
+      setNotice('正在恢复 AI 任务；会继续读取项目并重新验证构建')
+    }
+    // The resumed task belongs to the conversation recorded in its checkpoint.
+    const recoveryConversationId = aiRecovery?.conversationId
+    if (recoveryConversationId && workbenchConversations.some((item) => item.id === recoveryConversationId) && recoveryConversationId !== activeWorkbenchConversationId) {
+      setActiveWorkbenchConversationId(recoveryConversationId)
+      setAiHistoryLoadedKey('')
+      setAiTimeline([])
+    }
     setPlanning(true)
+    setRunningBackend(aiRecovery?.backend ?? settings.codingBackend)
     setAiOutputStatus('running')
-    setAiOutput('正在从保存的 AI 检查点继续任务…')
-    setNotice('正在恢复 AI 任务；会继续读取项目并重新验证构建')
-    // The recovery dialog is a confirmation step, not a progress screen. Keep
-    // the workspace usable while the model/build loop runs; re-open it only if
-    // the backend reports that the checkpoint still needs attention.
-    setAiRecovery(null)
+    setAiTimeline((current) => reduceWorkbenchProgress(current, { id: `recovery-${Date.now()}`, runId: `recovery-${taskProjectPath}`, stage: 'planning', title: '正在继续任务', detail: '从保存的检查点恢复并重新验证', status: 'running', time: new Date().toISOString() }, humanizeActivity))
     try {
-      const result = await window.modmind.ai.resumeRecovery()
-      setAiPlan(result)
-      if (result.todo) {
-        setAiTodo(result.todo)
-      } else {
-        setAiTodo((current) => current.length ? current : result.tasks.map((task, index) => ({ id: `T${index + 1}`, title: task, status: 'completed' as const })))
+      const result = await window.modmind.ai.resumeRecovery(taskProjectPath)
+      if (!isCurrentAiRunToken(taskProjectPath, runToken)) return
+      storeProjectPlan(taskProjectPath, result)
+      await refreshFilesFor(taskProjectPath)
+      if (isForegroundProject(taskProjectPath)) {
+        await refreshSnapshotsFor(taskProjectPath)
+        setAiRecovery(null)
+        setNotice('AI 已从中断点继续，并完成构建与独立验收')
       }
-      setAiOutputStatus('success')
-      await refreshFiles()
-      await refreshSnapshots()
-      setNotice('AI 已从中断点继续，并完成构建与独立验收')
     } catch (error) {
-      setAiOutputStatus('error')
-      setAiOutput((current) => `${current}\n\n[恢复失败]\n${errorMessage(error)}`)
-      setNotice(`继续任务失败：${errorMessage(error)}`)
+      if (!isCurrentAiRunToken(taskProjectPath, runToken)) return
+      if (!isForegroundProject(taskProjectPath)) {
+        const key = normalizeProjectPath(taskProjectPath)
+        const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+        projectWorkbenchCacheRef.current.set(key, {...current, planning: false, aiOutputStatus: 'error'})
+      } else if (isWorkflowAuditRejection(error)) {
+        setAiOutputStatus('idle')
+        setNotice('验证流程尚未完成，任务已保留，可从恢复入口继续')
+      } else if (uiModeRef.current === 'advanced') {
+        setAiOutputStatus('idle')
+      } else {
+        setAiOutputStatus('error')
+        setAiTimeline((current) => [...current, { id: `recovery-error-${Date.now()}`, kind: 'error', content: aiFailureMessage(error), time: new Date().toISOString(), status: 'error', terminal: true }])
+        setNotice(`继续任务失败：${aiFailureMessage(error)}`)
+      }
       if (shouldOfferAiRecovery(error)) {
-        const recovery = await window.modmind.ai.getRecovery().catch(() => ({ pending: false, snapshot: null }))
-        if (recovery.pending) setAiRecovery(recovery)
+        const recovery = await window.modmind.ai.getRecovery(taskProjectPath).catch(() => ({ pending: false, snapshot: null, sessionId: undefined }))
+        if (recovery.pending && normalizeProjectPath(projectPathRef.current) === normalizeProjectPath(taskProjectPath)) setAiRecovery(recovery)
       }
     } finally {
-      setPlanning(false)
-      setRecoveryBusy(false)
+      if (isForegroundProject(taskProjectPath)) {
+        setPlanning(false)
+      }
     }
   }
 
   const inspectExistingProject = async (sourceType: 'folder' | 'zip'): Promise<void> => {
+    setExistingInspecting(true)
     try {
       const analysis = await window.modmind.project.inspectExisting(sourceType)
       if (analysis) setExistingAnalysis(analysis)
     } catch (error) {
-      setNotice(errorMessage(error))
+      setErrorNotice(errorMessage(error))
+    } finally {
+      setExistingInspecting(false)
     }
   }
 
@@ -929,40 +2668,105 @@ export default function App(): React.JSX.Element {
       setView('workspace')
       setProjectLauncherOpen(false)
       void refreshRecentProjects()
-      const recovery = await window.modmind.ai.getRecovery()
-      setAiRecovery(recovery.pending ? recovery : null)
     } catch (error) {
-      setNotice(errorMessage(error))
+      setErrorNotice(errorMessage(error))
       void refreshRecentProjects()
     }
   }
 
   const removeRecentProject = async (recent: ProjectInfo): Promise<void> => {
+    if (!await requestConfirm({ title: `删除项目“${recent.name}”？`, message: '这会永久删除项目目录及其中的源代码、构建产物和快照，不能撤销', confirmLabel: '删除项目', tone: 'danger' })) return
     try {
-      setRecentProjects(await window.modmind.project.removeRecent(recent.path))
+      const remaining = await window.modmind.project.deleteProject(recent.path)
+      setRecentProjects(remaining)
+      if (project && project.path.replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase() === recent.path.replaceAll('\\', '/').replace(/\/+$/, '').toLowerCase()) {
+        setProject(null)
+        setProjectLauncherOpen(true)
+        setView('workspace')
+        setFiles([])
+        setSelectedFile('')
+        setEditorContent('')
+        setEditorDirty(false)
+        setAiPlan(null)
+        setAiTodo([])
+        setAiTimeline([])
+        setAiOutputStatus('idle')
+        setBuildResult(null)
+        setBuildError('')
+      }
+      setNotice(`项目“${recent.name}”已删除`)
     } catch (error) {
-      setNotice(errorMessage(error))
+      setErrorNotice(errorMessage(error))
     }
   }
 
+  const projectRenamed = (renamed: ProjectInfo): void => {
+    const isActive = project?.path === renamed.path
+    if (isActive) {
+      setProject(renamed)
+      setSelectedFile('')
+      setEditorContent('')
+      setEditorDirty(false)
+      void window.modmind.project.listFiles().then(setFiles).catch(() => undefined)
+    }
+    setRenamingProject(null)
+    void refreshRecentProjects()
+    setNotice(`已重命名为 ${renamed.name}（${renamed.namespace}）`)
+  }
+
   const selectFile = async (node: FileNode): Promise<void> => {
-    if (node.type !== 'file') return
+    const editorProjectPath = project?.path
+    if (node.type !== 'file' || !editorProjectPath) return
     try {
       if (editorDirty && selectedFile && selectedFile !== node.path) {
-        await window.modmind.project.writeFile(selectedFile, editorContent)
+        await window.modmind.project.writeFile(selectedFile, editorContent, editorProjectPath)
       }
       setSelectedFile(node.path)
       if (!isEditablePath(node.path)) {
         setEditorContent('')
         setEditorDirty(false)
-        setNotice('该文件不是可编辑文本，可使用工具栏在文件管理器中显示。')
+        setNotice('该文件不是可编辑文本，可使用工具栏在文件管理器中显示')
         return
       }
-      const content = await window.modmind.project.readFile(node.path)
+      const content = await window.modmind.project.readFile(node.path, editorProjectPath)
+      if (normalizeProjectPath(projectPathRef.current) !== normalizeProjectPath(editorProjectPath)) return
       setEditorContent(content)
       setEditorDirty(false)
     } catch (error) {
       setNotice(`无法读取文件：${errorMessage(error)}`)
+    }
+  }
+
+  const openEditorFile = async (relativePath: string): Promise<void> => {
+    const normalized = relativePath.replaceAll('\\', '/').replace(/^\.\//, '')
+    navigateToView('code')
+    setProjectLauncherOpen(false)
+    await selectFile({ name: normalized.split('/').at(-1) ?? normalized, path: normalized, type: 'file' })
+    void refreshFiles()
+  }
+
+  const openModpackContentEditor = (contentPath?: string): void => {
+    if (!contentPath) {
+      navigateToView('code')
+      setProjectLauncherOpen(false)
+      void refreshFiles()
+      return
+    }
+    void window.modmind.modpack.contentProjectPath(contentPath)
+      .then(openEditorFile)
+      .catch((error) => setNotice(`无法打开内容文件：${errorMessage(error)}`))
+  }
+
+  const createModpackContentFile = async (contentPath: string, initialContent?: string): Promise<void> => {
+    try {
+      const suggestedPath = await window.modmind.modpack.contentProjectPath(contentPath)
+      const relativePath = (await requestPrompt({ title: '新建整合包文件', message: '输入项目相对路径；文件创建后会直接在代码编辑器中打开', value: suggestedPath, inputLabel: '项目相对路径', confirmLabel: '新建文件' }))?.trim()
+      if (!relativePath) return
+      const result = await window.modmind.project.createFile(relativePath, initialContent, project?.path)
+      await openEditorFile(result.path)
+      setNotice(`已创建 ${result.path}`)
+    } catch (error) {
+      setNotice(`无法创建内容文件：${errorMessage(error)}`)
     }
   }
 
@@ -1001,9 +2805,10 @@ export default function App(): React.JSX.Element {
   }
 
   const saveFile = async (): Promise<void> => {
-    if (!selectedFile) return
+    const editorProjectPath = project?.path
+    if (!selectedFile || !editorProjectPath) return
     try {
-      await window.modmind.project.writeFile(selectedFile, editorContent)
+      await window.modmind.project.writeFile(selectedFile, editorContent, editorProjectPath)
       setEditorDirty(false)
       setNotice('文件已保存')
     } catch (error) {
@@ -1013,10 +2818,10 @@ export default function App(): React.JSX.Element {
 
   const createProjectFile = async (): Promise<void> => {
     const suggestedDirectory = selectedFile.includes('/') ? selectedFile.slice(0, selectedFile.lastIndexOf('/') + 1) : 'src/main/'
-    const relativePath = window.prompt('输入新文件的项目相对路径', `${suggestedDirectory}NewFile.java`)?.trim()
+    const relativePath = (await requestPrompt({ title: '创建文件', message: '输入新文件的项目相对路径', value: `${suggestedDirectory}NewFile.java`, inputLabel: '项目相对路径', confirmLabel: '创建文件' }))?.trim()
     if (!relativePath) return
     try {
-      const result = await window.modmind.project.createFile(relativePath)
+      const result = await window.modmind.project.createFile(relativePath, undefined, project?.path)
       await refreshFiles()
       setSelectedFile(result.path)
       setEditorContent('')
@@ -1029,10 +2834,10 @@ export default function App(): React.JSX.Element {
 
   const createProjectDirectory = async (): Promise<void> => {
     const suggestedDirectory = selectedFile.includes('/') ? selectedFile.slice(0, selectedFile.lastIndexOf('/')) : 'src/main'
-    const relativePath = window.prompt('输入新目录的项目相对路径', `${suggestedDirectory}/new-directory`)?.trim()
+    const relativePath = (await requestPrompt({ title: '创建目录', message: '输入新目录的项目相对路径', value: `${suggestedDirectory}/new-directory`, inputLabel: '项目相对路径', confirmLabel: '创建目录' }))?.trim()
     if (!relativePath) return
     try {
-      const result = await window.modmind.project.createDirectory(relativePath)
+      const result = await window.modmind.project.createDirectory(relativePath, project?.path)
       await refreshFiles()
       setNotice(`已创建 ${result.path}`)
     } catch (error) {
@@ -1041,12 +2846,13 @@ export default function App(): React.JSX.Element {
   }
 
   const renameSelectedFile = async (): Promise<void> => {
-    if (!selectedFile) return
-    const nextPath = window.prompt('输入新的项目相对路径', selectedFile)?.trim()
+    const editorProjectPath = project?.path
+    if (!selectedFile || !editorProjectPath) return
+    const nextPath = (await requestPrompt({ title: '重命名文件', message: '输入新的项目相对路径', value: selectedFile, inputLabel: '项目相对路径', confirmLabel: '重命名' }))?.trim()
     if (!nextPath || nextPath === selectedFile) return
     try {
-      if (editorDirty) await window.modmind.project.writeFile(selectedFile, editorContent)
-      const result = await window.modmind.project.renamePath(selectedFile, nextPath)
+      if (editorDirty) await window.modmind.project.writeFile(selectedFile, editorContent, editorProjectPath)
+      const result = await window.modmind.project.renamePath(selectedFile, nextPath, editorProjectPath)
       setSelectedFile(result.path)
       setEditorDirty(false)
       await refreshFiles()
@@ -1057,9 +2863,9 @@ export default function App(): React.JSX.Element {
   }
 
   const deleteSelectedFile = async (): Promise<void> => {
-    if (!selectedFile || !window.confirm(`删除“${selectedFile}”？\n\n此操作不会删除受保护的项目目录。`)) return
+    if (!selectedFile || !await requestConfirm({ title: `删除“${selectedFile}”？`, message: '此操作不会删除受保护的项目目录', confirmLabel: '删除文件', tone: 'danger' })) return
     try {
-      await window.modmind.project.deletePath(selectedFile)
+      await window.modmind.project.deletePath(selectedFile, project?.path)
       setSelectedFile('')
       setEditorContent('')
       setEditorDirty(false)
@@ -1071,6 +2877,11 @@ export default function App(): React.JSX.Element {
   }
 
   const performBuild = async (showBuildView = false): Promise<{ success: true } | { success: false; error: string }> => {
+    if (!project) return { success: false, error: '没有打开的项目' }
+    const buildProject = project
+    const buildProjectPath = buildProject.path
+    const javaProject = isJavaLoader(buildProject.loader)
+    const artifactKind = javaProject ? 'Gradle artifact' : buildProject.loader === 'bedrock' ? 'Bedrock artifact' : 'NetEase archive'
     setBuilding(true)
     setBuildResult(null)
     setBuildError('')
@@ -1080,22 +2891,29 @@ export default function App(): React.JSX.Element {
         id: `build-start-${Date.now()}`,
         stage: 'building',
         title: '正在构建项目',
-        detail: '执行托管 Gradle build',
+        detail: javaProject ? '执行托管 Gradle build' : buildProject.loader === 'bedrock' ? '校验并打包 .mcaddon' : '校验并生成网易工作台归档',
         status: 'running',
         time: new Date().toISOString()
       },
       ...current
     ])
     try {
-      const artifact = await window.modmind.minecraft.buildProject()
-      const result = await window.modmind.build.preflight()
-      result.logs.unshift(`PASS  Gradle artifact: ${artifact.name}`)
-      result.summary = result.success ? 'Gradle 构建成功，项目预检通过。' : result.summary
+      const artifact = await window.modmind.minecraft.buildProject(buildProjectPath)
+      if (isForegroundProject(buildProjectPath)) setExportArtifactAvailable(true)
+      const result = await window.modmind.build.preflight(buildProjectPath)
+      result.logs.unshift(`PASS  ${artifactKind}: ${artifact.name}`)
+      result.summary = result.success ? (javaProject ? 'Gradle 构建成功，项目预检通过' : `${platformLabel(buildProject.loader)} 归档成功，项目预检通过`) : result.summary
+      if (!isForegroundProject(buildProjectPath)) {
+        const key = normalizeProjectPath(buildProjectPath)
+        const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+        projectWorkbenchCacheRef.current.set(key, {...current, building: false, buildResult: result, buildError: result.success ? '' : '项目预检未通过', exportArtifactAvailable: true})
+        return result.success ? {success: true} : {success: false, error: result.summary}
+      }
       setBuildResult(result)
       if (!result.success) {
-        const detail = 'Gradle 已生成有效 JAR，但项目预检未通过；本次构建不标记为成功。'
+        const detail = javaProject ? 'Gradle 已生成有效 JAR，但项目预检未通过；本次构建不标记为成功' : '平台归档已生成，但项目预检未通过；本次构建不标记为成功'
         setBuildError(detail)
-        setEvents((current) => [
+        if (uiModeRef.current !== 'advanced') setEvents((current) => [
           {
             id: `build-preflight-error-${Date.now()}`,
             stage: 'error',
@@ -1124,8 +2942,14 @@ export default function App(): React.JSX.Element {
       return { success: true }
     } catch (error) {
       const detail = errorMessage(error)
+      if (!isForegroundProject(buildProjectPath)) {
+        const key = normalizeProjectPath(buildProjectPath)
+        const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+        projectWorkbenchCacheRef.current.set(key, {...current, building: false, buildError: detail})
+        return {success: false, error: detail}
+      }
       setBuildError(detail)
-      setEvents((current) => [
+      if (uiModeRef.current !== 'advanced') setEvents((current) => [
         {
           id: `build-error-${Date.now()}`,
           stage: 'error',
@@ -1139,53 +2963,167 @@ export default function App(): React.JSX.Element {
       if (showBuildView) setView('build')
       return { success: false, error: detail }
     } finally {
-      setBuilding(false)
+      if (isForegroundProject(buildProjectPath)) setBuilding(false)
+      else {
+        const key = normalizeProjectPath(buildProjectPath)
+        const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+        projectWorkbenchCacheRef.current.set(key, {...current, building: false})
+      }
     }
   }
 
   const captureIdea = async (): Promise<void> => {
-    if (!prompt.trim() || !project) return
-    const idea = prompt.trim()
+    if ((!prompt.trim() && !aiAttachments.length) || !project) return
+    const taskProjectPath = project.path
+    if (!aiOutputHistoryKey || aiHistoryLoadedKey !== aiOutputHistoryKey || workbenchPersistenceState === 'loading' || workbenchPersistenceState === 'error') {
+      setNotice(workbenchPersistenceState === 'error' ? workbenchPersistenceMessage : '对话历史尚未完成安全加载')
+      return
+    }
+    // Serial workbench policy: only one task may run per project at a time.
+    if (planning) {
+      setNotice('当前项目有任务正在运行，请等待完成或停止后再发送')
+      return
+    }
+    const selectedBackend: AgentSettings['codingBackend'] = uiMode === 'beginner' ? 'quota' : settings.codingBackend
+    setRunningBackend(selectedBackend)
+    const usesQuota = selectedBackend === 'quota'
+    if (usesQuota && deviceState.status !== 'connected') {
+      setNotice('请先连接 ModMind 账号')
+      return
+    }
+    if (usesQuota && deviceState.keyStatus === 'FROZEN') {
+      setNotice('当前账号暂不可用，请前往网站查看账号状态')
+      return
+    }
+    let activeConversation = workbenchConversations.find((item) => item.id === activeWorkbenchConversationId)
+    let nextConversations = workbenchConversations
+    if (!activeConversation) {
+      const created = createWorkbenchConversation(workbenchConversations)
+      nextConversations = created.conversations
+      activeConversation = created.conversation
+    }
+    const idea = prompt.trim() || '请分析并使用我上传的附件'
+    const requestPrompt = `${idea}${formatAiAttachmentContext(aiAttachments)}`
+    const promptHistoryKey = workbenchPromptHistoryStorageKey(taskProjectPath, activeConversation)
+    let taskPromptHistory = workspacePromptHistoryRef.current.get(promptHistoryKey) ?? []
+    try {
+      const saved = JSON.parse(localStorage.getItem(promptHistoryKey) ?? '[]') as unknown
+      if (Array.isArray(saved)) taskPromptHistory = saved.filter((value): value is string => typeof value === 'string').slice(-50)
+    } catch { /* Keep the in-memory history. */ }
+    const repeated = isRepeatedAiPrompt(requestPrompt, taskPromptHistory)
+    const promptForAgent = repeated ? AI_CONTINUATION_PROMPT : requestPrompt
+    const sessionId = `coding-${Date.now()}`
+    nextConversations = touchWorkbenchConversation(
+      nextConversations,
+      activeConversation!.id,
+      nextConversations.find((item) => item.id === activeConversation!.id)?.title === '新的对话' ? { title: titleFromUserText(idea) } : {}
+    )
+    const visibleRequest = aiAttachments.length
+      ? `${idea}\n\n附件：${aiAttachments.map((attachment) => attachment.name).join('、')}`
+      : idea
+    const nextTimeline = appendUserTurn(aiTimelineRef.current, visibleRequest, sessionId)
+    const nextHistoryPath = `.modmind/workbench-timeline-${activeConversation.id}.json`
+    const nextHistoryKey = `${taskProjectPath}:${activeConversation.id}`
+    try {
+      await Promise.all([
+        requireRedundantWorkbenchWrite(() => persistWorkbenchIndexNow(taskProjectPath, nextConversations), '对话索引'),
+        requireRedundantWorkbenchWrite(() => persistWorkbenchTimelineNow(taskProjectPath, nextHistoryPath, nextHistoryKey, nextTimeline), '用户消息')
+      ])
+    } catch (error) {
+      setWorkbenchPersistenceState('error')
+      setWorkbenchPersistenceMessage(`消息未能双重保存：${errorMessage(error)}`)
+      setNotice('消息未发送：未能完成双重落盘')
+      return
+    }
+    taskPromptHistory = [...taskPromptHistory, requestPrompt].slice(-50)
+    workspacePromptHistoryRef.current.set(promptHistoryKey, taskPromptHistory)
+    try { localStorage.setItem(promptHistoryKey, JSON.stringify(taskPromptHistory)) } catch { /* repetition history is optional */ }
+    const runToken = nextAiRunToken(taskProjectPath)
+    workspaceSessionRef.current = sessionId
+    setWorkbenchConversations(nextConversations)
+    if (activeConversation.id !== activeWorkbenchConversationId) setActiveWorkbenchConversationId(activeConversation.id)
+    setAiTimeline(nextTimeline)
+    setPrompt('')
+    setAiAttachments([])
+    // A follow-up turn has its own report and Todo state. The conversation
+    // timeline remains intact, but it must not present the prior turn as this
+    // turn's code change while the new request is running.
+    setAiPlan(null)
+    setAiTodo([])
+    setBeginnerTaskState('working')
+    setPlanning(true)
     setEvents((current) => [
       {
         id: `idea-${Date.now()}`,
+        stage: 'planning',
+        title: uiMode === 'beginner' ? '正在准备开发工具' : '需求已记录',
+        detail: uiMode === 'beginner' ? '正在检查 Codex、下载组件并比对配置' : '已写入 docs/idea.md',
+        status: uiMode === 'beginner' ? 'running' : 'success',
+        time: new Date().toISOString()
+      },
+      ...current
+    ])
+    try {
+      if (usesQuota) await window.modmind.beginnerCodex.prepare(taskProjectPath)
+      if (!isCurrentAiRunToken(taskProjectPath, runToken)) return
+      await window.modmind.project.captureIdea(requestPrompt, taskProjectPath)
+      if (!isCurrentAiRunToken(taskProjectPath, runToken)) return
+      await refreshFilesFor(taskProjectPath)
+      await refreshExportArtifactFor(taskProjectPath)
+      if (uiMode === 'beginner') setEvents((current) => [{
+        id: `idea-recorded-${Date.now()}`,
         stage: 'planning',
         title: '需求已记录',
         detail: '已写入 docs/idea.md',
         status: 'success',
         time: new Date().toISOString()
-      },
-      ...current
-    ])
-    await window.modmind.project.captureIdea(idea)
-    setPrompt('')
-    await refreshFiles()
-    if (settings.codingBackend === 'internal' && !settings.model) {
-      setNotice('需求已保存；请先在设置中配置 AI 模型')
+      }, ...current])
+    } catch (error) {
+      if (!isCurrentAiRunToken(taskProjectPath, runToken)) return
+      const detail = errorMessage(error)
+      if (uiModeRef.current === 'advanced') {
+        setBeginnerTaskState('idle')
+        setAiOutputStatus('idle')
+      } else {
+        setBeginnerTaskState('error')
+        setNotice(detail)
+        setEvents((current) => [{
+          id: `codex-prepare-error-${Date.now()}`,
+          stage: 'error',
+          title: '开始制作失败',
+          detail,
+          status: 'error',
+          time: new Date().toISOString()
+        }, ...current])
+      }
+      setPlanning(false)
       return
     }
-    setPlanning(true)
     setAiOutputStatus('running')
     setEvents((current) => [
       {
         id: `plan-${Date.now()}`,
         stage: 'planning',
         title: 'AI 正在分析请求',
-        detail: settings.codingBackend === 'internal' ? settings.model : settings.codingBackend === 'codex' ? 'Codex 正在判断任务意图' : 'Claude Code 正在判断任务意图',
+        detail: selectedBackend === 'quota' ? '正在使用 ModMind 额度启动 Codex' : selectedBackend === 'codex' ? 'Codex 正在判断任务意图' : 'Claude Code 正在判断任务意图',
         status: 'running',
         time: new Date().toISOString()
       },
       ...current
     ])
-    const sessionId = `coding-${Date.now()}`
     try {
-      let plan = await window.modmind.ai.createCode(idea, sessionId, settings.codingBackend)
-      setAiPlan(plan)
-      if (plan.todo) setAiTodo(plan.todo)
-      else setAiTodo((current) => current.length ? current : plan.tasks.map((task, index) => ({ id: `T${index + 1}`, title: task, status: 'completed' as const })))
-      setAiOutputStatus('success')
+      if (!isCurrentAiRunToken(taskProjectPath, runToken)) return
+      let plan = await window.modmind.ai.createCode(
+        promptForAgent,
+        sessionId,
+        selectedBackend,
+        usesQuota ? 'beginner-unlimited' : 'standard',
+        { surface: 'workspace', sessionScope: activeConversation.sessionScope, resumeSession: true, projectPath: taskProjectPath, fallbackPrompt: requestPrompt }
+      )
+      if (!isCurrentAiRunToken(taskProjectPath, runToken)) return
+      storeProjectPlan(taskProjectPath, plan)
       const informational = plan.intent === 'informational'
-      setEvents((current) => [
+      if (isForegroundProject(taskProjectPath)) setEvents((current) => [
         {
           id: `plan-done-${Date.now()}`,
           stage: 'planning',
@@ -1196,30 +3134,138 @@ export default function App(): React.JSX.Element {
         },
         ...current
       ])
-      await refreshFiles()
-      await refreshSnapshots()
-      setNotice(informational ? 'AI 已完成回答，项目未发生修改' : 'AI 已完成修改、构建和自动验收；请进入游戏测试实际玩法')
+      await refreshFilesFor(taskProjectPath)
+      if (isForegroundProject(taskProjectPath)) {
+        await refreshSnapshotsFor(taskProjectPath)
+        setNotice(informational ? 'AI 已完成回答，项目未发生修改' : 'AI 已完成修改、构建和自动验收；请进入游戏测试实际玩法')
+      }
     } catch (error) {
-      setEvents((current) => [
-        {
-          id: `plan-error-${Date.now()}`,
-          stage: 'error',
-          title: 'AI 编程失败',
-          detail: errorMessage(error),
-          status: 'error',
-          time: new Date().toISOString()
-        },
-        ...current
-      ])
-      setNotice(errorMessage(error))
-      setAiOutputStatus('error')
-      setAiOutput((current) => `${current}\n\n[任务失败]\n${errorMessage(error)}`)
+      if (!isCurrentAiRunToken(taskProjectPath, runToken)) return
+      const failureDetail = aiFailureMessage(error)
+      const inactivityTimeout = /没有返回任何内容|连接中断|线路繁忙|响应超时|上游模型服务异常/i.test(failureDetail)
+      if (isWorkflowAuditRejection(error)) {
+        if (isForegroundProject(taskProjectPath)) {
+          setBeginnerTaskState('idle')
+          setAiOutputStatus('idle')
+          setNotice('验证流程尚未完成，任务已保留，可从恢复入口继续')
+        }
+        const recovery = await window.modmind.ai.getRecovery(taskProjectPath).catch(() => ({ pending: false, snapshot: null, sessionId: undefined }))
+        if (recovery.pending) {
+          if (isForegroundProject(taskProjectPath)) setAiRecovery(recovery)
+          else {
+            const key = normalizeProjectPath(taskProjectPath)
+            const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+            projectWorkbenchCacheRef.current.set(key, {...current, aiRecovery: recovery, planning: false, aiOutputStatus: 'idle', beginnerTaskState: 'idle'})
+          }
+        }
+        return
+      }
+      if (inactivityTimeout && isForegroundProject(taskProjectPath)) {
+        setBeginnerTaskState('idle')
+        setAiOutputStatus('error')
+         setNoticeState(failureDetail)
+      } else if (!isForegroundProject(taskProjectPath)) {
+        const key = normalizeProjectPath(taskProjectPath)
+        const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+        projectWorkbenchCacheRef.current.set(key, {...current, planning: false, aiOutputStatus: 'error', beginnerTaskState: 'error'})
+      } else if (uiModeRef.current === 'advanced') {
+        setBeginnerTaskState('idle')
+        setAiOutputStatus('idle')
+      } else {
+        setEvents((current) => [
+          {
+            id: `plan-error-${Date.now()}`,
+            stage: 'error',
+            title: 'AI 编程失败',
+            detail: failureDetail,
+            status: 'error',
+            time: new Date().toISOString()
+          },
+          ...current
+        ])
+        setNotice('制作没有完成，可导出诊断日志')
+        setBeginnerTaskState('error')
+        setAiOutputStatus('error')
+      }
       if (shouldOfferAiRecovery(error)) {
-        const recovery = await window.modmind.ai.getRecovery().catch(() => ({ pending: false, snapshot: null }))
-        if (recovery.pending) setAiRecovery(recovery)
+        const recovery = await window.modmind.ai.getRecovery(taskProjectPath).catch(() => ({ pending: false, snapshot: null, sessionId: undefined }))
+        if (recovery.pending && isForegroundProject(taskProjectPath)) setAiRecovery(recovery)
       }
     } finally {
-      setPlanning(false)
+      if (isForegroundProject(taskProjectPath)) setPlanning(false)
+      else {
+        const key = normalizeProjectPath(taskProjectPath)
+        const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+        projectWorkbenchCacheRef.current.set(key, {...current, planning: false})
+      }
+    }
+  }
+
+  const deviceAuthorize = async (): Promise<void> => {
+    setDeviceBusy(true)
+    try {
+      setDeviceState(await window.modmind.device.authorize())
+    } catch (error) {
+      setNotice(`连接失败：${errorMessage(error)}`)
+    } finally {
+      setDeviceBusy(false)
+    }
+  }
+
+  const deviceCancel = async (): Promise<void> => {
+    setDeviceBusy(true)
+    try {
+      setDeviceState(await window.modmind.device.cancelAuthorization())
+    } catch (error) {
+      setNotice(`取消失败：${errorMessage(error)}`)
+    } finally {
+      setDeviceBusy(false)
+    }
+  }
+
+  const deviceDisconnect = async (): Promise<void> => {
+    setDeviceBusy(true)
+    try {
+      setDeviceState(await window.modmind.device.disconnectLocal())
+    } catch (error) {
+      setNotice(`断开失败：${errorMessage(error)}`)
+    } finally {
+      setDeviceBusy(false)
+    }
+  }
+
+  const deviceRefresh = async (): Promise<void> => {
+    setDeviceBusy(true)
+    try {
+      setDeviceState(await window.modmind.device.refreshUsage())
+    } catch (error) {
+      setNotice(`刷新用量失败：${errorMessage(error)}`)
+    } finally {
+      setDeviceBusy(false)
+    }
+  }
+
+  const deviceOpenSite = (): void => { void window.modmind.device.openSite().catch((error) => setErrorNotice(errorMessage(error))) }
+
+  const remoteToggle = async (): Promise<void> => {
+    setRemoteBusy(true)
+    try {
+      setRemoteState(await (remoteState.enabled ? window.modmind.remote.stop() : window.modmind.remote.start()))
+    } catch (error) {
+      setNotice(`Remote 连接失败：${errorMessage(error)}`)
+    } finally {
+      setRemoteBusy(false)
+    }
+  }
+
+  const mcpBridgeToggle = async (enabled: boolean): Promise<void> => {
+    setMcpBridgeBusy(true)
+    try {
+      setMcpBridgeState(await window.modmind.mcpBridge.setEnabled(enabled))
+    } catch (error) {
+      setNotice(`MCP 接入设置失败：${errorMessage(error)}`)
+    } finally {
+      setMcpBridgeBusy(false)
     }
   }
 
@@ -1234,73 +3280,121 @@ export default function App(): React.JSX.Element {
   const exportArtifact = async (): Promise<void> => {
     try {
       const target = await window.modmind.project.exportArtifact()
-      if (target) setNotice(`Mod JAR 已导出到 ${target}`)
+      if (target) setNotice(project?.kind === 'modpack' ? `整合包已导出到 ${target}` : `Mod JAR 已导出到 ${target}`)
     } catch (error) {
       setNotice(`导出失败：${errorMessage(error)}`)
     }
   }
 
+  const exportServerPack = async (): Promise<void> => {
+    try {
+      const target = await window.modmind.modpack.exportServerPack()
+      if (target) setNotice(`服务端包已导出：${target}`)
+    } catch (error) {
+      setNotice(`服务端包导出失败：${errorMessage(error)}`)
+    }
+  }
+
   const repairBuildWithAi = async (): Promise<void> => {
     if (!project || !buildError || planning || building) return
+    const taskProjectPath = project.path
     let failure = buildError
     const sessionId = `build-repair-${Date.now()}`
+    workspaceSessionRef.current = sessionId
+    const selectedBackend: AgentSettings['codingBackend'] = uiMode === 'beginner' ? 'quota' : settings.codingBackend
+    setRunningBackend(selectedBackend)
+    const usesQuota = selectedBackend === 'quota'
+    const runToken = nextAiRunToken(taskProjectPath)
     setPlanning(true)
     setAiOutputStatus('running')
     try {
+      if (usesQuota) await window.modmind.beginnerCodex.prepare(taskProjectPath)
       for (let round = 1; round <= MAX_AUTO_REPAIR_ROUNDS; round += 1) {
+        if (!isCurrentAiRunToken(taskProjectPath, runToken)) return
+        const repairEvent: PipelineEvent = {
+          id: `repair-build-${round}-${Date.now()}`,
+          stage: 'planning',
+          title: uiMode === 'beginner' ? 'Codex 正在自动修复' : `AI 自动修复 ${round}/${MAX_AUTO_REPAIR_ROUNDS}`,
+          detail: '读取编译错误和当前工程文件',
+          status: 'running',
+          time: new Date().toISOString()
+        }
+        if (isForegroundProject(taskProjectPath)) setEvents((current) => [repairEvent, ...current])
+        else {
+          const key = normalizeProjectPath(taskProjectPath)
+          const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+          projectWorkbenchCacheRef.current.set(key, {...current, events: [repairEvent, ...current.events].slice(0, 500), planning: true, aiOutputStatus: 'running'})
+        }
+        const repairRoundInstruction = uiMode === 'beginner'
+          ? 'Fix every reported build error and keep repairing until verification passes.'
+          : `Automatic build repair round ${round}/${MAX_AUTO_REPAIR_ROUNDS}. Fix every reported build error.`
+        const result = await window.modmind.ai.createCode(
+          `${repairRoundInstruction} Preserve the requested mod behavior and make the smallest complete source changes needed.\n\nBUILD FAILURE\n${failure}`,
+          sessionId,
+          selectedBackend,
+          usesQuota ? 'beginner-unlimited' : 'standard',
+          { surface: 'workspace', projectPath: taskProjectPath, runId: `repair-${runToken}` }
+        )
+        if (!isCurrentAiRunToken(taskProjectPath, runToken)) return
+        storeProjectPlan(taskProjectPath, result)
+        await refreshFilesFor(taskProjectPath)
+        await refreshSnapshotsFor(taskProjectPath)
+        if (uiMode === 'beginner') {
+          if (isForegroundProject(taskProjectPath)) setNotice('Codex 已完成修复、构建和验收')
+          return
+        }
+          const build = await performBuild()
+        if (!isCurrentAiRunToken(taskProjectPath, runToken)) return
+        if (build.success) {
+          if (isForegroundProject(taskProjectPath)) setNotice(`AI 修复 ${round} 轮后构建成功`)
+          return
+        }
+        failure = build.error
+        if (isForegroundProject(taskProjectPath)) setAiOutputStatus('running')
+      }
+      if (isForegroundProject(taskProjectPath)) {
+        setView('build')
+        setNotice(`已自动修复 ${MAX_AUTO_REPAIR_ROUNDS} 轮，最后一次错误已保留`)
+      }
+    } catch (error) {
+      if (!isCurrentAiRunToken(taskProjectPath, runToken)) return
+      const detail = errorMessage(error)
+      if (!isForegroundProject(taskProjectPath)) {
+        const key = normalizeProjectPath(taskProjectPath)
+        const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+        projectWorkbenchCacheRef.current.set(key, {...current, planning: false, aiOutputStatus: 'error', buildError: detail})
+      } else if (uiModeRef.current === 'advanced') {
+        setAiOutputStatus('idle')
+      } else {
+        setAiOutputStatus('error')
         setEvents((current) => [
           {
-            id: `repair-build-${round}-${Date.now()}`,
-            stage: 'planning',
-            title: `AI 自动修复 ${round}/${MAX_AUTO_REPAIR_ROUNDS}`,
-            detail: '读取编译错误和当前工程文件',
-            status: 'running',
+            id: `repair-build-error-${Date.now()}`,
+            stage: 'error',
+            title: 'AI 修复未完成',
+            detail,
+            status: 'error',
             time: new Date().toISOString()
           },
           ...current
         ])
-        const result = await window.modmind.ai.createCode(
-          `Automatic build repair round ${round}/${MAX_AUTO_REPAIR_ROUNDS}. Fix every reported build error while preserving the requested mod behavior. Make the smallest complete source changes needed.\n\nBUILD FAILURE\n${failure}`,
-          sessionId
-        )
-        setAiPlan(result)
-        setAiOutputStatus('success')
-        await refreshFiles()
-        await refreshSnapshots()
-        const build = await performBuild()
-        if (build.success) {
-          setNotice(`AI 修复 ${round} 轮后构建成功`)
-          return
-        }
-        failure = build.error
-        setAiOutputStatus('running')
+        setNotice(detail)
       }
-      setView('build')
-      setNotice(`已自动修复 ${MAX_AUTO_REPAIR_ROUNDS} 轮，最后一次错误已保留`)
-    } catch (error) {
-      const detail = errorMessage(error)
-      setAiOutputStatus('error')
-      setEvents((current) => [
-        {
-          id: `repair-build-error-${Date.now()}`,
-          stage: 'error',
-          title: 'AI 修复未完成',
-          detail,
-          status: 'error',
-          time: new Date().toISOString()
-        },
-        ...current
-      ])
-      setNotice(detail)
     } finally {
-      setPlanning(false)
+      if (isForegroundProject(taskProjectPath)) setPlanning(false)
+      else {
+        const key = normalizeProjectPath(taskProjectPath)
+        const current = projectWorkbenchCacheRef.current.get(key) ?? emptyProjectWorkbenchState()
+        projectWorkbenchCacheRef.current.set(key, {...current, planning: false})
+      }
     }
   }
 
   const createSnapshot = async (): Promise<void> => {
     if (!project) return
     try {
-      const result = await window.modmind.snapshots.create('手动快照')
+      const projectPath = project.path
+      const result = await window.modmind.snapshots.create('手动快照', projectPath)
       setSnapshots((current) => [result, ...current])
       setNotice(`已保存 ${result.fileCount} 个文件`)
     } catch (error) {
@@ -1311,13 +3405,14 @@ export default function App(): React.JSX.Element {
   const restoreSnapshot = async (snapshot: SnapshotInfo): Promise<void> => {
     if (!project || restoringSnapshotId || building || planning || migrationBusy) return
     const unsavedMessage = editorDirty
-      ? '\n\n当前代码编辑器有未保存内容；继续后会先保存，并包含在自动安全备份中。'
+      ? '\n\n当前代码编辑器有未保存内容；继续后会先保存，并包含在自动安全备份中'
       : ''
-    if (!window.confirm(`恢复快照“${snapshot.label}”？\n\n当前项目状态会先自动备份，恢复失败时会自动回滚。${unsavedMessage}`)) return
+    if (!await requestConfirm({ title: `恢复快照“${snapshot.label}”？`, message: `当前项目状态会先自动备份，恢复失败时会自动回滚。${unsavedMessage}`, confirmLabel: '恢复快照', actionIcon: 'restore' })) return
     setRestoringSnapshotId(snapshot.id)
     try {
-      if (editorDirty && selectedFile) await window.modmind.project.writeFile(selectedFile, editorContent)
-      const result = await window.modmind.snapshots.restore(snapshot.id)
+      if (editorDirty && selectedFile) await window.modmind.project.writeFile(selectedFile, editorContent, project.path)
+      const projectPath = project.path
+      const result = await window.modmind.snapshots.restore(snapshot.id, projectPath)
       setProject(result.project)
       setSelectedFile('')
       setEditorContent('')
@@ -1327,7 +3422,7 @@ export default function App(): React.JSX.Element {
       setEvents([])
       setMinecraftEvents([])
       setAiRecovery(null)
-      await Promise.all([refreshFiles(), refreshSnapshots()])
+      await Promise.all([refreshFilesFor(projectPath), refreshSnapshotsFor(projectPath)])
       setNotice(`已恢复“${result.snapshot.label}”，恢复前状态已备份为 ${result.backup.id.slice(0, 19)}`)
     } catch (error) {
       setNotice(`恢复失败：${errorMessage(error)}`)
@@ -1338,10 +3433,12 @@ export default function App(): React.JSX.Element {
 
   const deleteSnapshot = async (snapshot: SnapshotInfo): Promise<void> => {
     if (!project || restoringSnapshotId || deletingSnapshotId || building || planning || migrationBusy) return
-    if (!window.confirm(`永久删除快照“${snapshot.label}”？\n\n删除后无法从 ModMind 恢复。`)) return
+    if (!await requestConfirm({ title: `永久删除快照“${snapshot.label}”？`, message: '删除后无法从 ModMind 恢复', confirmLabel: '永久删除', tone: 'danger' })) return
     setDeletingSnapshotId(snapshot.id)
     try {
-      setSnapshots(await window.modmind.snapshots.delete(snapshot.id))
+      const projectPath = project.path
+      const nextSnapshots = await window.modmind.snapshots.delete(snapshot.id, projectPath)
+      if (isForegroundProject(projectPath)) setSnapshots(nextSnapshots)
       setNotice(`已删除快照“${snapshot.label}”`)
     } catch (error) {
       setNotice(`删除快照失败：${errorMessage(error)}`)
@@ -1380,36 +3477,243 @@ export default function App(): React.JSX.Element {
     }
   }
 
-  const saveSettings = async (): Promise<void> => {
+  const saveSettingsPatch = async (patch: Partial<AgentSettings>): Promise<void> => {
+    const previous = settingsRef.current
+    const next = { ...previous, ...patch }
+    const mutation = settingsMutationRef.current + 1
+    settingsMutationRef.current = mutation
+    settingsRef.current = next
+    setSettings(next)
+    const save = settingsSaveTailRef.current.catch(() => undefined).then(() => window.modmind.settings.saveAgent(next))
+    settingsSaveTailRef.current = save.then(() => undefined).catch(() => undefined)
     try {
-      const saved = await window.modmind.settings.saveAi(settings)
-      setSettings(saved)
-      setNotice('设置已保存')
+      const saved = await save
+      if (settingsMutationRef.current === mutation) {
+        settingsRef.current = saved
+        setSettings(saved)
+        setNotice('设置已保存')
+      }
     } catch (error) {
-      setNotice(`配置保存失败：${errorMessage(error)}`)
+      if (settingsMutationRef.current === mutation) {
+        settingsRef.current = previous
+        setSettings(previous)
+        setNotice(`配置保存失败：${errorMessage(error)}`)
+      }
     }
   }
 
-  const selectCodingBackend = (backend: AiSettings['codingBackend']): void => {
-    const next = { ...settings, codingBackend: backend }
-    setSettings(next)
-    void window.modmind.settings.saveAi(next).then(setSettings).catch((error) => {
-      setNotice(`后端切换未保存：${errorMessage(error)}`)
-    })
+  const scanJavaHomes = (): void => {
+    setJavaScanState('scanning')
+    window.modmind.settings.scanJavaHomes()
+      .then((homes) => { setDetectedJavaHomes(homes); setJavaScanState('done') })
+      .catch(() => setJavaScanState('failed'))
   }
 
-  const launchExternalAgent = async (kind: 'codex' | 'claude'): Promise<void> => {
+  useEffect(() => {
+    if (view !== 'settings' || javaScanRequestedRef.current) return
+    javaScanRequestedRef.current = true
+    scanJavaHomes()
+  }, [view])
+
+  const updateJavaPreference = (scenario: keyof JavaPreferences) => (value: string): void => {
+    const base = settings.javaPreferences ?? { game: '', build: '', tools: '' }
+    void saveSettingsPatch({ javaPreferences: { ...base, [scenario]: value } })
+  }
+
+  const configureExternalAgent = async (kind: ExternalAgentKind): Promise<void> => {
+    if (configuringAgents[kind]) return
+    const usesManagedService = kind === 'codex'
+    if (usesManagedService && (!agentDraft.baseUrl?.trim() || !agentDraft.model?.trim() || (!agentDraft.apiKey?.trim() && !settings.externalAgents?.[kind]?.hasStoredKey))) {
+      setNotice('请填写 Base URL、API Key 并选择模型')
+      return
+    }
+    setConfiguringAgents((current) => ({ ...current, [kind]: true }))
+    try {
+      const result = await window.modmind.externalAgents.configure(kind, agentDraft)
+      const refreshedSettings = await window.modmind.settings.getAgent()
+      settingsRef.current = refreshedSettings
+      setSettings(refreshedSettings)
+      setEditingAgent(null)
+      setAgentDraft({})
+      setNotice(`${externalAgentLabel(kind)} 配置完成${result.configPath ? `：${result.configPath}` : ''}`)
+    } catch (error) {
+      setNotice(`自动配置失败：${errorMessage(error)}`)
+    } finally {
+      setConfiguringAgents((current) => ({ ...current, [kind]: false }))
+    }
+  }
+
+  const exportDiagnosticLogs = async (): Promise<void> => {
+    if (diagnosticExporting) return
+    setDiagnosticExporting(true)
+    try {
+      capturePageSnapshot()
+      const target = await window.modmind.diagnostics.exportLogs([...pageSnapshotsRef.current.values()])
+      if (target) setNotice(`诊断日志已导出：${target}`)
+    } catch (error) {
+      setNotice(`诊断日志导出失败：${errorMessage(error)}`)
+    } finally {
+      setDiagnosticExporting(false)
+    }
+  }
+
+  const saveImageSettings = async (patch: Partial<ImageStudioSettings> & { apiKey?: string; clearApiKey?: boolean }): Promise<void> => {
+    try {
+      const next = { ...imageStudioSettings, ...patch }
+      setImageStudioSettings(await window.modmind.imageStudio.saveSettings({ ...next, apiKey: patch.apiKey ?? imageApiKey, clearApiKey: patch.clearApiKey }))
+      if (patch.apiKey !== undefined) setImageApiKey('')
+      setNotice('图像服务设置已保存')
+    } catch (error) {
+      setNotice(`图像服务设置保存失败：${errorMessage(error)}`)
+    }
+  }
+
+  const clearImageApiKey = async (): Promise<void> => {
+    if (!await requestConfirm({ title: '删除已保存的图片 API Key？', message: '删除后图像服务将改用 ModMind 托管额度', confirmLabel: '删除 Key', tone: 'danger' })) return
+    await saveImageSettings({ apiKey: '', clearApiKey: true })
+  }
+
+  const saveBeginnerAiPreference = async (patch: Partial<BeginnerAiPreferences>): Promise<void> => {
+    if (savingAiPreferences) return
+    const previous = beginnerAiPreferences
+    const next = { ...beginnerAiPreferences, ...patch }
+    setBeginnerAiPreferences(next)
+    setSavingAiPreferences(true)
+    try {
+      setBeginnerAiPreferences(await window.modmind.device.saveAiPreferences(next))
+      setNotice('智能引擎设置已保存')
+    } catch (error) {
+      setBeginnerAiPreferences(previous)
+      setNotice(`智能引擎设置保存失败：${errorMessage(error)}`)
+    } finally {
+      setSavingAiPreferences(false)
+    }
+  }
+
+  const selectCodingBackend = (backend: AgentSettings['codingBackend']): void => {
+    const currentSettings = settingsRef.current
+    const currentBackend = runningBackend ?? currentSettings.codingBackend
+    if ((!planning && backend === currentSettings.codingBackend) || (planning && !switchingBackendRef.current && backend === currentBackend) || switchingBackendRef.current === backend) return
+    const generation = backendSwitchCounterRef.current + 1
+    backendSwitchCounterRef.current = generation
+    backendSwitchGenerationRef.current = generation
+    const taskProjectPath = project?.path
+    const activeConversation = workbenchConversations.find((item) => item.id === activeWorkbenchConversationId)
+    if (!taskProjectPath || uiMode !== 'advanced' || (!planning && !aiRecovery)) {
+      void saveSettingsPatch({ codingBackend: backend })
+      return
+    }
+    const wasPlanning = planning
+    let restoredPreviousSwitch = false
+    let preservePlanning = false
+    const request: PendingBackendSwitch = { generation, backend, previousBackend: currentBackend, accepted: false }
+    backendSwitchRequestsRef.current.set(generation, request)
+    pendingBackendSwitchRef.current = request
+    switchingBackendRef.current = backend
+    setSwitchingBackend(backend)
+    setPlanning(true)
+    setAiOutputStatus('running')
+    nextAiRunToken(taskProjectPath)
+    void window.modmind.ai.switchBackend(backend, taskProjectPath, activeConversation?.sessionScope, generation)
+      .then(async (result) => {
+        if (backendSwitchGenerationRef.current !== generation) return
+        if (result.status === 'superseded') return
+        if (result.status === 'rejected') {
+          const taskState = await window.modmind.ai.getProjectTaskState(taskProjectPath).catch(() => null)
+          if (backendSwitchGenerationRef.current !== generation) return
+          preservePlanning = wasPlanning && (taskState ? Boolean(taskState.startedAt) : true)
+          const activePending = result.activeSwitchId !== undefined
+            ? backendSwitchRequestsRef.current.get(result.activeSwitchId)
+            : undefined
+          if (activePending && taskState?.startedAt) {
+            restoredPreviousSwitch = true
+            const activeReady = result.activeReady === true || activePending.accepted
+            backendSwitchGenerationRef.current = activePending.generation
+            pendingBackendSwitchRef.current = activeReady ? null : activePending
+            switchingBackendRef.current = activeReady ? null : activePending.backend
+            setSwitchingBackend(activeReady ? null : activePending.backend)
+            if (activeReady) {
+              settingsRef.current = { ...settingsRef.current, codingBackend: activePending.backend }
+              setSettings((current) => ({ ...current, codingBackend: activePending.backend }))
+              setRunningBackend(activePending.backend)
+            }
+          } else {
+            const activeBackend = result.activeBackend ?? currentBackend
+            pendingBackendSwitchRef.current = null
+            switchingBackendRef.current = null
+            setSwitchingBackend(null)
+            settingsRef.current = { ...settingsRef.current, codingBackend: activeBackend }
+            setSettings((current) => ({ ...current, codingBackend: activeBackend }))
+            setRunningBackend(activeBackend)
+          }
+          setAiOutputStatus(preservePlanning ? 'running' : 'error')
+          setNotice(`引擎切换失败：${result.message ?? '目标引擎当前不可用'}`)
+          return
+        }
+        const pending = pendingBackendSwitchRef.current
+        if (pending?.generation === generation && !pending.accepted) {
+          pending.accepted = true
+          settingsRef.current = { ...settingsRef.current, codingBackend: backend }
+          setSettings((current) => ({ ...current, codingBackend: backend }))
+          setRunningBackend(backend)
+        }
+        setAiRecovery(null)
+        if (result.result) storeProjectPlan(taskProjectPath, result.result)
+        if (result.status === 'idle') setNotice(`已切换到 ${backend === 'quota' ? '智能引擎' : backend === 'codex' ? 'Codex' : 'Claude Code'}`)
+      })
+      .catch((error) => {
+        if (backendSwitchGenerationRef.current === generation) {
+          const pending = pendingBackendSwitchRef.current
+          if (pending?.generation === generation && !pending.accepted) {
+            settingsRef.current = { ...settingsRef.current, codingBackend: pending.previousBackend }
+            setSettings((current) => ({ ...current, codingBackend: pending.previousBackend }))
+            setRunningBackend(pending.previousBackend)
+          }
+          setNotice(`引擎切换失败：${aiFailureMessage(error)}`)
+          setAiOutputStatus('error')
+        }
+      })
+      .finally(() => {
+        backendSwitchRequestsRef.current.delete(generation)
+        if (backendSwitchGenerationRef.current === generation) {
+          pendingBackendSwitchRef.current = null
+          switchingBackendRef.current = null
+          setSwitchingBackend(null)
+          setPlanning(preservePlanning)
+        } else if (restoredPreviousSwitch) {
+          setPlanning(preservePlanning)
+        }
+      })
+  }
+
+  const selectUiMode = (nextMode: UiMode): void => {
+    if (nextMode === uiMode) return
+    if (nextMode === 'beginner') {
+      setLastAdvancedView(view === 'settings' ? 'workspace' : view)
+      setView('workspace')
+    } else {
+      setView(lastAdvancedView)
+    }
+    setUiMode(nextMode)
+    try {
+      localStorage.setItem('modmind-ui-mode', nextMode)
+    } catch {
+      // A restricted webview may not expose localStorage; the in-memory mode still works.
+    }
+  }
+
+  const launchExternalAgent = async (kind: ExternalAgentKind): Promise<void> => {
     try {
       await window.modmind.externalAgents.launch(kind)
-      setNotice(`${kind === 'codex' ? 'Codex' : 'Claude Code'} 已在项目目录启动`)
+      setNotice(`${externalAgentLabel(kind)} 已在项目目录启动`)
     } catch (error) {
-      setNotice(errorMessage(error))
+      setErrorNotice(errorMessage(error))
     }
   }
 
-  const installExternalAgent = async (kind: 'codex' | 'claude'): Promise<void> => {
+  const installExternalAgent = async (kind: ExternalAgentKind): Promise<void> => {
     setInstallingAgents((current) => ({ ...current, [kind]: true }))
-    setNotice(`正在安装 ${kind === 'codex' ? 'Codex' : 'Claude Code'}…`)
+    setNotice(`正在安装 ${externalAgentLabel(kind)}…`)
     try {
       const status = await window.modmind.externalAgents.install(kind)
       setExternalAgents((current) => [...current.filter((item) => item.kind !== kind), status])
@@ -1421,7 +3725,7 @@ export default function App(): React.JSX.Element {
     }
   }
 
-  const openExternalAgentDocs = async (kind: 'codex' | 'claude'): Promise<void> => {
+  const openExternalAgentDocs = async (kind: ExternalAgentKind): Promise<void> => {
     try {
       await window.modmind.externalAgents.openDocs(kind)
     } catch (error) {
@@ -1430,23 +3734,97 @@ export default function App(): React.JSX.Element {
   }
 
   const scanModels = async (): Promise<void> => {
-    if (scanningModels || !settings.baseUrl.trim()) return
+    if (scanningModels || !editingAgent || !agentDraft.baseUrl?.trim()) return
     setScanningModels(true)
     setModelScanMessage('正在读取可用模型…')
     try {
-      const models = await window.modmind.settings.listModels(settings)
+      const models = await window.modmind.settings.listAgentModels(editingAgent, agentDraft)
       setAvailableModels(models)
       setModelScanMessage(models.length ? `发现 ${models.length} 个模型` : '接口没有返回可用模型，可手动填写 ID')
-      if (models.length === 1 && !settings.model) setSettings((current) => ({ ...current, model: models[0].id }))
+      if (models.length === 1 && !agentDraft.model) setAgentDraft((current) => ({ ...current, model: models[0].id }))
     } catch (error) {
       setAvailableModels([])
-      setModelScanMessage(errorMessage(error))
+      setModelScanMessage(aiFailureMessage(error))
     } finally {
       setScanningModels(false)
     }
   }
 
+  const scanBeginnerModels = async (): Promise<void> => {
+    if (scanningBeginnerModels) return
+    setScanningBeginnerModels(true)
+    setBeginnerModelScanMessage('正在读取账号可用模型…')
+    try {
+      const models = await window.modmind.device.listModels(true)
+      setBeginnerAvailableModels(models)
+      setBeginnerAiPreferences(await window.modmind.device.getAiPreferences())
+      setBeginnerModelScanMessage(models.length ? `发现 ${models.length} 个可用模型` : '账号服务没有返回可用模型')
+    } catch (error) {
+      setBeginnerAvailableModels([])
+      setBeginnerModelScanMessage(aiFailureMessage(error))
+    } finally {
+      setScanningBeginnerModels(false)
+    }
+  }
+
+  const saveGiteeBuildSettings = async (): Promise<void> => {
+    setGiteeBuildBusy('save')
+    try {
+      const saved = await window.modmind.production.remoteBuild.saveGiteeSettings(giteeSettings)
+      setGiteeSettings(saved)
+      setGiteeValidation(null)
+      setNotice('Gitee 构建配置已保存')
+    } catch (error) {
+      setNotice(`Gitee 配置保存失败：${errorMessage(error)}`)
+    } finally {
+      setGiteeBuildBusy('')
+    }
+  }
+
+  const validateGitee = async (): Promise<void> => {
+    setGiteeBuildBusy('validate')
+    try {
+      const result = await window.modmind.production.remoteBuild.validateGitee(giteeSettings)
+      setGiteeValidation(result)
+      setNotice(result.detail)
+    } catch (error) {
+      setGiteeValidation({ valid: false, detail: errorMessage(error) })
+      setNotice(`Gitee 校验失败：${errorMessage(error)}`)
+    } finally {
+      setGiteeBuildBusy('')
+    }
+  }
+
+  const triggerGiteeBuild = async (): Promise<void> => {
+    if (!giteeSettings.repositoryUrl.trim()) {
+      setNotice('请先填写 Gitee 仓库地址')
+      return
+    }
+    setGiteeBuildBusy('build')
+    setGiteeBuildResult(null)
+    try {
+      const saved = await window.modmind.production.remoteBuild.saveGiteeSettings(giteeSettings)
+      setGiteeSettings(saved)
+      const result = await window.modmind.production.remoteBuild.triggerGitee()
+      setGiteeBuildResult(result)
+      setNotice(result.detail)
+    } catch (error) {
+      setNotice(`Gitee 远程构建失败：${errorMessage(error)}`)
+    } finally {
+      setGiteeBuildBusy('')
+    }
+  }
+
   const latestEvent = events[0]
+  const javaProject = !project || isJavaLoader(project.loader)
+  const modpackProject = project?.kind === 'modpack'
+  const workspacePromptHeading = modpackProject ? '描述整合包的下一步' : '描述你想要的 Mod'
+  const workspacePromptDescription = modpackProject
+    ? 'AI 会读取当前整合包，并直接修改任务、配置、资源或脚本'
+    : 'AI 将读取现有工程，直接创建或修改代码与资源文件'
+  const workspacePromptPlaceholder = modpackProject
+    ? '例如：加入一条新手任务线，并为每一步配置奖励'
+    : '例如：制作一个可以储存经验值的水晶方块，右键存入，Shift 右键取出…'
   const migrationVersions = loaderCatalog.filter((option) => option.loader === migrationLoader)
   const selectedMigrationVersion = migrationVersion || migrationVersions[0]?.minecraftVersion || ''
   const filteredModels = availableModels.filter((model) => model.id.toLowerCase().includes(modelSearch.trim().toLowerCase()))
@@ -1455,58 +3833,680 @@ export default function App(): React.JSX.Element {
     return !query || `${member.type} ${Object.values(member.names).join(' ')}`.toLowerCase().includes(query)
   }) ?? []
   const navGroups = useMemo(
-    () => [
+    () => {
+      if (!project) {
+        return [
+          {
+            label: '项目',
+            items: [{ id: 'workspace' as const, label: '项目', icon: FolderOpen }]
+          },
+          {
+            label: '应用',
+            items: [
+              { id: 'image-studio' as const, label: '图像工坊', icon: WandSparkles },
+              { id: 'settings' as const, label: '设置', icon: Settings }
+            ]
+          }
+        ]
+      }
+
+      if (modpackProject) {
+        return [
+          { label: '整合包', items: [
+            { id: 'workspace' as const, label: '整合包创作', icon: MessageSquareText },
+            { id: 'modpack-manifest' as const, label: '文件清单', icon: Archive },
+            { id: 'modpack-mod-list' as const, label: '模组列表', icon: List },
+            { id: 'third-party-mods' as const, label: '模组下载', icon: PackagePlus }
+          ] },
+          { label: '内容', items: [
+            { id: 'modpack-config' as const, label: '配置与默认项', icon: FileCog },
+            { id: 'modpack-scripts' as const, label: '脚本与 KubeJS', icon: Code2 },
+            { id: 'modpack-datapacks' as const, label: '数据包', icon: Archive },
+            { id: 'ftb-quests' as const, label: 'FTB 任务书', icon: BookOpen },
+            { id: 'patchouli' as const, label: 'Patchouli 指南书', icon: LibraryBig },
+            { id: 'image-studio' as const, label: '图像工坊', icon: WandSparkles },
+            { id: 'modpack-resourcepacks' as const, label: '资源包', icon: Image },
+            { id: 'modpack-shaders' as const, label: '光影包', icon: Sparkles },
+            { id: 'modpack-ui' as const, label: '界面资源', icon: WandSparkles },
+            { id: 'modpack-worlds' as const, label: '存档与世界', icon: Save },
+            { id: 'modpack-client' as const, label: '玩家预设', icon: SlidersHorizontal },
+            { id: 'modpack-server-content' as const, label: '服务端配置', icon: ServerCog },
+            { id: 'modpack-files' as const, label: '文件工作台', icon: FolderOpen },
+            { id: 'code' as const, label: '代码编辑器', icon: Code2 }
+          ] },
+          { label: '运行', items: [
+            { id: 'modpack-migration' as const, label: '版本迁移', icon: ArrowRightLeft },
+            { id: 'decompile' as const, label: '反编译', icon: Binary },
+            { id: 'modpack-automation' as const, label: '依赖与优化', icon: Gauge },
+            { id: 'modpack-server' as const, label: '本机服务端', icon: Server },
+            { id: 'minecraft' as const, label: '游戏测试', icon: Gamepad2 },
+            { id: 'inspiration' as const, label: '灵感台', icon: Lightbulb }
+          ] },
+          { label: '项目', items: [
+            { id: 'production' as const, label: '版本与导出', icon: CloudUpload },
+            { id: 'snapshots' as const, label: '版本记录', icon: History },
+            { id: 'settings' as const, label: '设置', icon: Settings }
+          ] }
+        ]
+      }
+
+      return [
       {
-        label: '开发',
-        items: [
+        label: '创作',
+        items: modpackProject ? [
+          { id: 'workspace' as const, label: '整合包创作', icon: MessageSquareText },
+          { id: 'modpack-mod-list' as const, label: '模组列表', icon: List },
+          { id: 'third-party-mods' as const, label: '模组下载', icon: PackagePlus },
+          { id: 'modpack-config' as const, label: '配置与默认项', icon: FileCog },
+          { id: 'modpack-scripts' as const, label: '脚本与 KubeJS', icon: Code2 },
+          { id: 'modpack-datapacks' as const, label: '数据包', icon: Archive },
+          { id: 'ftb-quests' as const, label: 'FTB 任务书', icon: BookOpen },
+          { id: 'patchouli' as const, label: 'Patchouli 指南书', icon: LibraryBig },
+          { id: 'modpack-resourcepacks' as const, label: '资源包', icon: Image },
+          { id: 'modpack-shaders' as const, label: '光影包', icon: Sparkles },
+          { id: 'modpack-ui' as const, label: '界面资源', icon: WandSparkles },
+          { id: 'modpack-worlds' as const, label: '存档与世界', icon: Save },
+          { id: 'modpack-client' as const, label: '玩家预设', icon: SlidersHorizontal },
+          { id: 'modpack-server-content' as const, label: '服务端配置', icon: ServerCog },
+          { id: 'modpack-files' as const, label: '文件工作台', icon: FolderOpen },
+          { id: 'modpack-automation' as const, label: '依赖与优化', icon: Gauge },
+          { id: 'modpack-server' as const, label: '本机服务端', icon: Server },
+          { id: 'minecraft' as const, label: '游戏测试', icon: Gamepad2 },
+          { id: 'inspiration' as const, label: '灵感台', icon: Lightbulb }
+        ] : [
           { id: 'workspace' as const, label: '工作台', icon: MessageSquareText },
           { id: 'inspiration' as const, label: '灵感台', icon: Lightbulb },
-          { id: 'blockbench' as const, label: 'Blockbench', icon: Box },
-          { id: 'code' as const, label: '代码编辑', icon: Code2 },
-          { id: 'minecraft' as const, label: '游戏测试', icon: Gamepad2 },
-          { id: 'build' as const, label: '构建', icon: Hammer }
+          { id: 'image-studio' as const, label: '资源', icon: WandSparkles },
+          { id: 'blockbench' as const, label: '模型', icon: Box },
+          { id: 'code' as const, label: '代码', icon: Code2 },
+          ...(javaProject ? [{ id: 'relationships' as const, label: '前置与联动', icon: Link2 }] : []),
+          ...(javaProject ? [{ id: 'decompile' as const, label: '反编译', icon: Binary }] : []),
+          ...(javaProject ? [{ id: 'minecraft' as const, label: '游戏测试', icon: Gamepad2 }] : []),
+          { id: 'build' as const, label: '构建与导出', icon: Hammer }
         ]
       },
       {
-        label: '交付',
-        items: [
-          { id: 'production' as const, label: '生产中心', icon: CloudUpload },
+        label: '项目',
+        items: modpackProject ? [
+          { id: 'production' as const, label: '导出', icon: CloudUpload },
           { id: 'snapshots' as const, label: '版本', icon: History },
-          { id: 'mappings' as const, label: 'Mappings', icon: LibraryBig },
+          { id: 'settings' as const, label: '设置', icon: Settings }
+        ] : [
+          ...(javaProject ? [{ id: 'production' as const, label: '发布', icon: CloudUpload }] : []),
+          { id: 'snapshots' as const, label: '版本', icon: History },
+          ...(javaProject ? [{ id: 'mappings' as const, label: 'Mappings', icon: LibraryBig }] : []),
           { id: 'settings' as const, label: '设置', icon: Settings }
         ]
       }
-    ],
-    []
+      ]
+    },
+    [javaProject, modpackProject, project]
   )
+  const visibleNavGroupsRaw = uiMode === 'beginner'
+    ? !project
+      ? [
+          { label: '项目', items: [{ id: 'workspace' as const, label: '项目', icon: FolderOpen }] },
+          { label: '应用', items: [
+            { id: 'image-studio' as const, label: '图像工坊', icon: WandSparkles },
+            { id: 'settings' as const, label: '设置', icon: Settings }
+          ] }
+        ]
+      : [
+          ...(modpackProject ? [{
+            label: '创作',
+            items: [
+              { id: 'workspace' as const, label: '工作台', icon: Sparkles },
+              { id: 'inspiration' as const, label: '灵感台', icon: Lightbulb },
+              { id: 'ftb-quests' as const, label: 'FTB 任务书', icon: BookOpen },
+              { id: 'patchouli' as const, label: 'Patchouli 指南书', icon: LibraryBig },
+              { id: 'image-studio' as const, label: '图像工坊', icon: WandSparkles },
+              { id: 'code' as const, label: '代码编辑器', icon: Code2 },
+              { id: 'minecraft' as const, label: '游戏测试', icon: Gamepad2 }
+            ]
+          }] : []),
+          ...(!modpackProject ? [
+          { label: '创作', items: [
+            { id: 'workspace' as const, label: '开始创作', icon: Sparkles },
+            { id: 'inspiration' as const, label: '灵感', icon: Lightbulb },
+            ...(javaProject ? [{ id: 'relationships' as const, label: '联动模组', icon: Link2 }] : []),
+            ...(javaProject
+              ? [{ id: 'minecraft' as const, label: '游戏测试', icon: Gamepad2 }]
+              : [{ id: 'build' as const, label: '构建与导出', icon: Hammer }])
+          ] }
+          ] : [])
+        ]
+    : navGroups
+  // 用户插件分组：追加到导航尾部。
+  // 高级模式常驻「管理插件」入口（面向制作者，保证可发现性）；新手模式仅在已启用面板插件时出现。
+  const enabledPanelPlugins = useMemo(
+    () => pluginSnapshot.plugins.filter((plugin) => plugin.enabled && !plugin.error && plugin.manifest.panel),
+    [pluginSnapshot]
+  )
+  const visibleNavGroupsWithPlugins = useMemo(
+    () => {
+      const showManagerAlways = uiMode !== 'beginner'
+      if (enabledPanelPlugins.length === 0 && !showManagerAlways) return visibleNavGroupsRaw
+      return [...visibleNavGroupsRaw, {
+        label: '插件',
+        items: [
+          ...enabledPanelPlugins.map((plugin) => ({
+            id: `plugin:${plugin.manifest.id}` as ViewId,
+            label: plugin.manifest.name,
+            icon: Puzzle
+          })),
+          { id: 'plugins' as const, label: '管理插件', icon: Puzzle }
+        ]
+      }]
+    },
+    [enabledPanelPlugins, visibleNavGroupsRaw, uiMode]
+  )
+  const navLabelMap: Partial<Record<ViewId, string>> = {
+    workspace: modpackProject ? '工作台' : uiMode === 'beginner' ? '开始创作' : '工作台',
+    inspiration: '灵感台',
+    relationships: uiMode === 'beginner' ? '联动模组' : '前置与联动',
+    'modpack-manifest': '文件清单',
+    'modpack-mod-list': '模组列表',
+    'third-party-mods': '模组下载',
+    'modpack-config': '配置与默认项',
+    'modpack-scripts': '脚本与 KubeJS',
+    'modpack-datapacks': '数据包',
+    'modpack-content': '任务与手册',
+    'ftb-quests': 'FTB 任务书',
+    patchouli: 'Patchouli 指南书',
+    'modpack-resourcepacks': '资源包',
+    'modpack-shaders': '光影包',
+    'modpack-ui': '界面资源',
+    'modpack-worlds': '存档与世界',
+    'modpack-client': '玩家预设',
+    'modpack-server-content': '服务端配置',
+    'modpack-files': '文件工作台',
+    'modpack-migration': '版本迁移',
+    decompile: '反编译',
+    plugins: '管理插件',
+    'modpack-automation': '依赖与优化',
+    'modpack-server': '服务端测试',
+    minecraft: '游戏测试',
+    'image-studio': '图像工坊',
+    blockbench: '模型',
+    code: '代码',
+    build: '构建与导出',
+    production: '发布',
+    snapshots: '版本记录',
+    mappings: 'Mappings',
+    settings: '设置'
+  }
+  const navOrderStorageKey = `modmind-sidebar-order:v2:${uiMode}:${project?.kind ?? 'launcher'}:${javaProject ? 'java' : 'addon'}`
+  const navGroupOrderStorageKey = `${navOrderStorageKey}:groups`
 
-  return (
-    <div className={`app-shell ${settings.darkMode ? 'dark-mode' : ''}`}>
-      <header className="titlebar">
-        <div className="titlebar-name"><img src={appLogo} alt="" />{projectLauncherOpen ? 'ModMind' : project?.name ?? 'ModMind'}</div>
+  const resetSidebarOrder = async (): Promise<void> => {
+    if (!await requestConfirm({
+      title: '恢复侧边栏默认顺序？',
+      message: '这会清除当前项目的功能和类型排序，恢复默认顺序',
+      confirmLabel: '恢复默认顺序',
+      cancelLabel: '保留当前顺序',
+      tone: 'danger',
+      actionIcon: 'restore'
+    })) return
+
+    try {
+      localStorage.removeItem(navOrderStorageKey)
+      localStorage.removeItem(navGroupOrderStorageKey)
+      setSidebarOrders({})
+      setSidebarGroupOrder([])
+      setNotice('侧边栏顺序已恢复默认')
+    } catch (error) {
+      setNotice(`恢复侧边栏顺序失败：${errorMessage(error)}`)
+    }
+  }
+
+  useEffect(() => {
+    const load = (): void => {
+      try {
+        const stored = localStorage.getItem(navOrderStorageKey)
+        const parsed = stored ? JSON.parse(stored) : {}
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('invalid sidebar order')
+        const orders: Record<string, string[]> = {}
+        for (const [key, value] of Object.entries(parsed)) {
+          if (Array.isArray(value)) orders[key] = value.filter((item): item is string => typeof item === 'string')
+        }
+        setSidebarOrders(orders)
+      } catch {
+        setSidebarOrders({})
+      }
+    }
+    const onStorage = (event: StorageEvent): void => { if (event.key === navOrderStorageKey) load() }
+    load()
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [navOrderStorageKey])
+
+  useEffect(() => {
+    const load = (): void => {
+      try {
+        const stored = localStorage.getItem(navGroupOrderStorageKey)
+        const parsed = stored ? JSON.parse(stored) : []
+        setSidebarGroupOrder(Array.isArray(parsed) ? parsed.filter((item): item is string => typeof item === 'string') : [])
+      } catch {
+        setSidebarGroupOrder([])
+      }
+    }
+    const onStorage = (event: StorageEvent): void => { if (event.key === navGroupOrderStorageKey) load() }
+    load()
+    window.addEventListener('storage', onStorage)
+    return () => window.removeEventListener('storage', onStorage)
+  }, [navGroupOrderStorageKey])
+
+  const baseVisibleNavGroups = visibleNavGroupsWithPlugins.map((group, groupIndex) => ({
+    ...group,
+    groupKey: String(groupIndex),
+    label: group.label === '创建' || group.label === '鍒涗綔' ? '创作' : group.label === '项目' || group.label === '椤圭洰' ? '项目' : group.label === '应用' || group.label === '搴旂敤' ? '应用' : group.label,
+    items: (() => {
+      const mapped = group.items
+        .filter((item) => uiMode !== 'beginner' || !['ftb-quests', 'patchouli', 'image-studio'].includes(item.id))
+        .map((item) => ({ ...item, label: navLabelMap[item.id] || item.label }))
+      if (uiMode === 'beginner' && modpackProject && !mapped.some((item) => item.id === 'modpack-server')) {
+        mapped.push({ id: 'modpack-server' as const, label: '服务端测试', icon: Server })
+      }
+      if (!modpackProject || uiMode === 'beginner' || groupIndex !== 0) return mapped
+      const primary = mapped.find((item) => item.id === 'workspace')
+      const inspiration = { id: 'inspiration' as const, label: '灵感台', icon: Lightbulb }
+      const modList = mapped.find((item) => item.id === 'modpack-mod-list')
+      const downloads = mapped.find((item) => item.id === 'third-party-mods')
+      const rest = mapped.filter((item) => !['workspace', 'inspiration', 'modpack-mod-list', 'third-party-mods'].includes(item.id))
+      return [primary, inspiration, modList, downloads, ...rest].filter(Boolean) as typeof mapped
+    })().sort((left, right) => {
+      const order = sidebarOrders[String(groupIndex)] ?? []
+      const leftIndex = order.indexOf(left.id)
+      const rightIndex = order.indexOf(right.id)
+      if (leftIndex < 0 && rightIndex < 0) return 0
+      if (leftIndex < 0) return 1
+      if (rightIndex < 0) return -1
+      return leftIndex - rightIndex
+    })
+  }))
+  type BaseSidebarItem = (typeof baseVisibleNavGroups)[number]['items'][number]
+  const navItemsById = new Map<string, BaseSidebarItem>(
+    baseVisibleNavGroups.flatMap((group) => group.items.map((item) => [item.id, item] as [string, BaseSidebarItem]))
+  )
+  const assignedNavItemIds = new Set<string>()
+  for (const group of baseVisibleNavGroups) {
+    for (const id of sidebarOrders[group.groupKey] ?? []) {
+      if (navItemsById.has(id)) assignedNavItemIds.add(id)
+    }
+  }
+  const visibleNavGroups = baseVisibleNavGroups.map((group) => {
+    const savedItems = (sidebarOrders[group.groupKey] ?? [])
+      .map((id) => navItemsById.get(id))
+      .filter((item): item is (typeof group.items)[number] => Boolean(item))
+    const defaultItems = group.items.filter((item) => !assignedNavItemIds.has(item.id))
+    return { ...group, items: [...savedItems, ...defaultItems].filter((item) => !detachedSidebarItemIds.has(item.id)) }
+  })
+  const orderedVisibleNavGroups = [...visibleNavGroups].filter((group) => !detachedSidebarGroupKeys.has(group.groupKey)).sort((left, right) => {
+    const leftIndex = sidebarGroupOrder.indexOf(left.groupKey)
+    const rightIndex = sidebarGroupOrder.indexOf(right.groupKey)
+    if (leftIndex < 0 && rightIndex < 0) return 0
+    if (leftIndex < 0) return 1
+    if (rightIndex < 0) return -1
+    return leftIndex - rightIndex
+  })
+  const detachedGroup = initialDetachedGroup ? orderedVisibleNavGroups.find((group) => group.groupKey === initialDetachedGroup) : undefined
+  const detachedWindowTitle = navLabelMap[view] ?? 'ModMind'
+
+  useEffect(() => {
+    const firstItemId = detachedGroup?.items[0]?.id
+    if (!initialDetachedGroup || view !== 'workspace' || !firstItemId) return
+    setView(firstItemId)
+  }, [detachedGroup?.groupKey, detachedGroup?.items[0]?.id, initialDetachedGroup, view])
+
+  useLayoutEffect(() => {
+    const nav = sidebarNavRef.current
+    if (!nav) return
+    for (const animation of sidebarLayoutAnimationsRef.current.values()) animation.cancel()
+    sidebarLayoutAnimationsRef.current.clear()
+    const draggedKey = sidebarDragItemRef.current ? `item:${sidebarDragItemRef.current.id}` : sidebarDragGroupKeyRef.current ? `group:${sidebarDragGroupKeyRef.current}` : ''
+    const next = new Map<string, DOMRect>()
+    nav.querySelectorAll<HTMLElement>('[data-sidebar-drag-key]').forEach((node) => {
+      const key = node.dataset.sidebarDragKey
+      if (!key) return
+      const rect = node.getBoundingClientRect()
+      const previous = sidebarLayoutSnapshotRef.current.get(key)
+      if (previous) {
+        const deltaX = previous.left - rect.left
+        const deltaY = previous.top - rect.top
+        if (key !== draggedKey && (Math.abs(deltaX) > 1 || Math.abs(deltaY) > 1)) {
+          const animation = node.animate([{ transform: `translate(${deltaX}px, ${deltaY}px)` }, { transform: 'translate(0, 0)' }], { duration: 115, easing: 'cubic-bezier(0.25, 0.8, 0.35, 1)' })
+          sidebarLayoutAnimationsRef.current.set(key, animation)
+          void animation.finished.then(() => { if (sidebarLayoutAnimationsRef.current.get(key) === animation) sidebarLayoutAnimationsRef.current.delete(key) }).catch(() => undefined)
+        }
+      }
+      next.set(key, rect)
+    })
+    sidebarLayoutSnapshotRef.current = next
+  }, [sidebarOrders, sidebarGroupOrder, detachedSidebarGroupKeys, detachedSidebarItemIds])
+
+  const moveSidebarItem = (fromGroupKey: string, targetGroupKey: string, targetItems: Array<{ id: ViewId }>, draggedId: ViewId, targetId: ViewId | null, insertAfter = false): void => {
+    const sourceGroup = visibleNavGroups.find((group) => group.groupKey === fromGroupKey)
+    if (!sourceGroup) return
+    setSidebarOrders((current) => {
+      const normalizedIds = (groupKey: string, items: Array<{ id: ViewId }>): string[] => {
+        const availableIds = items.map((item) => item.id)
+        const saved = current[groupKey] ?? []
+        return [...saved.filter((id) => availableIds.includes(id as ViewId)), ...availableIds.filter((id) => !saved.includes(id))]
+      }
+      const sourceIds = normalizedIds(fromGroupKey, sourceGroup.items)
+      if (!sourceIds.includes(draggedId)) return current
+      const next = { ...current }
+      if (fromGroupKey === targetGroupKey) {
+        if (draggedId === targetId) return current
+        const reorderedIds = sourceIds.filter((id) => id !== draggedId)
+        const targetPosition = targetId ? reorderedIds.indexOf(targetId) : reorderedIds.length
+        if (targetPosition < 0) return current
+        const targetIndex = targetPosition + (targetId && insertAfter ? 1 : 0)
+        reorderedIds.splice(targetIndex, 0, draggedId)
+        if (reorderedIds.length === sourceIds.length && reorderedIds.every((id, index) => id === sourceIds[index])) return current
+        next[fromGroupKey] = reorderedIds
+      } else {
+        const targetIds = normalizedIds(targetGroupKey, targetItems).filter((id) => id !== draggedId)
+        const targetPosition = targetId ? targetIds.indexOf(targetId) : targetIds.length
+        if (targetPosition < 0) return current
+        const targetIndex = targetPosition + (targetId && insertAfter ? 1 : 0)
+        next[fromGroupKey] = sourceIds.filter((id) => id !== draggedId)
+        targetIds.splice(targetIndex, 0, draggedId)
+        next[targetGroupKey] = targetIds
+      }
+      try {
+        localStorage.setItem(navOrderStorageKey, JSON.stringify(next))
+      } catch {
+        // The session remains ordered even when browser storage is unavailable.
+      }
+      return next
+    })
+  }
+
+  const moveSidebarGroup = (draggedGroupKey: string, targetGroupKey: string, insertAfter = false): void => {
+    if (draggedGroupKey === targetGroupKey) return
+    setSidebarGroupOrder((current) => {
+      const groupKeys = visibleNavGroups.map((group) => group.groupKey)
+      const orderedKeys = [...current.filter((key) => groupKeys.includes(key)), ...groupKeys.filter((key) => !current.includes(key))]
+      const fromIndex = orderedKeys.indexOf(draggedGroupKey)
+      const targetIndex = orderedKeys.indexOf(targetGroupKey)
+      if (fromIndex < 0 || targetIndex < 0) return current
+      orderedKeys.splice(fromIndex, 1)
+      orderedKeys.splice(orderedKeys.indexOf(targetGroupKey) + (insertAfter ? 1 : 0), 0, draggedGroupKey)
+      if (orderedKeys.every((key, index) => key === [...current.filter((key) => groupKeys.includes(key)), ...groupKeys.filter((key) => !current.includes(key))][index])) return current
+      try {
+        localStorage.setItem(navGroupOrderStorageKey, JSON.stringify(orderedKeys))
+      } catch {
+        // The session remains ordered even when browser storage is unavailable.
+      }
+      return orderedKeys
+    })
+  }
+
+  const stopSidebarDragScroll = (): void => {
+    sidebarDragScrollVelocityRef.current = 0
+    if (sidebarDragScrollFrameRef.current !== null) {
+      window.cancelAnimationFrame(sidebarDragScrollFrameRef.current)
+      sidebarDragScrollFrameRef.current = null
+    }
+  }
+
+  const updateSidebarDragScroll = (clientY: number): void => {
+    const nav = sidebarNavRef.current
+    if (!nav || (!sidebarDragItemRef.current && !sidebarDragGroupKeyRef.current)) return
+    const bounds = nav.getBoundingClientRect()
+    const edge = Math.min(64, Math.max(32, bounds.height * 0.18))
+    const distanceFromTop = clientY - bounds.top
+    const distanceFromBottom = bounds.bottom - clientY
+    const intensity = distanceFromTop < edge ? (distanceFromTop - edge) / edge : distanceFromBottom < edge ? (edge - distanceFromBottom) / edge : 0
+    const velocity = Math.sign(intensity) * Math.min(18, Math.max(2, Math.abs(intensity) * 18))
+    if (!velocity || (velocity < 0 && nav.scrollTop <= 0) || (velocity > 0 && nav.scrollTop + nav.clientHeight >= nav.scrollHeight)) {
+      stopSidebarDragScroll()
+      return
+    }
+    sidebarDragScrollVelocityRef.current = velocity
+    if (sidebarDragScrollFrameRef.current !== null) return
+    const tick = (): void => {
+      const element = sidebarNavRef.current
+      const nextVelocity = sidebarDragScrollVelocityRef.current
+      if (!element || !nextVelocity) {
+        sidebarDragScrollFrameRef.current = null
+        return
+      }
+      const previous = element.scrollTop
+      element.scrollTop += nextVelocity
+      if (element.scrollTop === previous) {
+        stopSidebarDragScroll()
+        return
+      }
+      sidebarDragScrollFrameRef.current = window.requestAnimationFrame(tick)
+    }
+    sidebarDragScrollFrameRef.current = window.requestAnimationFrame(tick)
+  }
+
+  const handleSidebarWheel = (event: React.WheelEvent<HTMLElement>): void => {
+    const nav = sidebarNavRef.current
+    if (!nav || !event.deltaY) return
+    nav.scrollTop += event.deltaY
+    event.preventDefault()
+  }
+
+  const beginSidebarDrag = (event: React.DragEvent<HTMLButtonElement>, item: { id: ViewId; label: string }, groupKey: string): void => {
+    window.getSelection()?.removeAllRanges()
+    sidebarDropHandledRef.current = false
+    sidebarDragGroupKeyRef.current = null
+    sidebarDragItemRef.current = { id: item.id, groupKey, label: item.label }
+    setSidebarDraggedId(item.id)
+    setSidebarDropTargetId(null)
+    setSidebarGroupDropTargetKey(null)
+    event.dataTransfer.effectAllowed = 'copyMove'
+    event.dataTransfer.setData('text/plain', item.id)
+    event.dataTransfer.setData('application/x-modmind-sidebar-item', JSON.stringify(sidebarDragItemRef.current))
+  }
+
+  const beginSidebarGroupDrag = (event: React.DragEvent<HTMLSpanElement>, groupKey: string): void => {
+    window.getSelection()?.removeAllRanges()
+    sidebarDropHandledRef.current = false
+    sidebarDragItemRef.current = null
+    sidebarDragGroupKeyRef.current = groupKey
+    setSidebarDraggedId(null)
+    setSidebarDropTargetId(null)
+    setSidebarDraggedGroupKey(groupKey)
+    setSidebarGroupDropTargetKey(null)
+    event.dataTransfer.effectAllowed = 'move'
+    event.dataTransfer.setData('text/plain', `group:${groupKey}`)
+  }
+
+  const clearSidebarDragState = (): void => {
+    stopSidebarDragScroll()
+    sidebarDragItemRef.current = null
+    sidebarDragGroupKeyRef.current = null
+    sidebarDropHandledRef.current = false
+    setSidebarDraggedId(null)
+    setSidebarDropTargetId(null)
+    setSidebarDraggedGroupKey(null)
+    setSidebarGroupDropTargetKey(null)
+  }
+
+  const finishSidebarDrag = (event: React.DragEvent<HTMLElement>): void => {
+    const dragged = sidebarDragItemRef.current
+    const draggedGroupKey = sidebarDragGroupKeyRef.current
+    const navBounds = sidebarNavRef.current?.getBoundingClientRect()
+    const droppedOutsideNavigation = Boolean(navBounds && (
+      event.clientX < navBounds.left || event.clientX > navBounds.right || event.clientY < navBounds.top || event.clientY > navBounds.bottom
+    ))
+    const droppedOutsideNavigationHorizontally = Boolean(navBounds && (event.clientX < navBounds.left || event.clientX > navBounds.right))
+    const acceptedExternalDrop = event.dataTransfer.dropEffect === 'move'
+    if (dragged && !sidebarDropHandledRef.current && droppedOutsideNavigation && !acceptedExternalDrop) {
+      void window.modmind.app.openDetachedWindow(dragged.id, dragged.label)
+        .then(() => {
+          setDetachedSidebarItemIds((current) => new Set(current).add(dragged.id))
+        })
+        .catch(setErrorNotice)
+    }
+    if (draggedGroupKey && !sidebarDropHandledRef.current && droppedOutsideNavigationHorizontally) {
+      const group = visibleNavGroups.find((entry) => entry.groupKey === draggedGroupKey)
+      if (group) void window.modmind.app.openDetachedWindow(`group:${draggedGroupKey}`, group.label)
+        .then(() => setDetachedSidebarGroupKeys((current) => new Set(current).add(draggedGroupKey)))
+        .catch(setErrorNotice)
+    }
+    clearSidebarDragState()
+  }
+
+  const toggleDetachedAlwaysOnTop = (): void => {
+    void window.modmind.app.setDetachedWindowAlwaysOnTop(!detachedAlwaysOnTop)
+      .then((state) => setDetachedAlwaysOnTop(state.alwaysOnTop))
+      .catch(setErrorNotice)
+  }
+
+  useEffect(() => {
+    const reset = (): void => clearSidebarDragState()
+    window.addEventListener('dragend', reset)
+    window.addEventListener('drop', reset)
+    return () => {
+      window.removeEventListener('dragend', reset)
+      window.removeEventListener('drop', reset)
+    }
+  }, [])
+
+  const advancedErrorsHidden = uiMode === 'advanced'
+  const buildLogs = buildResult?.logs.filter((line) => !advancedErrorsHidden || !/(error|failed|failure|exception|fatal|fail|失败|错误|异常)/i.test(line)) ?? []
+  const projectIndependentView = view === 'settings'
+    || view === 'image-studio'
+    || view === 'decompile'
+    || view === 'plugins'
+    || view.startsWith('plugin:')
+
+  if (false && initialDetachedGroup) {
+    return <div className={`app-shell ${settings.darkMode ? 'dark-mode' : ''} detached-window detached-group-window-shell mode-${uiMode}`}>
+      <header className="titlebar detached-titlebar">
+        <div className="titlebar-name"><img src={appLogo} alt="" />{detachedGroup?.label ?? 'ModMind'}</div>
         <div className="titlebar-actions">
-          <button className="titlebar-icon" title="切换侧栏"><PanelLeft size={15} /></button>
-          <button className="titlebar-icon" title="更多操作"><MoreHorizontal size={16} /></button>
+          <button className={`detached-pin ${detachedAlwaysOnTop ? 'active' : ''}`} type="button" title={detachedAlwaysOnTop ? '取消窗口置顶' : '窗口置顶'} aria-label={detachedAlwaysOnTop ? '取消窗口置顶' : '窗口置顶'} aria-pressed={detachedAlwaysOnTop} onClick={toggleDetachedAlwaysOnTop}>{detachedAlwaysOnTop ? <Pin size={14} /> : <PinOff size={14} />}</button>
           <span className="titlebar-divider" />
           <button className="window-control" title="最小化" onClick={() => void window.modmind.app.minimize()}><Minus size={15} /></button>
           <button className="window-control" title="最大化" onClick={() => void window.modmind.app.maximize()}><Square size={13} /></button>
           <button className="window-control close" title="关闭" onClick={() => void window.modmind.app.close()}><X size={16} /></button>
         </div>
       </header>
+      <main className="detached-group-window">
+        {detachedGroup ? <nav aria-label={detachedGroup?.label ?? 'ModMind'}>{detachedGroup?.items?.map((item) => <button key={item.id} type="button" onClick={() => void window.modmind.app.openDetachedWindow(item.id, item.label).catch(setErrorNotice)}><item.icon size={16} /><span>{item.label}</span>{item.id === 'decompile' || item.id === 'plugins' ? <i className="sidebar-beta-badge" title="新功能测试中">Beta</i> : null}<ChevronRight size={15} /></button>)}</nav> : <div className="detached-group-empty">类型内容正在载入</div>}
+      </main>
+    </div>
+  }
+
+  return (
+    <div className={`app-shell ${settings.darkMode ? 'dark-mode' : ''} ${uiMode === 'beginner' ? 'beginner-mode' : ''} ${isDetachedWindow ? 'detached-window' : ''} ${initialDetachedGroup ? 'detached-group-window-shell' : ''} mode-transition mode-${uiMode}`}>
+      {isDetachedWindow ? <header className="titlebar detached-titlebar">
+        <div className="titlebar-name">{initialDetachedGroup ? detachedGroup?.label ?? '' : <><img src={appLogo} alt="" />{detachedWindowTitle}</>}</div>
+        <div className="titlebar-actions">
+          <button className={`detached-pin ${detachedAlwaysOnTop ? 'active' : ''}`} type="button" title={detachedAlwaysOnTop ? '取消窗口置顶' : '窗口置顶'} aria-label={detachedAlwaysOnTop ? '取消窗口置顶' : '窗口置顶'} aria-pressed={detachedAlwaysOnTop} onClick={toggleDetachedAlwaysOnTop}>{detachedAlwaysOnTop ? <Pin size={14} /> : <PinOff size={14} />}</button>
+          <span className="titlebar-divider" />
+          <button className="window-control" title="最小化" onClick={() => void window.modmind.app.minimize()}><Minus size={15} /></button>
+          <button className="window-control" title="最大化" onClick={() => void window.modmind.app.maximize()}><Square size={13} /></button>
+          <button className="window-control close" title="关闭" onClick={() => void window.modmind.app.close()}><X size={16} /></button>
+        </div>
+      </header> : null}
+      {!isDetachedWindow ? <header className="titlebar">
+        <div className="titlebar-name"><img src={appLogo} alt="" />{projectLauncherOpen ? 'ModMind' : project?.name ?? 'ModMind'}</div>
+        <div className="titlebar-actions">
+          <button className="hosted-titlebar-button" type="button" title="ModMind 账号与额度" onClick={() => setDeviceAccountOpen(true)}><UserRound size={14} /><span>{deviceState.status === 'connected' ? formatBalanceCents(deviceState.balanceCents) : '连接账号'}</span></button>
+          <label className="expert-mode-toggle" title="开启后显示完整开发工具与设置"><span>专业模式</span><input type="checkbox" checked={uiMode === 'advanced'} onChange={(event) => selectUiMode(event.target.checked ? 'advanced' : 'beginner')} /><span className="expert-mode-track" aria-hidden="true" /></label>
+          <button className="titlebar-icon" title={sidebarCollapsed ? '展开侧栏' : '收起侧栏'} aria-label={sidebarCollapsed ? '展开侧栏' : '收起侧栏'} onClick={() => setSidebarCollapsed((current) => !current)}><PanelLeft size={15} /></button>
+          <div className="titlebar-menu-wrap" ref={titlebarMenuRef}>
+            <button className="titlebar-icon" title="更多操作" aria-label="更多操作" aria-expanded={titlebarMenuOpen} onClick={() => setTitlebarMenuOpen((current) => !current)}><MoreHorizontal size={16} /></button>
+            {titlebarMenuOpen ? <div className="titlebar-menu" role="menu">
+              <button type="button" role="menuitem" onClick={() => { selectUiMode('advanced'); setView('settings'); setTitlebarMenuOpen(false) }}><Settings size={14} />打开设置</button>
+              <button type="button" role="menuitem" onClick={() => { void saveSettingsPatch({ darkMode: !settings.darkMode }); setTitlebarMenuOpen(false) }}><Sparkles size={14} />切换深色模式</button>
+              {project ? <button type="button" role="menuitem" onClick={() => { void window.modmind.project.reveal(undefined, project.path); setTitlebarMenuOpen(false) }}><FolderOpen size={14} />打开项目目录</button> : null}
+            </div> : null}
+          </div>
+          <span className="titlebar-divider" />
+          <button className="window-control" title="最小化" onClick={() => void window.modmind.app.minimize()}><Minus size={15} /></button>
+          <button className="window-control" title="最大化" onClick={() => void window.modmind.app.maximize()}><Square size={13} /></button>
+          <button className="window-control close" title="关闭" onClick={() => void window.modmind.app.close()}><X size={16} /></button>
+        </div>
+      </header> : null}
 
       <div className="app-body">
-        <aside className="sidebar">
+        {(!isDetachedWindow || initialDetachedGroup) ? <aside className={`sidebar ${sidebarCollapsed ? 'collapsed' : ''} ${initialDetachedGroup ? 'detached-group-sidebar' : ''}`}>
           <div className="brand-row">
             <img className="brand-mark" src={appLogo} alt="ModMind" />
-            <div><strong>ModMind</strong><span>AI Mod Workspace</span></div>
+            <div><strong>ModMind</strong><span>Minecraft 创作工具</span></div>
           </div>
 
-          <nav className="sidebar-nav">
-            {navGroups.map((group, index) => <div className="sidebar-nav-group" key={group.label}>
-              <span className={`nav-caption ${index ? 'settings-caption' : ''}`}>{group.label}</span>
+          <nav ref={sidebarNavRef} className="sidebar-nav" onDragOver={(event) => updateSidebarDragScroll(event.clientY)} onDragLeave={(event) => { if (!event.currentTarget.contains(event.relatedTarget as Node | null)) stopSidebarDragScroll() }} onWheel={handleSidebarWheel}>
+            {(initialDetachedGroup && detachedGroup ? [detachedGroup] : orderedVisibleNavGroups).map((group, index) => <div className="sidebar-nav-group" data-sidebar-drag-key={`group:${group.groupKey}`} key={group.groupKey}>
+              <span
+                draggable
+                className={`nav-caption ${index ? 'settings-caption' : ''} ${sidebarDraggedGroupKey === group.groupKey ? 'dragging' : ''} ${sidebarGroupDropTargetKey === group.groupKey ? 'drop-target' : ''}`}
+                onDragStart={(event) => beginSidebarGroupDrag(event, group.groupKey)}
+                onDragOver={(event) => {
+                  const draggedGroupKey = sidebarDragGroupKeyRef.current
+                  const draggedItem = sidebarDragItemRef.current ?? readSidebarDragPayload(event.dataTransfer)
+                  if (!draggedGroupKey && !draggedItem && !event.dataTransfer.types.includes('application/x-modmind-sidebar-item')) return
+                  event.preventDefault()
+                  event.dataTransfer.dropEffect = 'move'
+                  if (draggedGroupKey) {
+                    const bounds = event.currentTarget.getBoundingClientRect()
+                    moveSidebarGroup(draggedGroupKey, group.groupKey, event.clientY > bounds.top + bounds.height / 2)
+                  }
+                  setSidebarGroupDropTargetKey(group.groupKey)
+                  setSidebarDropTargetId(null)
+                }}
+                onDrop={(event) => {
+                  const draggedGroupKey = sidebarDragGroupKeyRef.current
+                  const draggedItem = sidebarDragItemRef.current ?? readSidebarDragPayload(event.dataTransfer)
+                  if (!draggedGroupKey && !draggedItem) return
+                  event.preventDefault()
+                  sidebarDropHandledRef.current = true
+                  if (draggedGroupKey) moveSidebarGroup(draggedGroupKey, group.groupKey, event.clientY > event.currentTarget.getBoundingClientRect().top + event.currentTarget.getBoundingClientRect().height / 2)
+                  else if (draggedItem) {
+                    moveSidebarItem(draggedItem.groupKey, group.groupKey, group.items, draggedItem.id, null)
+                    if (sidebarDragItemRef.current?.id === draggedItem.id) sidebarDragItemRef.current = { ...sidebarDragItemRef.current, groupKey: group.groupKey }
+                  }
+                  setSidebarGroupDropTargetKey(null)
+                }}
+                onDragEnd={finishSidebarDrag}
+              >{group.label}</span>
               {group.items.map((item) => (
-                <button key={item.id} className={view === item.id ? 'active' : ''} onClick={() => setView(item.id)} type="button">
+                <button
+                  key={item.id}
+                  data-sidebar-drag-key={`item:${item.id}`}
+                  draggable
+                  className={`sidebar-nav-item ${view === item.id ? 'active' : ''} ${sidebarDraggedId === item.id ? 'dragging' : ''} ${sidebarDropTargetId === item.id ? 'drop-target' : ''}`}
+                  aria-current={view === item.id ? 'page' : undefined}
+                  aria-label={item.label}
+                  title={sidebarCollapsed ? item.label : undefined}
+                  onClick={() => { navigateToView(item.id); if (project) setProjectLauncherOpen(false) }}
+                  onDragStart={(event) => beginSidebarDrag(event, item, group.groupKey)}
+                  onDragOver={(event) => {
+                    const dragged = sidebarDragItemRef.current ?? readSidebarDragPayload(event.dataTransfer)
+                    if (!dragged && !event.dataTransfer.types.includes('application/x-modmind-sidebar-item')) return
+                    event.preventDefault()
+                    event.dataTransfer.dropEffect = 'move'
+                    if (dragged) {
+                      moveSidebarItem(dragged.groupKey, group.groupKey, group.items, dragged.id, item.id, event.clientY > event.currentTarget.getBoundingClientRect().top + event.currentTarget.getBoundingClientRect().height / 2)
+                      if (sidebarDragItemRef.current?.id === dragged.id && dragged.groupKey !== group.groupKey) sidebarDragItemRef.current = { ...sidebarDragItemRef.current, groupKey: group.groupKey }
+                    }
+                    setSidebarDropTargetId(item.id)
+                    setSidebarGroupDropTargetKey(null)
+                  }}
+                  onDrop={(event) => {
+                    const dragged = sidebarDragItemRef.current ?? readSidebarDragPayload(event.dataTransfer)
+                    if (!dragged) return
+                    event.preventDefault()
+                    sidebarDropHandledRef.current = true
+                    moveSidebarItem(dragged.groupKey, group.groupKey, group.items, dragged.id, item.id, event.clientY > event.currentTarget.getBoundingClientRect().top + event.currentTarget.getBoundingClientRect().height / 2)
+                    if (sidebarDragItemRef.current?.id === dragged.id && dragged.groupKey !== group.groupKey) sidebarDragItemRef.current = { ...sidebarDragItemRef.current, groupKey: group.groupKey }
+                    setSidebarDropTargetId(null)
+                    setSidebarGroupDropTargetKey(null)
+                  }}
+                  onDragEnd={finishSidebarDrag}
+                  type="button"
+                >
                   <item.icon size={16} /><span>{item.label}</span>
+                  {item.id === 'decompile' || item.id === 'plugins' ? <i className="sidebar-beta-badge" title="新功能测试中">Beta</i> : null}
                   {item.id === 'build' && latestEvent ? <i className={`status-dot ${latestEvent.status}`} /> : null}
                 </button>
               ))}
@@ -1515,147 +4515,171 @@ export default function App(): React.JSX.Element {
 
           <div className="sidebar-footer">
             {project ? (
-              <button className="project-switcher" onClick={() => { setProjectLauncherOpen(true); setView('workspace'); void refreshRecentProjects() }}>
-                <span className="project-cube"><Box size={16} /></span>
-                <span><strong>{project.name}</strong><small>{project.loader} · {project.minecraftVersion}</small></span>
-                <ChevronDown size={14} />
-              </button>
+              <div className="project-switcher-row">
+                <button className="project-switcher" type="button" onClick={() => { setProjectLauncherOpen(true); setView('workspace'); void refreshRecentProjects() }}>
+                  <span className="project-cube"><Box size={16} /></span>
+                  <span><strong>{project.name}</strong><small>{platformLabel(project.loader)} · {project.minecraftVersion}</small></span>
+                  <ChevronDown size={14} />
+                </button>
+              </div>
             ) : (
               <button className="new-project-side" onClick={() => setShowCreate(true)}><Plus size={16} />新建项目</button>
             )}
           </div>
-        </aside>
+        </aside> : null}
 
-        {view !== 'settings' && (projectLauncherOpen || !project) ? (
+        {!isDetachedWindow && !projectIndependentView && (projectLauncherOpen || !project) ? (
           <ProjectLauncher
             projects={recentProjects}
             onCreate={() => setShowCreate(true)}
             onOpen={() => void openProject()}
             onAdopt={() => setExistingImportPicker(true)}
+            onImportModJar={async () => {
+              const picked = await window.modmind.decompile.pickJar()
+              if (!picked) return
+              setModJarInspecting(true)
+              try {
+                setModJarInspection(await window.modmind.decompile.inspect(picked))
+              } catch (reason) {
+                setErrorNotice(errorMessage(reason))
+              } finally {
+                setModJarInspecting(false)
+              }
+            }}
             onSelect={(recent) => void openRecentProject(recent)}
             onRemove={(recent) => void removeRecentProject(recent)}
+            onRename={setRenamingProject}
           />
         ) : (
-          <main className="main-content">
-            {view === 'workspace' && project ? (
-              <>
-                <div className="content-toolbar">
-                  <div><h1>{project.name}</h1><p>{project.loader} · Minecraft {project.minecraftVersion}</p></div>
-                  <div className="toolbar-actions">
-                    <button className="secondary-button" onClick={() => void createSnapshot()}><History size={16} />保存版本</button>
-                    <button className="primary-button" disabled={building || planning} onClick={() => void runPreflight()}>
-                      {building ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}一键构建
-                    </button>
-                  </div>
+          <main ref={mainContentRef} className="main-content" data-view={view}>
+            {project?.kind === 'modpack' ? <KeepAliveRoute key={`modpack-content:${project.path}`} active={view === 'modpack-content'}><ModpackToolsWorkspace project={project} section="content" /></KeepAliveRoute> : null}
+            {view === 'relationships' && project && project.kind !== 'modpack' && isJavaLoader(project.loader) ? <AddonRelationshipsWorkspace project={project} beginner={uiMode === 'beginner'} onFilesChanged={() => { void refreshFiles(); void refreshSnapshots() }} onDecompile={(jarPath) => { setDecompileJarHandoff(jarPath); setView('decompile') }} /> : null}
+            {view === 'ftb-quests' && project?.kind === 'modpack' ? <div className="ftb-quest-host"><FtbQuestEditor project={project} /></div> : null}
+            {view === 'patchouli' && project?.kind === 'modpack' ? <PatchouliBookEditor /> : null}
+            {project?.kind === 'modpack' ? <KeepAliveRoute key={`modpack-migration:${project.path}`} active={view === 'modpack-migration'}><ModpackMigrationWorkspace project={project} onDecompile={(jarPath) => { setDecompileJarHandoff(jarPath); setView('decompile') }} /></KeepAliveRoute> : null}
+            <KeepAliveRoute key={`decompile:${project?.path ?? 'standalone'}`} active={view === 'decompile'}>
+              <DecompileWorkspace
+                key={decompileJarHandoff ?? 'none'}
+                initialJarPath={decompileJarHandoff}
+                projectContext={project}
+                darkMode={settings.darkMode}
+                onProjectCreated={(created) => {
+                  setProject(created)
+                  setProjectLauncherOpen(false)
+                  setView('workspace')
+                  void refreshRecentProjects()
+                }}
+              />
+            </KeepAliveRoute>
+            {project?.kind === 'modpack' ? <KeepAliveRoute key={`modpack-automation:${project.path}`} active={view === 'modpack-automation'}><ModpackToolsWorkspace project={project} section="automation" /></KeepAliveRoute> : null}
+            {project?.kind === 'modpack' ? <KeepAliveRoute key={`modpack-server:${project.path}`} active={view === 'modpack-server'}><ModpackToolsWorkspace project={project} section="server" /></KeepAliveRoute> : null}
+            {view === 'modpack-mod-list' && project?.kind === 'modpack' ? <ModpackModListWorkspace project={project} onOpenModule={(module) => { setProject(module); setView('workspace') }} onDecompile={(jarPath) => { setDecompileJarHandoff(jarPath); setView('decompile') }} /> : null}
+            {view === 'modpack-manifest' && project?.kind === 'modpack' ? <ModpackContentWorkspace project={project} section="other" inventoryMode onOpenEditor={openModpackContentEditor} onCreateFile={(contentPath, content) => void createModpackContentFile(contentPath, content)} /> : null}
+            {view === 'modpack-config' && project?.kind === 'modpack' ? <ModpackContentWorkspace project={project} section="config" onOpenEditor={openModpackContentEditor} onCreateFile={(contentPath, content) => void createModpackContentFile(contentPath, content)} /> : null}
+            {view === 'modpack-scripts' && project?.kind === 'modpack' ? <ModpackContentWorkspace project={project} section="scripts" onOpenEditor={openModpackContentEditor} onCreateFile={(contentPath, content) => void createModpackContentFile(contentPath, content)} /> : null}
+            {view === 'modpack-datapacks' && project?.kind === 'modpack' ? <ModpackContentWorkspace project={project} section="datapacks" onOpenEditor={openModpackContentEditor} onCreateFile={(contentPath, content) => void createModpackContentFile(contentPath, content)} /> : null}
+            {view === 'modpack-resourcepacks' && project?.kind === 'modpack' ? <ModpackContentWorkspace project={project} section="resourcepacks" onOpenEditor={openModpackContentEditor} onCreateFile={(contentPath, content) => void createModpackContentFile(contentPath, content)} /> : null}
+            {view === 'modpack-shaders' && project?.kind === 'modpack' ? <ModpackContentWorkspace project={project} section="shaderpacks" onOpenEditor={openModpackContentEditor} onCreateFile={(contentPath, content) => void createModpackContentFile(contentPath, content)} /> : null}
+            {view === 'modpack-ui' && project?.kind === 'modpack' ? <ModpackContentWorkspace project={project} section="ui" onOpenEditor={openModpackContentEditor} onCreateFile={(contentPath, content) => void createModpackContentFile(contentPath, content)} /> : null}
+            {view === 'modpack-worlds' && project?.kind === 'modpack' ? <ModpackContentWorkspace project={project} section="worlds" onOpenEditor={openModpackContentEditor} onCreateFile={(contentPath, content) => void createModpackContentFile(contentPath, content)} /> : null}
+            {view === 'modpack-client' && project?.kind === 'modpack' ? <ModpackKeybindWorkspace project={project} onOpenRaw={(relativePath) => void openEditorFile(relativePath)} /> : null}
+            {view === 'modpack-server-content' && project?.kind === 'modpack' ? <ModpackContentWorkspace project={project} section="server" onOpenEditor={openModpackContentEditor} onCreateFile={(contentPath, content) => void createModpackContentFile(contentPath, content)} /> : null}
+            {view === 'modpack-files' && project?.kind === 'modpack' ? <ModpackContentWorkspace project={project} section="other" onOpenEditor={openModpackContentEditor} onCreateFile={(contentPath, content) => void createModpackContentFile(contentPath, content)} /> : null}
+            {project?.kind === 'modpack' ? <div className="third-party-route" hidden={view !== 'third-party-mods'}><ThirdPartyModsWorkspace key={project.path} project={project} visible={view === 'third-party-mods'} /></div> : null}
+
+            {view === 'workspace' && project && normalizeProjectPath(activeWorkbenchProjectRef.current) === normalizeProjectPath(project.path) ? <AgentWorkbench
+              key={project.path}
+              project={project}
+              uiMode={uiMode}
+              modpack={project.kind === 'modpack'}
+              prompt={prompt}
+              setPrompt={setPrompt}
+              attachments={aiAttachments}
+              setAttachments={setAiAttachments}
+              planning={planning}
+              taskState={beginnerTaskState}
+              aiPlan={aiPlan}
+              aiTodo={aiTodo}
+              aiTimeline={aiTimeline}
+              processingStartedAt={processingStartedAt}
+              aiOutputStatus={aiOutputStatus}
+              aiRecovery={aiRecovery}
+              conversations={workbenchConversations}
+              activeConversationId={activeWorkbenchConversationId}
+              persistenceState={workbenchPersistenceState}
+              persistenceMessage={workbenchPersistenceMessage}
+              onSelectConversation={selectWorkbenchConversation}
+              onNewConversation={startWorkbenchConversation}
+              onDeleteConversation={(conversationId) => deleteWorkbenchConversation(conversationId)}
+              backend={settings.codingBackend}
+              runningBackend={runningBackend}
+              switchingBackend={switchingBackend}
+              onBackendChange={selectCodingBackend}
+              onStart={() => void captureIdea()}
+              onCancel={cancelAi}
+              onResume={() => void resumeInterruptedAi()}
+              onDismissRecovery={() => setAiRecovery(null)}
+              onRename={() => setRenamingProject(project)}
+              onSnapshot={() => void createSnapshot()}
+              onExport={() => void exportArtifact()}
+              onExportServerPack={() => void exportServerPack()}
+              onExportLogs={() => void exportDiagnosticLogs()}
+              onTest={() => setView('minecraft')}
+              onAttachmentError={(error) => setNotice(`无法添加附件：${errorMessage(error)}`)}
+              canExportArtifact={exportArtifactAvailable}
+              building={building}
+              deviceState={deviceState}
+              onOpenAccount={() => setDeviceAccountOpen(true)}
+              beginnerAiPreferences={beginnerAiPreferences}
+              beginnerAvailableModels={beginnerAvailableModels}
+              scanningBeginnerModels={scanningBeginnerModels}
+              savingAiPreferences={savingAiPreferences}
+              beginnerModelScanMessage={beginnerModelScanMessage}
+              onScanBeginnerModels={() => void scanBeginnerModels()}
+              onModelChange={(model) => void saveBeginnerAiPreference({ model })}
+              onReasoningLevelChange={(reasoningLevel) => void saveBeginnerAiPreference({ reasoningLevel })}
+              onFastModeChange={(fastMode) => void saveBeginnerAiPreference({ fastMode })}
+              placeholder={workspacePromptPlaceholder}
+              humanizeActivity={humanizeActivity}
+            /> : null}
+
+            {[...new Map([...(project ? [project] : []), ...recentProjects].map((entry) => [normalizeProjectPath(entry.path), entry])).values()].map((inspirationProject) => (
+              <InspirationWorkspace
+                key={inspirationProject.path}
+                project={inspirationProject}
+                visible={view === 'inspiration' && Boolean(project && normalizeProjectPath(project.path) === normalizeProjectPath(inspirationProject.path))}
+                uiMode={uiMode}
+                deviceState={deviceState}
+                codingBackend={settings.codingBackend}
+                onBusyChange={() => undefined}
+                onConnectionRequired={() => setDeviceAccountOpen(true)}
+                onSendToCoding={(codingPrompt) => {
+                  if (!project || normalizeProjectPath(project.path) !== normalizeProjectPath(inspirationProject.path)) return
+                  setPrompt(codingPrompt)
+                  setView('workspace')
+                  setNotice('已发送到工作台，请确认后开始开发')
+                }}
+              />
+            ))}
+
+            {uiMode === 'advanced' || view === 'image-studio' ? <div className="image-studio-host" hidden={view !== 'image-studio'}><ImageStudioWorkspace visible={view === 'image-studio'} darkMode={settings.darkMode} onOpenSettings={() => setView('settings')} /></div> : null}
+
+            {project ? (
+              <KeepAliveRoute key={`blockbench:${project.path}`} active={view === 'blockbench'}>
+                <div className="blockbench-page">
+                  <BlockbenchWorkspace visible={view === 'blockbench'} darkMode={settings.darkMode} project={project} />
                 </div>
-
-                <div className="workspace-grid">
-                  <section className="idea-section">
-                    <div className="section-heading">
-                      <div><Sparkles size={18} /><div><h2>描述你想要的 Mod</h2><p>AI 将读取现有工程，直接创建或修改代码与资源文件。</p></div></div>
-                      <div className="backend-switch" role="tablist" aria-label="Coding backend">
-                        <button type="button" className={settings.codingBackend === 'internal' ? 'active' : ''} onClick={() => selectCodingBackend('internal')}><Bot size={13} />内部 AI</button>
-                        <button type="button" className={settings.codingBackend === 'codex' ? 'active' : ''} onClick={() => selectCodingBackend('codex')}><TerminalSquare size={13} />Codex</button>
-                        <button type="button" className={settings.codingBackend === 'claude' ? 'active' : ''} onClick={() => selectCodingBackend('claude')}><Sparkles size={13} />Claude Code</button>
-                      </div>
-                    </div>
-                    <div className="prompt-box">
-                      <textarea
-                        value={prompt}
-                        onChange={(event) => setPrompt(event.target.value)}
-                        placeholder="例如：制作一个可以储存经验值的水晶方块，右键存入，Shift 右键取出……"
-                      />
-                      <div className="prompt-footer">
-                         <div className="prompt-meta"><span>{settings.codingBackend === 'internal' ? (settings.model || '尚未选择模型') : settings.codingBackend === 'codex' ? 'Codex CLI · ModMind MCP' : 'Claude Code · ModMind MCP'}</span><span>并发 {settings.parallelism}</span></div>
-                        {planning ? <button className="secondary-button" title="停止 AI 编程" onClick={() => void window.modmind.ai.cancelCode()}><X size={16} />停止 AI</button> : <button className="send-button" title="开始 AI 编程" disabled={!prompt.trim()} onClick={() => void captureIdea()}><Send size={17} /><span>开始开发</span></button>}
-                      </div>
-                    </div>
-                    <div className="suggestions">
-                      <button onClick={() => setPrompt('添加一种新的矿石、矿物方块和对应工具套装')}>矿石与工具</button>
-                      <button onClick={() => setPrompt('制作一个右键打开界面的经验储存方块')}>功能方块</button>
-                      <button onClick={() => setPrompt('添加一种拥有特殊攻击效果的武器')}>特殊武器</button>
-                    </div>
-                  </section>
-
-                  <aside className="project-inspector">
-                    <h2>项目概览</h2>
-                    <dl>
-                      <div><dt>命名空间</dt><dd>{project.namespace}</dd></div>
-                      <div><dt>加载器</dt><dd>{project.loader}</dd></div>
-                      <div><dt>游戏版本</dt><dd>{project.minecraftVersion}</dd></div>
-                      <div><dt>构建方式</dt><dd>托管 Gradle</dd></div>
-                    </dl>
-                    <div className="adapter-note"><TerminalSquare size={16} /><p><strong>零环境构建</strong><span>按需下载 Java 与 Gradle，构建结果自动同步到测试实例。</span></p></div>
-                  </aside>
-                </div>
-
-                <div className="ai-output-layout">
-                <section className="ai-output-section">
-                  <div className="ai-output-heading">
-                    <div><h2>AI 输出</h2><span className={`ai-output-status ${aiOutputStatus}`}>{aiOutputStatus === 'running' ? '生成中' : aiOutputStatus === 'success' ? '已应用' : aiOutputStatus === 'error' ? '需要检查' : '等待任务'}</span></div>
-                    <button className="icon-button" title="复制 AI 输出" onClick={() => void navigator.clipboard.writeText(aiOutput)}><Copy size={14} /></button>
-                  </div>
-                  <div className="ai-timeline">{aiTimeline.length ? aiTimeline.map((item) => {
-                    const label = timelineLabel(item.kind)
-                    const icon = item.kind === 'tool' ? <TerminalSquare size={11} /> : item.kind === 'diff' ? <FileCode2 size={11} /> : item.kind === 'history' ? <History size={11} /> : item.kind === 'start' ? <Play size={11} /> : item.kind === 'retry' ? <RotateCcw size={11} /> : <CircleAlert size={11} />
-                    return <article className={`ai-timeline-item ${item.kind}`} key={item.id}>{label ? <div className="ai-output-event-header"><span className="ai-output-event-badge">{icon}{label}</span></div> : null}{item.kind === 'answer' || item.kind === 'response' ? <MarkdownMessage content={item.content} /> : <p>{item.content}</p>}{item.diff ? <div className="code-diff-list">{item.diff.map((file) => <div className="code-diff-file" key={file.path}><strong>{file.path}</strong><span className="diff-count">+{file.added} / -{file.removed}</span>{file.additions.map((line, index) => <code className="diff-add" key={`a-${index}`}>+ {line || ' '}</code>)}{file.removals.map((line, index) => <code className="diff-remove" key={`r-${index}`}>- {line || ' '}</code>)}</div>)}</div> : null}</article>
-                  }) : <div className="ai-timeline-empty">AI 的工作过程会显示在这里。</div>}</div>
-                </section>
-                <aside className="ai-todo-section">
-                  <div className="ai-todo-heading"><div><Check size={15} /><h2>Todo List</h2></div><span>{aiTodo.length ? `${aiTodo.filter((item) => item.status === 'completed').length}/${aiTodo.length}` : '—'}</span></div>
-                  {aiTodo.length ? <ol className="ai-todo-list">{aiTodo.map((item) => <li className={item.status} key={item.id}><span className="ai-todo-check">{item.status === 'completed' ? <Check size={12} /> : item.status === 'in_progress' ? <LoaderCircle className="spin" size={12} /> : null}</span><div><strong>{item.title}</strong><small>{item.status === 'completed' ? '已完成' : item.status === 'in_progress' ? '进行中' : '待处理'}</small></div></li>)}</ol> : <div className="ai-todo-empty">AI 制定计划后会显示在这里</div>}
-                </aside>
-                </div>
-
-                {aiPlan ? (
-                  <section className="plan-summary">
-                    <div className="section-title-row"><h2>本次 AI 修改</h2><span>{aiPlan.files.length} 个文件</span></div>
-                    <p>{aiPlan.summary}</p>
-                    <ol>{aiPlan.tasks.slice(0, 5).map((task) => <li key={task}>{task}</li>)}</ol>
-                    <div className="ai-result-grid">
-                      <div><strong>已修改文件</strong>{aiPlan.files.length ? <ul>{aiPlan.files.slice(0, 12).map((file) => <li key={file.path}><code>{file.path}</code><span>{file.purpose}</span></li>)}</ul> : <p>没有记录到文件修改</p>}</div>
-                      <div><strong>自动验收范围</strong><p>已执行 Gradle 构建、资源/注册引用检查，以及需要时的 Minecraft 启动检查。</p>{aiPlan.tests.length ? <ul>{aiPlan.tests.slice(0, 8).map((test) => <li key={test}>{test}</li>)}</ul> : null}{aiPlan.warnings.length ? <ul className="ai-result-warnings">{aiPlan.warnings.slice(0, 8).map((warning) => <li key={warning}>{warning}</li>)}</ul> : null}<p className="ai-manual-check">实际玩法、按键、数值和平衡仍需进入游戏手动确认。</p></div>
-                    </div>
-                  </section>
-                ) : null}
-
-                <section className="activity-section">
-                  <div className="section-title-row"><h2>最近活动</h2><button onClick={() => setView('build')}>查看全部</button></div>
-                  {events.length ? (
-                    <div className="activity-list">
-                      {events.slice(0, 4).map((event) => (
-                        <div className="activity-row" key={event.id}>
-                          <span className={`activity-icon ${event.status}`}>
-                            {event.status === 'success' ? <Check size={14} /> : event.status === 'error' ? <X size={14} /> : <LoaderCircle className="spin" size={14} />}
-                          </span>
-                          <div><strong>{humanizeActivity(event.title)}</strong><p>{humanizeActivity(event.detail)}</p></div>
-                          <time>{formatTime(event.time)}</time>
-                        </div>
-                      ))}
-                    </div>
-                  ) : (
-                    <div className="empty-activity"><Clock3 size={18} />需求、文件修改和构建事件会显示在这里。</div>
-                  )}
-                </section>
-              </>
+              </KeepAliveRoute>
             ) : null}
 
-            {project ? <InspirationWorkspace key={project.path} project={project} visible={view === 'inspiration'} onSendToCoding={(codingPrompt) => { setPrompt(codingPrompt); setView('workspace'); setNotice('已发送到工作台，请确认后开始开发') }} /> : null}
-
-            {view === 'blockbench' && project ? (
-              <div className="blockbench-page">
-                <BlockbenchWorkspace visible />
-              </div>
-            ) : null}
-
-            {view === 'minecraft' && project ? <MinecraftTestWorkspace /> : null}
+            {project ? <KeepAliveRoute key={`minecraft:${project.path}`} active={view === 'minecraft'}><MinecraftTestWorkspace projectPath={project.path} beginner={uiMode === 'beginner'} modpack={project.kind === 'modpack'} onManageRelationships={() => setView('relationships')} /></KeepAliveRoute> : null}
 
             {view === 'mappings' && project ? (
               <div className="mappings-page">
                 <div className="content-toolbar">
-                  <div><h1>Minecraft Mappings</h1><p>查询 {project.minecraftVersion} 的 Mojang、Yarn、Intermediary 与其他映射。</p></div>
+                  <div><h1>Minecraft Mappings</h1><p>查询 {project.minecraftVersion} 的 Mojang、Yarn、Intermediary 与其他映射</p></div>
                   <div className="toolbar-actions">
-                    <button className="mapping-source-link" onClick={() => void window.modmind.mappings.openLoaderDocs(project.loader)}><ExternalLink size={13} />{project.loader === 'fabric' ? 'Fabric' : project.loader === 'quilt' ? 'Quilt' : project.loader === 'forge' ? 'Forge' : 'NeoForge'} 文档</button>
+                    <button className="mapping-source-link" onClick={() => void window.modmind.mappings.openLoaderDocs(project.loader)}><ExternalLink size={13} />{platformLabel(project.loader)} 文档</button>
                     <button className="mapping-source-link" onClick={() => void window.modmind.mappings.openSource(project.minecraftVersion)}><ExternalLink size={13} />mappings.dev</button>
                   </div>
                 </div>
@@ -1709,7 +4733,7 @@ export default function App(): React.JSX.Element {
                           ))}
                         </div>
                       </>
-                    ) : <div className="mapping-detail-empty"><LibraryBig size={30} /><h2>选择一个类查看完整映射</h2><p>结果包含字段、构造器、方法签名及各命名空间名称。</p></div>}
+                    ) : <div className="mapping-detail-empty"><LibraryBig size={30} /><h2>选择一个类查看完整映射</h2><p>结果包含字段、构造器、方法签名及各命名空间名称</p></div>}
                   </section>
                 </div>
               </div>
@@ -1729,8 +4753,8 @@ export default function App(): React.JSX.Element {
                   <div className="editor-toolbar">
                     <span className="editor-path"><FileCode2 size={14} />{selectedFile || '选择一个文件开始编辑'}{editorDirty ? <i title="有未保存修改" /> : null}</span>
                     <div className="editor-actions">
-                      <button className="icon-button" title="在文件管理器中显示" disabled={!selectedFile} onClick={() => void window.modmind.project.reveal(selectedFile)}><FolderOpen size={14} /></button>
-                      <button className="secondary-button compact" title="使用 Java LSP 与调试器打开完整项目" onClick={() => void window.modmind.project.openIde().catch((error) => window.alert(errorMessage(error)))}><ExternalLink size={14} />Java IDE</button>
+                      <button className="icon-button" title="在文件管理器中显示" disabled={!selectedFile} onClick={() => void window.modmind.project.reveal(selectedFile, project.path)}><FolderOpen size={14} /></button>
+                      <button className="secondary-button compact" title="在 VS Code 中打开完整项目" onClick={() => void window.modmind.project.openIde().catch((error) => setErrorNotice(errorMessage(error)))}><ExternalLink size={14} />VS Code</button>
                       <button className="icon-button" title="重命名文件" disabled={!selectedFile} onClick={() => void renameSelectedFile()}><Pencil size={14} /></button>
                       <button className="icon-button danger" title="删除文件" disabled={!selectedFile} onClick={() => void deleteSelectedFile()}><Trash2 size={14} /></button>
                       <button className="secondary-button compact" disabled={!editorDirty} onClick={() => void saveFile()}><Save size={14} />保存</button>
@@ -1747,20 +4771,20 @@ export default function App(): React.JSX.Element {
                       onSave={() => void saveFile()}
                     /></Suspense>
                   ) : selectedFile ? (
-                    <div className="editor-empty"><File size={28} /><p>该文件不是可编辑文本，可在文件管理器中查看。</p></div>
+                    <div className="editor-empty"><File size={28} /><p>该文件不是可编辑文本，可在文件管理器中查看</p></div>
                   ) : (
-                    <div className="editor-empty"><FileCode2 size={28} /><p>从左侧文件树中选择源码或配置文件。</p></div>
+                    <div className="editor-empty"><FileCode2 size={28} /><p>从左侧文件树中选择源码或配置文件</p></div>
                   )}
                 </section>
               </div>
             ) : null}
 
-            {view === 'build' && project ? (
+            {uiMode === 'advanced' && view === 'build' && project ? (
               <div className="standard-page">
                   <div className="content-toolbar">
-                    <div><h1>构建与测试</h1><p>使用托管 Java 与 Gradle 生成可运行的 Mod JAR。</p></div>
+                    <div><h1>构建与测试</h1><p>{isJavaLoader(project.loader) ? '使用托管 Java 与 Gradle 生成可运行的 Mod JAR' : project.loader === 'bedrock' ? '校验行为包与资源包并生成可导入的 .mcaddon' : '校验网易 Mod SDK 工程并生成工作台归档'}</p></div>
                     <div className="toolbar-actions">
-                      <button className="secondary-button" disabled={building || planning || !buildResult?.success} onClick={() => void exportArtifact()}><Download size={16} />导出 Mod JAR</button>
+                      <button className="secondary-button" disabled={building || planning || !buildResult?.success} onClick={() => void exportArtifact()}><Download size={16} />{isJavaLoader(project.loader) ? '导出 Mod JAR' : project.loader === 'bedrock' ? '导出 .mcaddon' : '导出工作台归档'}</button>
                       {buildError ? (
                       <button className="secondary-button" disabled={planning || building} onClick={() => void repairBuildWithAi()}>
                         {planning ? <LoaderCircle className="spin" size={16} /> : <Sparkles size={16} />}AI 修复
@@ -1772,18 +4796,18 @@ export default function App(): React.JSX.Element {
                   </div>
                 </div>
                 <section className="build-status-band">
-                  <div className={`build-state ${buildResult?.success ? 'success' : buildError || buildResult ? 'error' : ''}`}>
-                    {building ? <LoaderCircle className="spin" size={22} /> : buildResult?.success ? <Check size={22} /> : buildError || buildResult ? <X size={22} /> : <Hammer size={22} />}
-                    <div><strong>{building ? minecraftEvents.at(-1)?.message || '正在准备构建环境' : buildError ? buildResult && !buildResult.success ? '构建未通过' : '构建失败' : buildResult?.summary || '等待运行'}</strong><span>{buildError ? '错误详情已保留在下方输出中' : buildResult?.reportPath || '尚未生成预检报告'}</span></div>
+                  <div className={`build-state ${buildResult?.success ? 'success' : !advancedErrorsHidden && (buildError || buildResult) ? 'error' : ''}`}>
+                    {building ? <LoaderCircle className="spin" size={22} /> : buildResult?.success ? <Check size={22} /> : !advancedErrorsHidden && (buildError || buildResult) ? <X size={22} /> : <Hammer size={22} />}
+                    <div><strong>{building ? minecraftEvents.at(-1)?.message || '正在准备构建环境' : buildResult?.success ? buildResult.summary : advancedErrorsHidden && (buildError || buildResult) ? '构建状态已更新' : buildError ? buildResult && !buildResult.success ? '构建未通过' : '构建失败' : '等待运行'}</strong><span>{advancedErrorsHidden && buildError ? '详细信息已写入诊断日志' : buildError ? '错误详情已保留在下方输出中' : buildResult?.reportPath || '尚未生成预检报告'}</span></div>
                   </div>
-                  <div className="build-metrics"><span><strong>{buildResult?.logs.filter((line) => line.startsWith('PASS')).length ?? 0}</strong>通过</span><span><strong>{buildResult?.logs.filter((line) => line.startsWith('FAIL')).length ?? 0}</strong>失败</span></div>
+                  <div className="build-metrics"><span><strong>{buildResult?.logs.filter((line) => line.startsWith('PASS')).length ?? 0}</strong>通过</span>{advancedErrorsHidden ? null : <span><strong>{buildResult?.logs.filter((line) => line.startsWith('FAIL')).length ?? 0}</strong>失败</span>}</div>
                 </section>
                 <section className="log-section">
                   <div className="section-title-row"><h2>输出</h2><span>Preflight</span></div>
-                  <pre>{buildResult?.logs.join('\n') || [
+                  <pre>{advancedErrorsHidden && buildError ? '构建输出已写入诊断日志' : buildLogs.join('\n') || [
                     ...minecraftEvents.map((event) => `[${formatTime(event.time)}] ${event.message}`),
                     ...(buildError ? ['', buildError] : [])
-                  ].join('\n') || '点击“构建项目”下载所需运行时并执行 Gradle build。'}</pre>
+                  ].join('\n') || (isJavaLoader(project.loader) ? '点击“构建项目”下载所需运行时并执行 Gradle build' : project.loader === 'bedrock' ? '点击“构建项目”校验双 Pack 并生成 .mcaddon' : '点击“构建项目”校验工程并生成网易开发者工作台归档')}</pre>
                 </section>
                 <section className="pipeline-list">
                   <h2>任务时间线</h2>
@@ -1797,10 +4821,10 @@ export default function App(): React.JSX.Element {
             {view === 'snapshots' && project ? (
               <div className="standard-page">
                 <div className="content-toolbar">
-                  <div><h1>版本与迁移</h1><p>{project.loader} · Minecraft {project.minecraftVersion}</p></div>
+                  <div><h1>{project.kind === 'modpack' ? '版本' : '版本与迁移'}</h1><p>{platformLabel(project.loader)} · {project.minecraftVersion}{project.kind === 'modpack' ? ' · 整合包' : ''}</p></div>
                   <button className="primary-button" onClick={() => void createSnapshot()}><Plus size={16} />创建快照</button>
                 </div>
-                <section className="migration-band">
+                {project.kind !== 'modpack' && (isJavaLoader(project.loader) ? <section className="migration-band">
                   <div className="section-title-row"><h2>迁移目标</h2><span>生成到新目录</span></div>
                   <div className="migration-controls">
                     <div className="segmented-control">
@@ -1817,7 +4841,7 @@ export default function App(): React.JSX.Element {
                     {migrationPreview.blockers.map((blocker) => <p className="error" key={blocker}><X size={14} />{blocker}</p>)}
                     <button className="primary-button" disabled={migrationBusy || Boolean(migrationPreview.blockers.length)} onClick={() => void runMigration()}>{migrationBusy ? <LoaderCircle className="spin" size={15} /> : <PackageOpen size={15} />}生成迁移项目</button>
                   </div> : null}
-                </section>
+                </section> : <section className="migration-band"><div className="section-title-row"><h2>平台版本</h2><span>{platformLabel(project.loader)}</span></div><p>基岩与网易工程不执行 Java Loader 自动迁移。升级最低引擎或 Mod SDK 前请先创建快照，并按目标平台 API 逐项验证</p></section>)}
                 <GitWorkspace project={project} onFilesChanged={() => { void refreshFiles(); void refreshSnapshots() }} />
                 <div className="snapshot-list">
                   {snapshots.length ? snapshots.map((snapshot) => (
@@ -1844,73 +4868,248 @@ export default function App(): React.JSX.Element {
                         </button>
                       </div>
                     </article>
-                  )) : <div className="large-empty"><History size={26} /><h3>还没有版本快照</h3><p>创建快照后，项目文件会保存在项目内的 {project.toolDataDirectory ?? '.modmind'} 目录。</p></div>}
+                  )) : <div className="large-empty"><History size={26} /><h3>还没有版本快照</h3><p>创建快照后，项目文件会保存在项目内的 {project.toolDataDirectory ?? '.modmind'} 目录</p></div>}
                 </div>
               </div>
             ) : null}
 
-            {view === 'production' && project ? (
-              <ProductionWorkspace project={project} onFilesChanged={() => { void refreshFiles(); void refreshSnapshots() }} />
+            {project ? (
+              <KeepAliveRoute key={`production:${project.path}`} active={view === 'production'}>
+                <ProductionWorkspace project={project} onFilesChanged={() => { void refreshFiles(); void refreshSnapshots() }} />
+              </KeepAliveRoute>
             ) : null}
+
+            {view === 'plugins' ? (
+              <PluginsManager
+                snapshot={pluginSnapshot}
+                hasProject={Boolean(project)}
+                onRefresh={() => void window.modmind.plugins.list().then(setPluginSnapshot).catch(() => undefined)}
+                onOpenPanel={(pluginId) => navigateToView(`plugin:${pluginId}`)}
+                confirmDelete={(pluginId, pluginName) => requestConfirm({
+                  title: `永久删除插件“${pluginName}”？`,
+                  message: `将删除插件目录及全部源码（${pluginId}），此操作无法撤销`,
+                  confirmLabel: '永久删除',
+                  tone: 'danger'
+                })}
+              />
+            ) : null}
+
+            {view.startsWith('plugin:') ? (() => {
+              const pluginId = view.slice('plugin:'.length)
+              const plugin = pluginSnapshot.plugins.find((entry) => entry.manifest.id === pluginId)
+              if (!plugin) {
+                return <div className="large-empty"><Puzzle size={26} /><h3>插件未安装或已卸载</h3><p>在「管理插件」中检查插件状态</p></div>
+              }
+              return <PluginPanelHost plugin={plugin} theme={settings.darkMode ? 'dark' : 'light'} />
+            })() : null}
 
             {view === 'settings' ? (
               <div className="settings-page">
-                <div className="content-toolbar"><div><h1>设置</h1><p>配置 AI Provider 和任务执行方式。</p></div></div>
-                <section className="settings-section">
-                  <div className="settings-heading"><h2>AI 服务</h2><p>兼容 OpenAI 协议的 API 可以使用自定义地址。</p></div>
-                  <div className="external-agent-section">
-                    <div className="settings-heading"><h3>外部 Coding Agent</h3><p>Codex 和 Claude Code 通过 ModMind MCP 接入项目文件、映射、构建、游戏测试和 Blockbench。</p></div>
-                    <div className="external-agent-grid">
-                      {(['codex', 'claude'] as const).map((kind) => {
-                        const status = externalAgents.find((item) => item.kind === kind)
-                        const configuredPath = kind === 'codex' ? settings.codexExecutable ?? '' : settings.claudeExecutable ?? ''
-                        return <article className="external-agent-card" key={kind}>
-                          <div className="external-agent-card-heading"><div><strong>{kind === 'codex' ? 'Codex' : 'Claude Code'}</strong><small>{status?.installed ? status.version : externalAgentsReady ? '未检测到 CLI' : '正在检测…'}</small></div><span className={`status-dot ${status?.installed ? 'success' : 'warning'}`} /></div>
-                          <input value={configuredPath} onChange={(event) => setSettings({ ...settings, [kind === 'codex' ? 'codexExecutable' : 'claudeExecutable']: event.target.value })} placeholder={status?.executable || '留空则从 PATH 查找'} />
-                          <div className="external-agent-actions">
-                            {status?.installed || configuredPath.trim() ? <button className="secondary-button compact" type="button" onClick={() => void launchExternalAgent(kind)}><TerminalSquare size={14} />打开</button> : <button className="primary-button compact" type="button" disabled={!externalAgentsReady || installingAgents[kind]} onClick={() => void installExternalAgent(kind)}>{installingAgents[kind] ? <LoaderCircle className="spin" size={14} /> : <Download size={14} />}一键安装</button>}
-                            <button className="secondary-button compact" type="button" onClick={() => void openExternalAgentDocs(kind)}><ExternalLink size={14} />B站安装教程</button>
+                <div className="content-toolbar"><div><h1>设置</h1><p>管理制作引擎、外部工具和工作区偏好</p></div></div>
+                <nav className="settings-index" aria-label="设置分类">
+                  <a href="#settings-ai">AI 与 Agent</a>
+                  <a href="#settings-image">图像</a>
+                  <a href="#settings-build">构建</a>
+                  <a href="#settings-network">网络</a>
+                  <a href="#settings-diagnostics">诊断</a>
+                  <a href="#settings-appearance">外观</a>
+                  <a href="#settings-sidebar-order">侧边栏</a>
+                  <a href="#settings-notifications">通知</a>
+                  <a href="#settings-remote">远程构建</a>
+                </nav>
+                <section id="settings-ai" className="settings-section">
+                  <div className="settings-heading"><h2>AI 服务</h2><p>统一管理制作引擎，以及需要接入项目的外部 Coding Agent</p></div>
+                  <ProductionSettingsPanel
+                    aiSettings={beginnerAiPreferences}
+                    deviceState={deviceState}
+                    availableModels={beginnerAvailableModels}
+                    scanningModels={scanningBeginnerModels}
+                    savingAiPreferences={savingAiPreferences}
+                    modelScanMessage={beginnerModelScanMessage}
+                    onScanModels={() => void scanBeginnerModels()}
+                    onModelChange={(model) => void saveBeginnerAiPreference({ model })}
+                    onReasoningLevelChange={(reasoningLevel) => void saveBeginnerAiPreference({ reasoningLevel })}
+                    onFastModeChange={(fastMode) => void saveBeginnerAiPreference({ fastMode })}
+                  />
+                  <div className="external-agent-settings">
+                    <div className="settings-heading external-agent-heading"><h3>外部 Coding Agent</h3><p>检测到的本机 Agent 会直接使用原有配置。只有点“配置”时，ModMind 才会为对应 Agent 保存单独的服务设置</p></div>
+                    <div className="external-agent-list">
+                      {EXTERNAL_AGENT_OPTIONS.map((agent) => {
+                        const status = externalAgents.find((item) => item.kind === agent.kind)
+                        const configured = settings.externalAgents?.[agent.kind]
+                        return <div className="external-agent-row" key={agent.kind}>
+                          <div className="external-agent-name"><span className={`status-dot ${status?.installed ? 'success' : 'warning'}`} /><div><strong>{agent.label}</strong><p>{status?.installed ? `${status.version ?? '已检测到'} · ${configured?.baseUrl ? '已设置 ModMind 服务' : '使用本机原有配置'}` : externalAgentsReady ? '未检测到命令行工具' : '正在检测…'}</p></div></div>
+                          <div className="external-agent-row-actions">
+                            <button className="secondary-button compact" type="button" onClick={() => { setEditingAgent(agent.kind); setAgentDraft({...configured, mode: configured?.mode ?? (agent.kind === 'claude' ? 'local' : 'hosted'), apiKey: ''}); setAvailableModels([]); setModelScanMessage('输入 API Key 后扫描') }}><Pencil size={14} />配置</button>
+                            {status?.installed || configured?.executable ? <button className="icon-button" type="button" title={`打开 ${agent.label}`} onClick={() => void launchExternalAgent(agent.kind)}><TerminalSquare size={15} /></button> : <button className="icon-button" type="button" title={`安装 ${agent.label}`} disabled={!externalAgentsReady || installingAgents[agent.kind]} onClick={() => void installExternalAgent(agent.kind)}>{installingAgents[agent.kind] ? <LoaderCircle className="spin" size={15} /> : <Download size={15} />}</button>}
+                            <button className="icon-button" type="button" title={`${agent.label} 文档`} onClick={() => void openExternalAgentDocs(agent.kind)}><ExternalLink size={15} /></button>
                           </div>
-                        </article>
+                        </div>
                       })}
                     </div>
-                  </div>
-                  <div className="settings-form">
-                    <label className="field-label">Provider<select value={settings.provider} onChange={(event) => { setSettings({ ...settings, provider: event.target.value as AiSettings['provider'] }); setAvailableModels([]) }}><option value="openai-compatible">OpenAI Compatible</option><option value="openai">OpenAI</option><option value="local">本地模型</option></select></label>
-                    <label className="field-label">Base URL<input value={settings.baseUrl} onChange={(event) => { setSettings({ ...settings, baseUrl: event.target.value }); setAvailableModels([]) }} onBlur={() => { if (settings.provider === 'local' || settings.apiKey.trim() || settings.hasStoredKey) void scanModels() }} /></label>
-                    <label className="field-label">API Key<input type="password" value={settings.apiKey} onChange={(event) => setSettings({ ...settings, apiKey: event.target.value })} onBlur={() => { if (settings.apiKey.trim()) void scanModels() }} placeholder={settings.hasStoredKey ? '已安全保存，留空则保持不变' : '输入 API Key'} /></label>
-                    <label className="field-label">并发任务数<div className="stepper"><button onClick={() => setSettings({ ...settings, parallelism: Math.max(1, settings.parallelism - 1) })}>−</button><span>{settings.parallelism}</span><button onClick={() => setSettings({ ...settings, parallelism: Math.min(8, settings.parallelism + 1) })}>+</button></div></label>
-                    <label className="field-label">AI Agent 最大轮数<select value={settings.agentMaxSteps === 0 ? 'unlimited' : String(settings.agentMaxSteps)} onChange={(event) => setSettings({ ...settings, agentMaxSteps: event.target.value === 'unlimited' ? 0 : Number(event.target.value) })}><option value="unlimited">自适应</option><option value="12">12 轮</option><option value="24">24 轮</option><option value="48">48 轮</option><option value="96">96 轮</option></select><small>自适应模式不会按固定轮数截断；连续 8 轮没有进展时才会停止。</small></label>
-                    <label className="field-label">最大构建次数<select value={settings.maxBuilds === 0 ? 'unlimited' : String(settings.maxBuilds)} onChange={(event) => setSettings({ ...settings, maxBuilds: event.target.value === 'unlimited' ? 0 : Number(event.target.value) })}><option value="unlimited">无限制</option><option value="1">1 次</option><option value="2">2 次</option><option value="3">3 次</option><option value="5">5 次</option><option value="10">10 次</option></select><small>Todo 全部完成前不会启动构建；默认不限制构建次数。</small></label>
-                    <div className="model-picker-field">
-                      <div className="model-picker-heading"><span>可用模型</span><button type="button" disabled={scanningModels} onClick={() => void scanModels()}>{scanningModels ? <LoaderCircle className="spin" size={14} /> : <RotateCcw size={14} />}扫描模型</button></div>
-                      {availableModels.length > 8 ? <input className="model-search" value={modelSearch} onChange={(event) => setModelSearch(event.target.value)} placeholder="搜索模型" /> : null}
-                      <div className="model-options">
-                        {filteredModels.map((model) => (
-                          <label key={model.id} className={settings.model === model.id ? 'selected' : ''}><input type="radio" name="ai-model" checked={settings.model === model.id} onChange={() => setSettings({ ...settings, model: model.id })} /><span><strong>{model.id}</strong>{model.ownedBy ? <small>{model.ownedBy}</small> : null}</span></label>
-                        ))}
-                        {!filteredModels.length ? <p>{modelScanMessage}</p> : null}
+                    {editingAgent ? (() => {
+                      const selectedAgent = EXTERNAL_AGENT_OPTIONS.find((item) => item.kind === editingAgent)!
+                      const agent = {...selectedAgent, managedService: selectedAgent.managedService && (editingAgent !== 'claude' || agentDraft.mode === 'hosted')}
+                      return <div className="external-agent-editor">
+                        <div className="external-agent-editor-heading"><div><strong>配置 {agent.label}</strong><p>{agent.managedService ? '只在这里填写该 Agent 需要的中转服务。保存前会备份现有配置' : '通常不需要填写服务信息；ModMind 会沿用该 Agent 本机已有的账号和配置'}</p></div><button className="icon-button" type="button" title="关闭" onClick={() => { setEditingAgent(null); setAgentDraft({}) }}><X size={15} /></button></div>
+                        <div className="external-agent-editor-form">
+                          {editingAgent === 'claude' ? <label className="field-label">Claude Code 模式<select value={agentDraft.mode ?? 'local'} onChange={(event) => setAgentDraft((current) => ({...current, mode: event.target.value as ExternalAgentConfiguration['mode']}))}><option value="local">本机登录和配置</option><option value="hosted">ModMind 中转服务</option></select></label> : null}
+                          {editingAgent === 'claude' ? <label className="field-label">命令路径<input value={agentDraft.executable ?? ''} onChange={(event) => setAgentDraft((current) => ({...current, executable: event.target.value}))} placeholder="留空则从 PATH 查找" /></label> : null}
+                          {agent.managedService ? <><label className="field-label">Base URL<input value={agentDraft.baseUrl ?? ''} onChange={(event) => setAgentDraft((current) => ({...current, baseUrl: event.target.value}))} placeholder="https://api.example.com/v1" /></label><label className="field-label">API Key<input type="password" value={agentDraft.apiKey ?? ''} onChange={(event) => setAgentDraft((current) => ({...current, apiKey: event.target.value}))} placeholder={settings.externalAgents?.[editingAgent]?.hasStoredKey ? '已安全保存，留空保持不变' : '输入服务 API Key'} /></label><div className="model-picker-field"><div className="model-picker-heading"><span>模型</span><button type="button" onClick={() => void scanModels()} disabled={scanningModels || !agentDraft.baseUrl?.trim()}>{scanningModels ? <LoaderCircle className="spin" size={13} /> : <RotateCcw size={13} />}{scanningModels ? '扫描中' : '扫描模型'}</button></div><label className="field-label"><input value={agentDraft.model ?? ''} onChange={(event) => setAgentDraft((current) => ({...current, model: event.target.value}))} placeholder="扫描后选择，或手动填写模型 ID" /><small>{modelScanMessage}</small></label>{availableModels.length ? <select className="external-agent-model-select" value={availableModels.some((item) => item.id === agentDraft.model) ? agentDraft.model : ''} onChange={(event) => { if (event.target.value) setAgentDraft((current) => ({...current, model: event.target.value})) }}><option value="">从已扫描模型中选择</option>{availableModels.map((model) => <option key={model.id} value={model.id}>{model.id}{model.ownedBy ? ` (${model.ownedBy})` : ''}</option>)}</select> : null}</div><div className="external-agent-reasoning-control"><span>思考强度</span><div role="group" aria-label={`${agent.label} 思考强度`}>{(editingAgent === 'claude' ? ['low', 'medium', 'high', 'xhigh', 'max'] as const : ['low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const).map((value) => <button type="button" className={agentDraft.reasoningEffort === value ? 'active' : ''} key={value} onClick={() => setAgentDraft((current) => ({...current, reasoningEffort: value}))}>{value}</button>)}</div></div></> : null}
+                        </div>
+                        <div className="settings-actions editor-actions"><span><ShieldCheck size={15} />凭证通过系统加密保存</span><button className="primary-button compact" type="button" disabled={configuringAgents[editingAgent]} onClick={() => void configureExternalAgent(editingAgent)}>{configuringAgents[editingAgent] ? <LoaderCircle className="spin" size={14} /> : <Save size={14} />}保存 {agent.label} 配置</button></div>
                       </div>
-                      <label className="manual-model-field">手动模型 ID<input value={settings.model} onChange={(event) => setSettings({ ...settings, model: event.target.value })} placeholder="扫描不可用时手动填写" /></label>
+                    })() : null}
+                  </div>
+                  <div className="settings-heading external-agent-heading mcp-bridge-heading"><h3>MCP 接入</h3><p>允许 modmind-mcp 等开源 MCP 客户端接入当前项目，直接使用 ModMind 的制作工具</p></div>
+                  <div className="external-agent-list">
+                    <div className="external-agent-row">
+                      <div className="external-agent-name">
+                        <span className={`status-dot ${mcpBridgeState.running ? 'success' : mcpBridgeState.enabled ? 'warning' : ''}`} />
+                        <div>
+                          <strong>外部 MCP 桥接</strong>
+                          <p>
+                            {mcpBridgeState.running
+                              ? `运行中 · 项目「${mcpBridgeState.projectName ?? mcpBridgeState.projectPath}」`
+                              : mcpBridgeState.enabled
+                                ? (project ? '已开启，正在启动桥接…' : '已开启；打开项目后自动开始监听')
+                                : '未开启'}
+                          </p>
+                        </div>
+                      </div>
+                      <div className="external-agent-row-actions">
+                        <button
+                          className={`toggle${mcpBridgeState.enabled ? ' on' : ''}`}
+                          type="button"
+                          role="switch"
+                          aria-label="外部 MCP 接入"
+                          aria-checked={mcpBridgeState.enabled}
+                          disabled={mcpBridgeBusy}
+                          onClick={() => void mcpBridgeToggle(!mcpBridgeState.enabled)}
+                        ><span /></button>
+                      </div>
                     </div>
                   </div>
-                  <div className="settings-actions"><span><ShieldCheck size={15} />API Key 使用系统级加密存储</span><button className="primary-button" onClick={() => void saveSettings()}><Save size={16} />保存设置</button></div>
+                  {mcpBridgeState.enabled ? (
+                    <div className="mcp-bridge-detail">
+                      {mcpBridgeState.mcpConfigPath ? (
+                        <>
+                          <p>把下面的配置文件路径填到你的 MCP 客户端（如 modmind-mcp）即可接入：</p>
+                          <code className="mcp-bridge-path">{mcpBridgeState.mcpConfigPath}</code>
+                          <div className="settings-actions mcp-bridge-actions">
+                            <span><Info size={14} />配置文件在打开项目后生成，切换项目会自动跟随</span>
+                            <button className="secondary-button compact" type="button" onClick={() => void navigator.clipboard?.writeText(mcpBridgeState.mcpConfigPath ?? '').then(() => setNotice('已复制 MCP 配置路径')).catch(() => setNotice('复制失败，请手动复制'))}><Copy size={14} />复制路径</button>
+                          </div>
+                        </>
+                      ) : (
+                        <p><Info size={14} />开关已打开。打开一个项目后，这里会显示 mcp-config.json 的路径，填进 MCP 客户端即可接入。</p>
+                      )}
+                    </div>
+                  ) : (
+                    <div className="mcp-bridge-detail"><p>关闭时不监听任何外部接入；打开后也仅限本机访问，且跟随当前打开的项目。</p></div>
+                  )}
+                 </section>
+                 <section id="settings-image" className="settings-section image-settings-section">
+                    <div className="settings-heading"><h2>图像服务</h2><p>图片 API Key 使用系统级加密保存，图像工坊和外部 Agent 共用此配置</p></div>
+                    <div className="image-service-form">
+                      <label className="field-label">Base URL<input value={imageStudioSettings.baseUrl} onChange={(event) => setImageStudioSettings({ ...imageStudioSettings, baseUrl: event.target.value })} /></label>
+                      <label className="field-label">默认图片模型<input value={imageStudioSettings.model} onChange={(event) => setImageStudioSettings({ ...imageStudioSettings, model: event.target.value })} /></label>
+                      <label className="field-label">图片 API Key<input type="password" value={imageApiKey} onChange={(event) => setImageApiKey(event.target.value)} placeholder={imageStudioSettings.hasStoredKey ? '已安全保存，留空保持不变' : '输入自己的图片 API Key'} /></label>
+                      <div className="settings-actions"><span><ShieldCheck size={15} />{imageStudioSettings.hasStoredKey ? '已有加密凭证' : '未填写时使用 ModMind 托管额度'}</span><div className="settings-button-group">{imageStudioSettings.hasStoredKey ? <button className="secondary-button compact danger" type="button" onClick={() => void clearImageApiKey()}><Trash2 size={14} />删除已保存 Key</button> : null}<button className="primary-button compact" type="button" onClick={() => void saveImageSettings({ apiKey: imageApiKey })}><Save size={14} />保存图像服务</button></div></div>
+                    </div>
+                    <div className="settings-heading"><h2>AI 图像能力</h2><p>Codex、Claude Code 等外部 Agent 可以直接调用图像 Skill</p></div>
+                    <div className="image-settings-form">
+                      <div className="appearance-row"><div><strong>AI 图像 Skill</strong><p>外部 Agent 可以直接使用生图和图像处理 Skill</p></div><span className="status-dot success" /></div>
+                      <div className="settings-actions"><span><Info size={14} />外部 Agent 生图由 ModMind 自动执行并记录额度</span><button className="secondary-button compact" type="button" onClick={() => setView('image-studio')}><WandSparkles size={14} />打开图像工坊</button></div>
+                    </div>
+                 </section>
+                <section id="settings-build" className="settings-section">
+                  <div className="settings-heading"><h2>构建工具</h2><p>ModMind 使用项目自带的 Gradle Wrapper 构建，不安装单独的 Gradle 运行时</p></div>
+                  <div className="appearance-row"><div><strong>项目 Gradle Wrapper</strong><p>构建时在项目根目录执行 {navigator.platform.toLowerCase().includes('win') ? '.\\gradlew.bat build' : './gradlew build'}</p></div><span className="status-dot success" /></div>
                 </section>
-                <section className="settings-section">
-                  <div className="settings-heading"><h2>构建工具</h2><p>新项目仍保留官方 Gradle Wrapper；开启后，构建优先使用你机器上的 Gradle。</p></div>
-                  <label className="field-label">Gradle 下载源<select value={settings.gradleDownloadSource} onChange={(event) => setSettings({ ...settings, gradleDownloadSource: event.target.value as AiSettings['gradleDownloadSource'] })}><option value="auto">自动择优（推荐）</option><option value="china">国内镜像优先</option><option value="official">仅官方源</option></select><small>自动模式会探测华为云、腾讯云和官方源，下载后仍按官方 SHA-256 校验。</small></label>
-                  <div className="appearance-row"><div><strong>优先使用本机 Gradle</strong><p>允许使用 PATH 或下方路径中的任意版本，版本兼容性由你自行确认。</p></div><button className={`toggle ${settings.preferLocalGradle ? 'on' : ''}`} type="button" role="switch" aria-checked={settings.preferLocalGradle} onClick={() => setSettings({ ...settings, preferLocalGradle: !settings.preferLocalGradle })}><span /></button></div>
-                  <label className="field-label">Gradle 可执行文件路径<input value={settings.gradleExecutable ?? ''} onChange={(event) => setSettings({ ...settings, gradleExecutable: event.target.value })} placeholder="留空则从 PATH 查找 gradle" /></label>
-                  <div className="settings-actions"><span>关闭开关时始终优先使用项目 Wrapper 或 ModMind 托管版本</span><button className="primary-button" onClick={() => void saveSettings()}><Save size={16} />保存设置</button></div>
+                <section id="settings-java" className="settings-section">
+                  <div className="settings-heading"><h2>Java 运行时</h2><p>默认全自动：ModMind 按需检测本机 JDK 并下载托管运行时。也可以为每个场景手动指定 Java，版本不满足时自动回退</p></div>
+                  <div className="settings-actions">
+                    <span>
+                      <Info size={14} />
+                      {javaScanState === 'scanning' ? '正在扫描本机 Java…'
+                        : javaScanState === 'failed' ? '扫描失败：下方仍可手动填写 Java 目录'
+                        : detectedJavaHomes.length ? `检测到 ${detectedJavaHomes.length} 个本机 Java` : '未检测到本机 Java，可选择自动或手动填写目录'}
+                    </span>
+                    <button className="secondary-button compact" type="button" disabled={javaScanState === 'scanning'} onClick={scanJavaHomes}>
+                    {javaScanState === 'scanning' ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}重新扫描
+                    </button>
+                  </div>
+                  <JavaHomePreferenceRow
+                    label="游戏运行时"
+                    description="启动 Minecraft 测试实例、安装 Fabric/NeoForge 加载器时使用的 Java"
+                    value={settings.javaPreferences?.game ?? ''}
+                    homes={detectedJavaHomes}
+                    scanning={javaScanState === 'scanning'}
+                    onChange={updateJavaPreference('game')}
+                  />
+                  <JavaHomePreferenceRow
+                    label="Gradle 构建 JDK"
+                    description="编译模组项目时注入 Gradle 的 JAVA_HOME；需要包含 javac 的完整 JDK"
+                    value={settings.javaPreferences?.build ?? ''}
+                    homes={detectedJavaHomes}
+                    scanning={javaScanState === 'scanning'}
+                    onChange={updateJavaPreference('build')}
+                  />
+                  <JavaHomePreferenceRow
+                    label="内置工具"
+                    description="ServerPackCreator 服务端整合、HeadlessMC 冒烟测试等内置工具使用的 Java"
+                    value={settings.javaPreferences?.tools ?? ''}
+                    homes={detectedJavaHomes}
+                    scanning={javaScanState === 'scanning'}
+                    onChange={updateJavaPreference('tools')}
+                  />
                 </section>
-                <section className="settings-section">
-                  <div className="settings-heading"><h2>外观</h2><p>调整 ModMind 的显示方式。</p></div>
-                  <div className="appearance-row"><div><strong>深色模式</strong><p>使用深色界面降低夜间使用时的亮度。</p></div><button className={`toggle ${settings.darkMode ? 'on' : ''}`} type="button" role="switch" aria-checked={settings.darkMode} onClick={() => setSettings({ ...settings, darkMode: !settings.darkMode })}><span /></button></div>
-                  <div className="settings-actions"><span>修改外观后点击保存设置以记住选择</span></div>
+                <section id="settings-network" className="settings-section">
+                  <div className="settings-heading"><h2>网络</h2><p>Modrinth、CurseForge 等下载源无法直连时，配置 HTTP 代理后立即生效，无需重启</p></div>
+                  <label className="field-label">代理地址<input value={settings.networkProxyUrl ?? ''} onChange={(event) => void saveSettingsPatch({ networkProxyUrl: event.target.value })} placeholder="http://127.0.0.1:7890" /><small>留空则不使用代理。填写本机代理客户端的 HTTP 端口（Clash 混合端口通常为 7890，v2rayN 为 10809）；不支持 SOCKS 端口。MC百科、Gitee 等国内站点始终直连，不走此代理</small></label>
                 </section>
-                <section className="settings-section disabled-section">
-                  <div className="settings-heading"><h2>远程构建</h2><p>构建服务协议将在下一阶段接入。</p></div>
-                  <div className="connection-row"><span className="status-dot warning" /><div><strong>未配置</strong><p>当前仅执行本地工程预检。</p></div><button className="secondary-button" disabled>配置服务</button></div>
+                <section id="settings-diagnostics" className="settings-section">
+                  <div className="settings-heading"><h2>诊断日志</h2><p>导出启动、构建和崩溃日志，便于排查本机运行问题。不会包含已保存的 API Key 或 Token</p></div>
+                  <div className="settings-actions"><span><TerminalSquare size={15} />包含应用事件、下载重试、Minecraft、构建、服务端日志和页面快照</span><button className="secondary-button" type="button" disabled={diagnosticExporting} onClick={() => void exportDiagnosticLogs()}>{diagnosticExporting ? <LoaderCircle className="spin" size={16} /> : <Archive size={16} />}导出诊断日志</button></div>
+                </section>
+                <section id="settings-appearance" className="settings-section">
+                  <div className="settings-heading"><h2>外观</h2><p>调整 ModMind 的显示方式</p></div>
+                  <div className="appearance-row"><div><strong>深色模式</strong><p>使用深色界面降低夜间使用时的亮度</p></div><button className={`toggle ${settings.darkMode ? 'on' : ''}`} type="button" role="switch" aria-label="深色模式" aria-checked={settings.darkMode} onClick={() => void saveSettingsPatch({ darkMode: !settings.darkMode })}><span /></button></div>
+                  <div className="settings-actions"><span>修改后会自动保存</span></div>
+                </section>
+                <section id="settings-sidebar-order" className="settings-section">
+                  <div className="settings-heading"><h2>侧边栏顺序</h2><p>恢复功能和类型的默认排列顺序</p></div>
+                  <div className="settings-actions"><span>清除当前项目保存的拖拽排序</span><button className="secondary-button danger" type="button" onClick={() => void resetSidebarOrder()}><RotateCcw size={16} />恢复默认顺序</button></div>
+                </section>
+                <section id="settings-notifications" className="settings-section close-settings-section">
+                  <div className="settings-heading"><h2>关闭与通知</h2><p>控制右上角关闭按钮，以及 AI 和构建任务完成后的系统提醒</p></div>
+                  <label className="field-label">关闭窗口<select value={settings.closeBehavior} onChange={(event) => void saveSettingsPatch({ closeBehavior: event.target.value as AgentSettings['closeBehavior'] })}><option value="ask">每次询问</option><option value="tray">最小化到系统托盘</option><option value="quit">直接关闭</option></select><small>首次关闭时会询问；勾选“不再提示”后会记住你的选择</small></label>
+                  <div className="appearance-row"><div><strong>任务完成通知</strong><p>AI 或构建任务完成、失败时显示系统通知，不显示中间进度</p></div><button className={`toggle ${settings.notificationsEnabled ? 'on' : ''}`} type="button" role="switch" aria-label="任务完成通知" aria-checked={settings.notificationsEnabled} onClick={() => void saveSettingsPatch({ notificationsEnabled: !settings.notificationsEnabled })}><span /></button></div>
+                </section>
+                <section id="settings-remote" className="settings-section remote-build-section">
+                  <div className="settings-heading"><h2>远程构建</h2><p>免费、国内低延迟的构建方案：使用 Gitee Go 托管 CI，推送代码后在国内节点执行 Gradle</p></div>
+                  <div className="remote-build-card">
+                    <div className="remote-build-card-heading"><div><strong>推荐：Gitee Go</strong><small>免费额度 · 国内节点 · 支持 Java/Gradle 缓存</small></div><span className="status-dot warning" /></div>
+                    <p>配置一次仓库和 Token 后，ModMind 会自动生成 `.gitee-ci.yml`、提交项目并推送；已启用 Gitee Go 的仓库会自动开始 Gradle 构建</p>
+                    <div className="remote-build-form">
+                      <label className="field-label">Gitee 仓库地址<input value={giteeSettings.repositoryUrl} onChange={(event) => { setGiteeSettings({ ...giteeSettings, repositoryUrl: event.target.value }); setGiteeValidation(null) }} placeholder="https://gitee.com/用户名/仓库名" /></label>
+                      <label className="field-label">构建分支<input value={giteeSettings.branch} onChange={(event) => setGiteeSettings({ ...giteeSettings, branch: event.target.value })} placeholder="main" /></label>
+                      <label className="field-label remote-build-token-field">Gitee Personal Access Token<input type="password" value={giteeSettings.token} onChange={(event) => setGiteeSettings({ ...giteeSettings, token: event.target.value })} placeholder={giteeSettings.hasStoredToken ? '已安全保存，留空则保持不变' : '粘贴 Gitee Token'} /><small>请授予仓库读写权限；Token 只保存在系统加密存储中，用于 Git 推送和仓库校验</small></label>
+                    </div>
+                    <div className="remote-build-actions"><div className="remote-build-button-group"><button className="secondary-button compact" type="button" onClick={() => window.open('https://gitee.com/profile/personal_access_tokens', '_blank')}><ExternalLink size={14} />创建 Token</button><button className="secondary-button compact" type="button" disabled={Boolean(giteeBuildBusy) || !giteeSettings.repositoryUrl.trim()} onClick={() => void validateGitee()}>{giteeBuildBusy === 'validate' ? <LoaderCircle className="spin" size={14} /> : <Check size={14} />}校验连接</button><button className="secondary-button compact" type="button" disabled={Boolean(giteeBuildBusy) || !giteeSettings.repositoryUrl.trim()} onClick={() => void saveGiteeBuildSettings()}><Save size={14} />保存</button></div><span>{giteeValidation ? (giteeValidation.valid ? `已连接 ${giteeValidation.repository}` : giteeValidation.detail) : '首次使用需要 Gitee 账号和 Token'}</span></div>
+                    <div className="remote-build-primary-action"><button className="primary-button" type="button" disabled={Boolean(giteeBuildBusy) || !giteeSettings.repositoryUrl.trim() || (!giteeSettings.token.trim() && !giteeSettings.hasStoredToken)} onClick={() => void triggerGiteeBuild()}>{giteeBuildBusy === 'build' ? <LoaderCircle className="spin" size={15} /> : <CloudUpload size={15} />}推送并开始远程构建</button>{giteeBuildResult?.pipelineUrl ? <button className="secondary-button compact" type="button" onClick={() => window.open(giteeBuildResult.pipelineUrl, '_blank')}><ExternalLink size={14} />打开 Gitee 流水线</button> : null}</div>
+                    <details className="remote-build-guide">
+                      <summary>首次使用说明：需要注册账号</summary>
+                      <p>远程构建依赖第三方构建平台账号。ModMind 不会索要平台密码，只在浏览器中完成授权；没有账号时仍可使用本地构建</p>
+                      <div className="remote-build-account-list">
+                        <div><strong>推荐路径</strong><span>注册 Gitee 账号，创建私有仓库并启用 Gitee Go</span></div>
+                        <div><strong>备用云平台</strong><span>CODING 需要腾讯云/CODING 账号；CodeArts 需要华为云账号</span></div>
+                        <div><strong>自托管路径</strong><span>GitHub Runner 需要 GitHub 账号和在线机器；Jenkins 需要 Gitee 账号和已部署的 Jenkins</span></div>
+                      </div>
+                      <p className="remote-build-guide-note">云平台免费额度会因账号类型和政策变化；当前版本使用 Gitee Go，Gitee 不可用时请切换到本地构建。其他 Provider 接入后再启用自动择优</p>
+                    </details>
+                  </div>
                 </section>
               </div>
             ) : null}
@@ -1918,11 +5117,19 @@ export default function App(): React.JSX.Element {
         )}
       </div>
 
+      <GlobalDownloadIndicator />
       {showCreate ? <CreateProjectDialog onClose={() => setShowCreate(false)} onCreated={(created) => { setProject(created); setShowCreate(false); setProjectLauncherOpen(false); setView('workspace'); void refreshRecentProjects() }} /> : null}
+      {renamingProject ? <RenameProjectDialog project={renamingProject} onClose={() => setRenamingProject(null)} onRenamed={projectRenamed} /> : null}
       {existingImportPicker ? <ExistingImportPicker onClose={() => setExistingImportPicker(false)} onSelect={(sourceType) => { setExistingImportPicker(false); void inspectExistingProject(sourceType) }} /> : null}
+      {existingInspecting ? <ProjectInspectionDialog kind="project" /> : null}
+      {modJarInspecting ? <ProjectInspectionDialog kind="mod" /> : null}
       {existingAnalysis ? <AdoptProjectDialog analysis={existingAnalysis} onClose={() => setExistingAnalysis(null)} onAdopted={(adopted) => { setExistingAnalysis(null); setProject(adopted); setProjectLauncherOpen(false); setView('workspace'); void refreshRecentProjects() }} /> : null}
-      {aiRecovery ? <div className="modal-backdrop"><div className="dialog recovery-dialog" role="dialog" aria-modal="true"><div className="dialog-header"><div><h2>发现未完成的 AI 任务</h2><p>任务的计划、会话和修改进度已保存。</p></div><CircleAlert size={21} /></div><p className="recovery-copy">可以从中断点继续，也可以精确恢复到 AI 修改前状态。恢复前会自动备份当前半成品。</p><div className="dialog-footer"><button className="secondary-button" disabled={recoveryBusy} onClick={() => void restoreInterruptedAi()}><RotateCcw size={16} />恢复修改前状态</button>{recoveryBusy ? <button className="secondary-button" onClick={() => void window.modmind.ai.cancelCode()}><X size={16} />停止恢复</button> : null}<button className="primary-button" disabled={recoveryBusy} onClick={() => void resumeInterruptedAi()}>{recoveryBusy ? <LoaderCircle className="spin" size={16} /> : <Play size={16} />}继续 AI 任务</button></div></div></div> : null}
-      {buildTrustRequest ? <div className="modal-backdrop"><div className="dialog recovery-dialog" role="dialog" aria-modal="true"><div className="dialog-header"><div><h2>确认执行构建脚本</h2><p>{buildTrustRequest.projectName}</p></div><ShieldCheck size={21} /></div><p className="recovery-copy">Gradle 构建脚本能够以当前 Windows 用户权限执行程序、访问网络和读写文件。脚本内容发生变化后，ModMind 会重新询问。</p><code>{buildTrustRequest.projectPath}</code><div className="dialog-footer"><button className="secondary-button" onClick={() => { void window.modmind.build.respondTrust(buildTrustRequest.id, false); setBuildTrustRequest(null) }}>取消构建</button><button className="primary-button" onClick={() => { void window.modmind.build.respondTrust(buildTrustRequest.id, true); setBuildTrustRequest(null) }}><ShieldCheck size={16} />信任并构建</button></div></div></div> : null}
+      {modJarInspection ? <AdoptModJarDialog inspection={modJarInspection} onClose={() => setModJarInspection(null)} onAdopted={(adopted) => { setModJarInspection(null); setProject(adopted); setProjectLauncherOpen(false); setView('workspace'); void refreshRecentProjects() }} /> : null}
+      {updateInfo ? <div className="modal-backdrop"><div className="dialog update-dialog" role="dialog" aria-modal="true" aria-labelledby="update-dialog-title"><div className="dialog-header"><div><h2 id="update-dialog-title">发现新版本</h2><p>ModMind {updateInfo.latestVersion} 已发布</p></div><CloudUpload size={21} /></div><p className="recovery-copy">当前版本为 {updateInfo.currentVersion}。安装包将在后台下载，期间可以收起下载悬浮窗继续工作。</p><div className="dialog-footer"><button className="secondary-button" disabled={updateActionBusy} onClick={() => setUpdateInfo(null)}>暂不下载</button><button className="primary-button" disabled={updateActionBusy} onClick={downloadAppUpdate}>{updateActionBusy ? <LoaderCircle className="spin" size={16} /> : <Download size={16} />}下载更新</button></div></div></div> : null}
+      {updateDownloadedOpen && appUpdateState.phase === 'downloaded' ? <div className="modal-backdrop"><div className="dialog update-dialog update-ready-dialog" role="dialog" aria-modal="true" aria-labelledby="update-ready-dialog-title"><div className="dialog-header"><div><h2 id="update-ready-dialog-title">更新已下载</h2><p>ModMind {appUpdateState.latestVersion} 已准备好</p></div><PackageOpen size={21} /></div><p className="recovery-copy">安装包已经校验完成。可以立即重启安装；选择稍后时，下次启动 ModMind 会自动进入安装。</p><div className="dialog-footer"><button className="secondary-button" disabled={updateActionBusy} onClick={() => setUpdateDownloadedOpen(false)}>稍后</button><button className="primary-button" disabled={updateActionBusy} onClick={installAppUpdate}>{updateActionBusy ? <LoaderCircle className="spin" size={16} /> : <RotateCcw size={16} />}重启并安装</button></div></div></div> : null}
+      {deviceAccountOpen ? <DeviceAccountDialog state={deviceState} remoteState={remoteState} busy={deviceBusy} remoteBusy={remoteBusy} onClose={() => setDeviceAccountOpen(false)} onAuthorize={() => void deviceAuthorize()} onCancel={() => void deviceCancel()} onDisconnect={() => void deviceDisconnect()} onRefresh={() => void deviceRefresh()} onOpenSite={deviceOpenSite} onRemoteToggle={() => void remoteToggle()} /> : null}
+      {confirmDialog}
+      {promptDialog}
       {notice ? <div className="toast">{notice}</div> : null}
     </div>
   )

@@ -42,8 +42,8 @@ jobs:
             artifact: ModMind-Windows-unsigned
             paths: |
               release/ModMind Setup *.exe
-              release/ModMind *.exe
               release/SHA256SUMS.txt
+              release/update/**
           - os: ubuntu-latest
             command: npm run dist:linux
             artifact: ModMind-Linux

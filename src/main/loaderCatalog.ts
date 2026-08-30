@@ -2,12 +2,13 @@ import { promises as fs } from 'node:fs'
 import path from 'node:path'
 import { XMLParser } from 'fast-xml-parser'
 import type { LoaderKind, LoaderVersionOption } from '../shared/types'
+import { PROJECT_PLATFORMS } from '../shared/projectPlatform'
 import { javaVersionForMinecraft, supportsProjectCreation } from './loaderCompatibility'
+import { fetchTextWithRetry } from './networkRequest'
 
 export { javaVersionForMinecraft } from './loaderCompatibility'
 
 const CACHE_TTL_MS = 6 * 60 * 60 * 1000
-const REQUEST_TIMEOUT_MS = 30_000
 const xmlParser = new XMLParser({ ignoreAttributes: false })
 
 interface CatalogCache {
@@ -18,7 +19,7 @@ interface CatalogCache {
 function supportedOptions(options: LoaderVersionOption[]): LoaderVersionOption[] {
   const seen = new Set<string>()
   return options.filter((option) => {
-    if (!option || !['fabric', 'quilt', 'forge', 'neoforge'].includes(option.loader)) return false
+    if (!option || !(PROJECT_PLATFORMS as readonly string[]).includes(option.loader)) return false
     if (!supportsProjectCreation(option.loader, option.minecraftVersion)) return false
     if (!option.loaderVersion || !Number.isInteger(option.javaVersion) || !Array.isArray(option.notes)) return false
     const key = `${option.loader}:${option.minecraftVersion}`
@@ -29,18 +30,61 @@ function supportedOptions(options: LoaderVersionOption[]): LoaderVersionOption[]
 }
 
 function completeCatalog(options: LoaderVersionOption[]): boolean {
-  return (['fabric', 'quilt', 'forge', 'neoforge'] as const).every((loader) => options.some((option) => option.loader === loader))
+  return PROJECT_PLATFORMS.every((loader) => options.some((option) => option.loader === loader))
 }
 
+const addonOptions: LoaderVersionOption[] = [
+  { loader: 'bedrock', minecraftVersion: '1.26.30', loaderVersion: 'script-api-2.9.0', apiVersion: '2.9.0', javaVersion: 0, channel: 'release', supportTier: 'stable', notes: ['国际基岩版现代稳定档；版本表示最低引擎版本'] },
+  { loader: 'bedrock', minecraftVersion: '1.21.100', loaderVersion: 'script-api-2.0.0', apiVersion: '2.0.0', javaVersion: 0, channel: 'release', supportTier: 'stable', notes: ['国际基岩版长期兼容档'] },
+  { loader: 'bedrock', minecraftVersion: '1.20.80', loaderVersion: 'script-api-1.13.0', apiVersion: '1.13.0', javaVersion: 0, channel: 'release', supportTier: 'experimental', notes: ['旧版兼容档；部分现代组件和 Script API 不可用'] },
+  { loader: 'netease-pc', minecraftVersion: '3.8', loaderVersion: 'netease-modsdk-3.8', apiVersion: '3.8', javaVersion: 0, channel: 'release', supportTier: 'experimental', notes: ['需要网易开发者工作台、开发者账号与对应引擎版本'] },
+  { loader: 'netease-mobile', minecraftVersion: '3.8', loaderVersion: 'netease-modsdk-3.8', apiVersion: '3.8', javaVersion: 0, channel: 'release', supportTier: 'experimental', notes: ['在 PC 上开发，通过网易工作台进行手机测试与提交审核'] }
+]
+
+const fabricOfflineGames = [
+  '26.2', '26.1.2', '26.1.1', '26.1', '1.21.11', '1.21.10', '1.21.9', '1.21.8', '1.21.7', '1.21.6', '1.21.5', '1.21.4', '1.21.3', '1.21.2', '1.21.1', '1.21',
+  '1.20.6', '1.20.5', '1.20.4', '1.20.3', '1.20.2', '1.20.1', '1.20', '1.19.4', '1.19.3', '1.19.2', '1.19.1', '1.19', '1.18.2', '1.18.1', '1.18',
+  '1.17.1', '1.17', '1.16.5', '1.16.4', '1.16.3', '1.16.2', '1.16.1', '1.16', '1.15.2', '1.15.1', '1.15', '1.14.4', '1.14.3', '1.14.2', '1.14.1', '1.14'
+] as const
+
+const fabricOfflineApi: Record<string, string> = {
+  '26.2': '0.156.0+26.2', '26.1.2': '0.155.2+26.1.2', '26.1.1': '0.145.4+26.1.1', '26.1': '0.145.1+26.1',
+  '1.21.11': '0.141.6+1.21.11', '1.21.10': '0.138.4+1.21.10', '1.21.9': '0.134.1+1.21.9', '1.21.8': '0.136.1+1.21.8',
+  '1.21.7': '0.129.0+1.21.7', '1.21.6': '0.128.2+1.21.6', '1.21.5': '0.128.2+1.21.5', '1.21.4': '0.119.4+1.21.4',
+  '1.21.3': '0.114.1+1.21.3', '1.21.2': '0.106.1+1.21.2', '1.21.1': '0.116.15+1.21.1', '1.21': '0.102.0+1.21',
+  '1.20.6': '0.100.8+1.20.6', '1.20.5': '0.97.8+1.20.5', '1.20.4': '0.97.3+1.20.4', '1.20.3': '0.91.1+1.20.3',
+  '1.20.2': '0.91.6+1.20.2', '1.20.1': '0.92.11+1.20.1', '1.20': '0.83.0+1.20',
+  '1.19.4': '0.87.2+1.19.4', '1.19.3': '0.76.1+1.19.3', '1.19.2': '0.77.0+1.19.2', '1.19.1': '0.58.5+1.19.1', '1.19': '0.58.0+1.19',
+  '1.18.2': '0.77.0+1.18.2', '1.18.1': '0.46.6+1.18', '1.18': '0.46.6+1.18', '1.17.1': '0.46.1+1.17', '1.17': '0.46.1+1.17',
+  '1.16.5': '0.42.0+1.16', '1.16.4': '0.42.0+1.16', '1.16.3': '0.42.0+1.16', '1.16.2': '0.42.0+1.16', '1.16.1': '0.42.0+1.16', '1.16': '0.42.0+1.16',
+  '1.15.2': '0.28.5+1.15', '1.15.1': '0.28.5+1.15', '1.15': '0.28.5+1.15',
+  '1.14.4': '0.28.5+1.14', '1.14.3': '0.28.5+1.14', '1.14.2': '0.28.5+1.14', '1.14.1': '0.28.5+1.14', '1.14': '0.28.5+1.14'
+}
+
+const fabricFallbackOptions: LoaderVersionOption[] = fabricOfflineGames.map((minecraftVersion) => ({
+  loader: 'fabric', minecraftVersion, loaderVersion: '0.19.3', apiVersion: fabricOfflineApi[minecraftVersion],
+  javaVersion: javaVersionForMinecraft(minecraftVersion), channel: 'release',
+  supportTier: compareVersions(minecraftVersion, '1.20.1') >= 0 ? 'stable' : 'experimental',
+  notes: fabricOfflineApi[minecraftVersion] ? ['离线官方分支兼容档；联网后刷新 Fabric API'] : ['离线提供 Fabric Loader；联网后自动匹配 Fabric API']
+}))
+
 const fallbackOptions: LoaderVersionOption[] = [
-  { loader: 'fabric', minecraftVersion: '1.20.1', loaderVersion: '0.16.10', apiVersion: '0.92.9+1.20.1', javaVersion: 17, channel: 'release', supportTier: 'stable', notes: [] },
-  { loader: 'fabric', minecraftVersion: '1.20.6', loaderVersion: '0.16.10', apiVersion: '0.100.8+1.20.6', javaVersion: 21, channel: 'release', supportTier: 'stable', notes: [] },
-  { loader: 'fabric', minecraftVersion: '1.21.1', loaderVersion: '0.16.10', apiVersion: '0.116.13+1.21.1', javaVersion: 21, channel: 'release', supportTier: 'stable', notes: [] },
+  ...fabricFallbackOptions,
   { loader: 'quilt', minecraftVersion: '1.20.1', loaderVersion: '0.27.1', apiVersion: '7.7.0+0.92.2-1.20.1', qslVersion: '6.3.0+1.20.1', javaVersion: 17, channel: 'release', supportTier: 'experimental', notes: ['Quilt 与 Quilted Fabric API 支持处于兼容验证阶段'] },
+  { loader: 'forge', minecraftVersion: '1.6.4', loaderVersion: '1.6.4-9.11.1.1345', javaVersion: 8, channel: 'release', supportTier: 'experimental', notes: ['遗留 ForgeGradle 1.x 工具链'] },
+  { loader: 'forge', minecraftVersion: '1.7.10', loaderVersion: '1.7.10-10.13.4.1614-1.7.10', javaVersion: 8, channel: 'release', supportTier: 'experimental', notes: ['遗留 ForgeGradle 1.x 工具链'] },
+  { loader: 'forge', minecraftVersion: '1.8.9', loaderVersion: '1.8.9-11.15.1.2318-1.8.9', javaVersion: 8, channel: 'release', supportTier: 'stable', notes: ['重点兼容档：ForgeGradle 2.1、Gradle 2.7、stable_20 mappings'] },
+  { loader: 'forge', minecraftVersion: '1.12.2', loaderVersion: '1.12.2-14.23.5.2860', javaVersion: 8, channel: 'release', supportTier: 'stable', notes: ['重点兼容档：ForgeGradle 3、Gradle 4.9、官方 20171003-1.12 mappings'] },
+  { loader: 'forge', minecraftVersion: '1.16.5', loaderVersion: '1.16.5-36.2.42', javaVersion: 8, channel: 'release', supportTier: 'experimental', notes: ['旧版 ForgeGradle 工具链'] },
   { loader: 'forge', minecraftVersion: '1.20.1', loaderVersion: '1.20.1-47.4.0', javaVersion: 17, channel: 'release', supportTier: 'stable', notes: ['离线兼容目录，联网后会刷新 Forge 版本'] },
   { loader: 'neoforge', minecraftVersion: '1.20.4', loaderVersion: '20.4.251', javaVersion: 17, channel: 'release', supportTier: 'stable', notes: [] },
-  { loader: 'neoforge', minecraftVersion: '1.21.1', loaderVersion: '21.1.244', javaVersion: 21, channel: 'release', supportTier: 'stable', notes: [] }
+  { loader: 'neoforge', minecraftVersion: '1.21.1', loaderVersion: '21.1.244', javaVersion: 21, channel: 'release', supportTier: 'stable', notes: [] },
+  ...addonOptions
 ]
+
+export function bundledLoaderCatalog(): LoaderVersionOption[] {
+  return supportedOptions(fallbackOptions).sort(minecraftSort)
+}
 
 function asArray<T>(value: T | T[] | undefined): T[] {
   if (value === undefined) return []
@@ -67,21 +111,7 @@ function compareVersions(left: string, right: string): number {
 }
 
 async function fetchText(url: string, productVersion = 'development'): Promise<string> {
-  let lastError: unknown
-  for (let attempt = 1; attempt <= 3; attempt += 1) {
-    try {
-      const response = await fetch(url, {
-        headers: { 'User-Agent': `ModMind/${productVersion} (loader-catalog)` },
-        signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-      })
-      if (!response.ok) throw new Error(`${url} returned HTTP ${response.status}`)
-      return await response.text()
-    } catch (error) {
-      lastError = error
-      if (attempt < 3) await new Promise((resolve) => setTimeout(resolve, attempt * 350))
-    }
-  }
-  throw lastError
+  return await fetchTextWithRetry(url, { headers: { 'User-Agent': `ModMind/${productVersion} (loader-catalog)` } })
 }
 
 async function fetchOptionalText(url: string, fallback: string, productVersion: string): Promise<string> {
@@ -133,17 +163,21 @@ export async function downloadLoaderCatalog(productVersion = 'development'): Pro
   const fabricApiByGame = new Map<string, string>()
   for (const version of metadataVersions(fabricApiXml)) {
     const game = version.slice(version.lastIndexOf('+') + 1)
-    if (releases.includes(game)) fabricApiByGame.set(game, version)
+    const existing = fabricApiByGame.get(game)
+    if (!existing || compareVersions(version, existing) > 0) fabricApiByGame.set(game, version)
   }
 
   const options: LoaderVersionOption[] = []
   for (const game of loaderVersion ? fabricGames.filter((entry) => entry.stable && releases.includes(entry.version)) : []) {
-    const apiVersion = fabricApiByGame.get(game.version)
+    const family = game.version.startsWith('1.') ? game.version.split('.').slice(0, 2).join('.') : game.version
+    const apiVersion = fabricApiByGame.get(game.version) ?? fabricApiByGame.get(family)
     options.push({
       loader: 'fabric', minecraftVersion: game.version, loaderVersion, apiVersion,
       javaVersion: javaVersionForMinecraft(game.version), channel: 'release',
-      supportTier: apiVersion ? 'stable' : 'experimental',
-      notes: apiVersion ? [] : ['未找到对应的 Fabric API，模板将只包含 Fabric Loader']
+      supportTier: apiVersion && compareVersions(game.version, '1.20.1') >= 0 ? 'stable' : 'experimental',
+      notes: apiVersion
+        ? (compareVersions(game.version, '1.20.1') < 0 ? ['旧版 Fabric 使用历史 Java 与资源格式，需要额外运行验证'] : [])
+        : ['未找到对应的 Fabric API，模板将只包含 Fabric Loader']
     })
   }
 
@@ -192,8 +226,8 @@ export async function downloadLoaderCatalog(productVersion = 'development'): Pro
     options.push({
       loader: 'forge', minecraftVersion: game, loaderVersion: version,
       javaVersion: javaVersionForMinecraft(game), channel: 'release',
-      supportTier: modern ? 'stable' : 'experimental',
-      notes: modern ? [] : ['旧版 Forge 使用遗留构建工具链，需要额外验证']
+      supportTier: compareVersions(game, '1.20.1') >= 0 ? 'stable' : 'experimental',
+      notes: compareVersions(game, '1.20.1') >= 0 ? [] : [modern ? '旧版 Forge 工具链需要额外构建与启动验证' : '遗留 ForgeGradle 工具链需要 Java 8 和额外运行验证']
     })
   }
 
@@ -226,7 +260,7 @@ export async function downloadLoaderCatalog(productVersion = 'development'): Pro
       notes: ['NeoForge 1.20.1 过渡构件使用 net.neoforged:forge']
     })
   }
-  const supported = supportedOptions(options).sort(minecraftSort)
+  const supported = supportedOptions([...options, ...addonOptions]).sort(minecraftSort)
   if (!completeCatalog(supported)) throw new Error('上游 Loader 元数据未提供完整的受支持模板目录')
   return supported
 }
@@ -267,7 +301,7 @@ export class LoaderCatalog {
       } catch {
         // The bundled fallback keeps project creation available offline.
       }
-      this.memory = supportedOptions(fallbackOptions).map((option) => ({
+      this.memory = bundledLoaderCatalog().map((option) => ({
         ...option,
         notes: [...option.notes, `兼容目录刷新失败：${error instanceof Error ? error.message : String(error)}`]
       }))

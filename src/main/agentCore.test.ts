@@ -3,9 +3,9 @@ import { promises as fs } from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 import {
-  extractSingleJsonObject,
   listManagedFiles,
   redactSensitiveContent,
+  restoreManagedPathsFromSnapshot,
   restoreManagedTreeExact,
   snapshotManifestBelongsToProject,
   validateSnapshotId
@@ -33,23 +33,6 @@ afterEach(async () => {
   await Promise.all(temporaryRoots.splice(0).map((root) => fs.rm(root, { recursive: true, force: true })))
 })
 
-describe('extractSingleJsonObject', () => {
-  it('accepts fenced nested JSON with braces inside strings', () => {
-    const value = extractSingleJsonObject('```json\n{"action":"read_file","path":"a{b}.java"}\n```')
-    expect(JSON.parse(value)).toEqual({ action: 'read_file', path: 'a{b}.java' })
-  })
-
-  it('rejects hidden extra actions instead of silently dropping them', () => {
-    expect(() => extractSingleJsonObject('{"action":"read_file"}\n{"action":"build_project"}'))
-      .toThrow(/more than one action/)
-  })
-
-  it('accepts harmless prose after the JSON object', () => {
-    const value = extractSingleJsonObject('{"action":"read_file"}\nI inspected the file.')
-    expect(JSON.parse(value)).toEqual({ action: 'read_file' })
-  })
-})
-
 describe('redactSensitiveContent', () => {
   it('redacts property and JSON credentials while preserving ordinary settings', () => {
     expect(redactSensitiveContent('gradle.properties', 'minecraft_version=1.21.1\nrepoToken=secret-value'))
@@ -69,6 +52,9 @@ describe('restoreManagedTreeExact', () => {
     await fs.mkdir(path.join(project, 'src'), { recursive: true })
     await fs.writeFile(path.join(project, 'src', 'Existing.java'), 'modified')
     await fs.writeFile(path.join(project, 'src', 'CreatedByAi.java'), 'half finished')
+    await fs.mkdir(path.join(project, 'mods', 'generated', 'nested'), { recursive: true })
+    await fs.writeFile(path.join(project, 'mods', 'generated', 'nested', 'target-version.jar'), 'new')
+    await fs.mkdir(path.join(snapshot, 'empty-by-design'), { recursive: true })
     await fs.mkdir(path.join(project, '.modmind'), { recursive: true })
     await fs.writeFile(path.join(project, '.modmind', 'keep.json'), '{}')
 
@@ -77,7 +63,51 @@ describe('restoreManagedTreeExact', () => {
 
     await expect(fs.readFile(path.join(project, 'src', 'Existing.java'), 'utf8')).resolves.toBe('original')
     await expect(fs.stat(path.join(project, 'src', 'CreatedByAi.java'))).rejects.toThrow()
+    await expect(fs.stat(path.join(project, 'mods'))).rejects.toThrow()
+    await expect(fs.stat(path.join(project, 'empty-by-design'))).resolves.toMatchObject({ isDirectory: expect.any(Function) })
     await expect(fs.readFile(path.join(project, '.modmind', 'keep.json'), 'utf8')).resolves.toBe('{}')
+  })
+})
+
+describe('restoreManagedPathsFromSnapshot', () => {
+  it('rolls back only Agent-attributed files and preserves unrelated user changes', async () => {
+    const root = await temporaryDirectory()
+    const snapshot = path.join(root, 'snapshot')
+    const project = path.join(root, 'project')
+    await fs.mkdir(path.join(snapshot, 'src'), { recursive: true })
+    await fs.mkdir(path.join(project, 'src'), { recursive: true })
+    await fs.writeFile(path.join(snapshot, 'src', 'Changed.java'), 'before Agent')
+    await fs.writeFile(path.join(snapshot, 'src', 'DeletedByUser.java'), 'user later deleted this')
+    await fs.writeFile(path.join(project, 'src', 'Changed.java'), 'half-finished Agent edit')
+    await fs.writeFile(path.join(project, 'src', 'CreatedByAgent.java'), 'new Agent file')
+    await fs.writeFile(path.join(project, 'src', 'UnrelatedUserEdit.java'), 'keep me')
+
+    await restoreManagedPathsFromSnapshot(snapshot, project, ['src/Changed.java', 'src/CreatedByAgent.java'])
+
+    await expect(fs.readFile(path.join(project, 'src', 'Changed.java'), 'utf8')).resolves.toBe('before Agent')
+    await expect(fs.stat(path.join(project, 'src', 'CreatedByAgent.java'))).rejects.toThrow()
+    await expect(fs.stat(path.join(project, 'src', 'DeletedByUser.java'))).rejects.toThrow()
+    await expect(fs.readFile(path.join(project, 'src', 'UnrelatedUserEdit.java'), 'utf8')).resolves.toBe('keep me')
+  })
+
+  it('does not mutate project files when no Agent changes were recorded', async () => {
+    const root = await temporaryDirectory()
+    const snapshot = path.join(root, 'snapshot')
+    const project = path.join(root, 'project')
+    await fs.mkdir(snapshot)
+    await fs.mkdir(project)
+    await fs.writeFile(path.join(snapshot, 'kept.txt'), 'snapshot')
+    await fs.writeFile(path.join(project, 'kept.txt'), 'current user edit')
+
+    await restoreManagedPathsFromSnapshot(snapshot, project, [])
+
+    await expect(fs.readFile(path.join(project, 'kept.txt'), 'utf8')).resolves.toBe('current user edit')
+  })
+
+  it('rejects recovery paths outside the project', async () => {
+    const root = await temporaryDirectory()
+    await expect(restoreManagedPathsFromSnapshot(path.join(root, 'snapshot'), path.join(root, 'project'), ['../outside.txt']))
+      .rejects.toThrow(/Unsafe managed recovery path/)
   })
 })
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "Minecraft Content Assets"
+  short_description: "Create coordinated models, textures, data, and resources"
+  default_prompt: "Use $minecraft-content-assets to build the models, textures, and resources for this feature."

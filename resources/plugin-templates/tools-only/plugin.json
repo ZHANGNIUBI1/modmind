@@ -1,0 +1,29 @@
+{
+  "id": "tools-only",
+  "name": "仅工具插件模板",
+  "version": "0.1.0",
+  "description": "演示如何编写注册进 ModMind MCP server 的后端工具，供外部 AI Agent 调用。",
+  "author": "",
+  "permissions": ["project.read", "storage"],
+  "backend": {
+    "entry": "backend/main.mjs",
+    "tools": [
+      {
+        "name": "echo",
+        "description": "原样返回输入文本，用于验证插件工具链路是否连通。",
+        "inputSchema": {
+          "type": "object",
+          "properties": { "text": { "type": "string", "description": "要回显的文本" } },
+          "required": ["text"]
+        },
+        "annotations": { "readOnlyLocal": true }
+      },
+      {
+        "name": "counter",
+        "description": "维护一个持久化计数器并加一返回，演示 storage 权限的键值存储。",
+        "inputSchema": { "type": "object", "properties": {} },
+        "annotations": { "safeStateChange": true }
+      }
+    ]
+  }
+}

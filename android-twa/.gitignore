@@ -1,0 +1,13 @@
+# Build artifacts
+.gradle/
+build/
+app/build/
+
+# Signing material — NEVER commit. The keystore is the app's permanent identity.
+etherstudio-release.keystore
+keystore.properties
+
+# Local IDE files
+.idea/
+*.iml
+local.properties

@@ -9,6 +9,7 @@ export type MinecraftRuntimeStage =
   | 'installing-fabric'
   | 'building-mod'
   | 'testing-server'
+  | 'headless-testing'
   | 'syncing-mod'
   | 'launching'
   | 'running'
@@ -22,6 +23,7 @@ export interface MinecraftRuntimeEvent {
   progress?: number
   total?: number
   level?: 'info' | 'warning' | 'error'
+  projectPath?: string
 }
 
 export function appendMinecraftRuntimeEvent(
@@ -57,6 +59,7 @@ export interface MinecraftCrashInfo {
 }
 
 export interface MinecraftRuntimeState {
+  projectPath?: string
   stage: MinecraftRuntimeStage
   minecraftVersion: string
   loader?: LoaderKind
@@ -73,6 +76,43 @@ export interface MinecraftRuntimeState {
   lastCrash?: MinecraftCrashInfo
 }
 
+export type LocalServerStage = 'idle' | 'preparing' | 'building' | 'installing' | 'starting' | 'running' | 'stopping' | 'stopped' | 'error'
+
+export interface LocalServerEvent {
+  stage: LocalServerStage
+  message: string
+  time: string
+  level?: 'info' | 'warning' | 'error'
+}
+
+export interface LocalServerLogEntry {
+  message: string
+  time: string
+  level?: 'info' | 'warning' | 'error'
+}
+
+export interface LocalServerOperationProgress {
+  message: string
+  fraction?: number
+  downloaded?: number
+  total?: number
+}
+
+export interface LocalServerState {
+  stage: LocalServerStage
+  minecraftVersion: string
+  loader?: LoaderKind
+  loaderVersion?: string
+  running: boolean
+  address?: string
+  port?: number
+  pid?: number
+  logPath?: string
+  recentLogs: LocalServerLogEntry[]
+  operationProgress?: LocalServerOperationProgress
+  message: string
+}
+
 export interface MinecraftLaunchOptions {
   username: string
   maxMemoryMb: number
@@ -86,6 +126,17 @@ export interface MinecraftLaunchTestResult {
   crash?: MinecraftCrashInfo
 }
 
+export interface HeadlessSmokeTestResult {
+  success: boolean
+  launcherVersion: string
+  launcherPath: string
+  transcriptPath: string
+  stableWindowMs: number
+  message: string
+  joinedServer?: boolean
+  serverAddress?: string
+}
+
 export interface GradleVerificationResult {
   task?: string
   skipped: boolean
@@ -97,11 +148,16 @@ export interface GradleVerificationResult {
 export interface MinecraftApi {
   getState: () => Promise<MinecraftRuntimeState>
   prepare: () => Promise<MinecraftRuntimeState>
-  buildProject: () => Promise<MinecraftManagedMod>
+  cancelPreparation: () => Promise<MinecraftRuntimeState>
+  restartPreparation: () => Promise<MinecraftRuntimeState>
+  buildProject: (projectPath?: string) => Promise<MinecraftManagedMod>
   launch: (options: MinecraftLaunchOptions) => Promise<MinecraftRuntimeState>
   testLaunch: (options: MinecraftLaunchOptions) => Promise<MinecraftLaunchTestResult>
+  headlessSmokeTest: () => Promise<HeadlessSmokeTestResult>
+  openHeadlessMcLogin: () => Promise<void>
   stop: () => Promise<MinecraftRuntimeState>
   syncProjectMod: () => Promise<MinecraftManagedMod | null>
+  syncModpack: () => Promise<MinecraftRuntimeState>
   importMods: () => Promise<MinecraftManagedMod[]>
   removeMod: (name: string) => Promise<MinecraftManagedMod[]>
   listMods: () => Promise<MinecraftManagedMod[]>

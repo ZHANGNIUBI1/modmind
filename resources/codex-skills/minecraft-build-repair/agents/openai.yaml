@@ -1,0 +1,4 @@
+interface:
+  display_name: "Minecraft Build Repair"
+  short_description: "Diagnose and repair Gradle, compile, and runtime failures"
+  default_prompt: "Use $minecraft-build-repair to diagnose and fix this Minecraft mod failure."

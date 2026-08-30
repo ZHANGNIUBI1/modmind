@@ -1,0 +1,22 @@
+{
+  "id": "panel-and-tools",
+  "name": "面板加工具插件模板",
+  "version": "0.1.0",
+  "description": "完整示例：侧边栏面板通过宿主中转调用本插件后端工具，后端工具同时注册进 MCP。",
+  "author": "",
+  "permissions": ["project.read"],
+  "backend": {
+    "entry": "backend/main.mjs",
+    "tools": [
+      {
+        "name": "summarize_project",
+        "description": "返回当前 ModMind 项目的名称、路径与类型摘要。",
+        "inputSchema": { "type": "object", "properties": {} },
+        "annotations": { "readOnlyLocal": true }
+      }
+    ]
+  },
+  "panel": {
+    "entry": "panel/index.html"
+  }
+}

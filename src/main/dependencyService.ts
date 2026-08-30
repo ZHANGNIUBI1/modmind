@@ -11,9 +11,11 @@ import type {
   ManagedDependency
 } from '../shared/production'
 import type { ProjectInfo } from '../shared/types'
+import { isJavaLoader, platformLabel } from '../shared/projectPlatform'
+import { verifiedDownload } from './downloadService'
+import { fetchJsonWithRetry } from './networkRequest'
 
 const MODRINTH_API = 'https://api.modrinth.com/v2'
-const REQUEST_TIMEOUT_MS = 30_000
 const MAX_DOWNLOAD_BYTES = 256 * 1024 * 1024
 const START_MARKER = '// MODMIND DEPENDENCIES START'
 const END_MARKER = '// MODMIND DEPENDENCIES END'
@@ -85,12 +87,7 @@ function side(value: unknown): DependencyProject['clientSide'] {
 }
 
 async function fetchJson<T>(url: string, productVersion: string): Promise<T> {
-  const response = await fetch(url, {
-    headers: { 'User-Agent': `ModMind/${productVersion} (dependency-center)` },
-    signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS)
-  })
-  if (!response.ok) throw new Error(`Modrinth 请求失败：HTTP ${response.status}`)
-  return await response.json() as T
+  return await fetchJsonWithRetry<T>(url, { headers: { 'User-Agent': `ModMind/${productVersion} (dependency-center)` } })
 }
 
 function toProject(value: ModrinthSearchHit): DependencyProject | null {
@@ -135,6 +132,10 @@ async function readManifest(project: ProjectInfo): Promise<DependencyManifest> {
   } catch {
     return { version: 1, dependencies: [] }
   }
+}
+
+export async function readManagedDependencies(project: ProjectInfo): Promise<ManagedDependency[]> {
+  return (await readManifest(project)).dependencies
 }
 
 async function writeManifest(project: ProjectInfo, dependencies: ManagedDependency[]): Promise<void> {
@@ -225,7 +226,7 @@ async function gradleFile(project: ProjectInfo): Promise<{ target: string; sourc
   return { target, source, kotlin: isKotlin }
 }
 
-async function applyDependencyState(project: ProjectInfo, dependencies: ManagedDependency[]): Promise<void> {
+export async function applyManagedDependencies(project: ProjectInfo, dependencies: ManagedDependency[]): Promise<void> {
   const manifestTarget = manifestPath(project)
   const previousManifest = await fs.readFile(manifestTarget).catch(() => null)
   const gradle = await gradleFile(project)
@@ -249,8 +250,14 @@ export class DependencyService {
     private readonly productVersion = 'development'
   ) {}
 
-  async search(query: string, offset = 0): Promise<DependencySearchResult> {
+  private javaProject(): ProjectInfo {
     const project = this.getProject()
+    if (!isJavaLoader(project.loader)) throw new Error(`${platformLabel(project.loader)} 不使用 Maven/Gradle Mod 依赖中心`)
+    return project
+  }
+
+  async search(query: string, offset = 0): Promise<DependencySearchResult> {
+    const project = this.javaProject()
     const normalized = query.trim().slice(0, 100)
     if (!normalized) return { query: '', total: 0, offset: 0, hits: [] }
     const facets = JSON.stringify([[`categories:${project.loader}`], [`versions:${project.minecraftVersion}`], ['project_type:mod']])
@@ -265,7 +272,7 @@ export class DependencyService {
   }
 
   async versions(projectId: string): Promise<DependencyVersion[]> {
-    const project = this.getProject()
+    const project = this.javaProject()
     const id = safeSegment(projectId, '项目 ID')
     const query = new URLSearchParams({
       loaders: JSON.stringify([project.loader]),
@@ -277,11 +284,11 @@ export class DependencyService {
   }
 
   async list(): Promise<ManagedDependency[]> {
-    return (await readManifest(this.getProject())).dependencies
+    return (await readManifest(this.javaProject())).dependencies
   }
 
   async install(input: DependencyInstallInput): Promise<ManagedDependency> {
-    const project = this.getProject()
+    const project = this.javaProject()
     const projectId = safeSegment(input.projectId, '项目 ID')
     const available = await this.versions(projectId)
     const selected = input.versionId
@@ -295,17 +302,25 @@ export class DependencyService {
     if (!file.filename.toLowerCase().endsWith('.jar')) throw new Error('依赖主文件不是 JAR')
     const fileName = path.basename(file.filename)
     if (fileName !== file.filename || fileName.length > 180) throw new Error('依赖文件名无效')
-    const response = await fetch(file.url, { headers: { 'User-Agent': `ModMind/${this.productVersion} (dependency-center)` }, signal: AbortSignal.timeout(120_000) })
-    if (!response.ok) throw new Error(`依赖下载失败：HTTP ${response.status}`)
-    const buffer = Buffer.from(await response.arrayBuffer())
-    if (!buffer.length || buffer.length > MAX_DOWNLOAD_BYTES) throw new Error('依赖文件大小无效')
-    if (file.hashes?.sha512 && createHash('sha512').update(buffer).digest('hex') !== file.hashes.sha512) throw new Error('依赖 SHA-512 校验失败')
     const directory = path.join(project.path, 'libs', 'modmind')
     await fs.mkdir(directory, { recursive: true })
     const target = path.join(directory, fileName)
     const temporary = `${target}.partial-${process.pid}-${Date.now()}`
     const previousTarget = await fs.readFile(target).catch(() => null)
-    await fs.writeFile(temporary, buffer)
+    const expectedHash = file.hashes?.sha512
+      ? { algorithm: 'sha512' as const, value: file.hashes.sha512 }
+      : file.hashes?.sha1
+        ? { algorithm: 'sha1' as const, value: file.hashes.sha1 }
+        : undefined
+    await verifiedDownload.download({
+      sources: [{ id: 'modrinth-cdn', label: 'Modrinth CDN', url: file.url, headers: { 'User-Agent': `ModMind/${this.productVersion} (dependency-center)` } }],
+      destination: temporary,
+      ...(expectedHash ? { expectedHash } : {}),
+      maxBytes: MAX_DOWNLOAD_BYTES,
+      timeoutMs: 120_000,
+      retriesPerSource: 2,
+      signal: AbortSignal.timeout(120_000)
+    })
 
     const manifest = await readManifest(project)
     const previous = manifest.dependencies.find((entry) => entry.projectId === projectId)
@@ -326,10 +341,10 @@ export class DependencyService {
     try {
       await fs.rm(target, { force: true })
       await fs.rename(temporary, target)
-      await applyDependencyState(project, dependencies)
+      await applyManagedDependencies(project, dependencies)
       await this.importRuntime(target)
     } catch (error) {
-      await applyDependencyState(project, manifest.dependencies).catch(() => undefined)
+      await applyManagedDependencies(project, manifest.dependencies).catch(() => undefined)
       if (previousTarget) await atomicWriteFile(target, previousTarget)
       else await fs.rm(target, { force: true })
       await this.removeRuntime(fileName).catch(() => undefined)
@@ -346,7 +361,7 @@ export class DependencyService {
   }
 
   async installMaven(input: MavenDependencyInput): Promise<ManagedDependency> {
-    const project = this.getProject()
+    const project = this.javaProject()
     const coordinate = input.coordinate.trim()
     const match = coordinate.match(/^([A-Za-z0-9_.-]+):([A-Za-z0-9_.-]+):([A-Za-z0-9_.+\-]+)$/)
     if (!match) throw new Error('Maven 坐标必须使用 group:artifact:version 格式')
@@ -373,12 +388,12 @@ export class DependencyService {
     }
     const manifest = await readManifest(project)
     const dependencies = [dependency, ...manifest.dependencies.filter((entry) => entry.projectId !== id)]
-    await applyDependencyState(project, dependencies)
+    await applyManagedDependencies(project, dependencies)
     return dependency
   }
 
   async audit(): Promise<DependencyAuditResult> {
-    const project = this.getProject()
+    const project = this.javaProject()
     const dependencies = (await readManifest(project)).dependencies
     const errors: string[] = []
     const warnings: string[] = []
@@ -419,7 +434,7 @@ export class DependencyService {
   }
 
   async remove(projectId: string): Promise<ManagedDependency[]> {
-    const project = this.getProject()
+    const project = this.javaProject()
     const id = safeSegment(projectId, '项目 ID')
     const manifest = await readManifest(project)
     const removed = manifest.dependencies.find((entry) => entry.projectId === id)
@@ -428,10 +443,10 @@ export class DependencyService {
     const target = removed.relativePath ? path.join(project.path, ...removed.relativePath.split('/')) : ''
     const previousTarget = target ? await fs.readFile(target).catch(() => null) : null
     try {
-      await applyDependencyState(project, dependencies)
+      await applyManagedDependencies(project, dependencies)
       if (target) await fs.rm(target, { force: true })
     } catch (error) {
-      await applyDependencyState(project, manifest.dependencies).catch(() => undefined)
+      await applyManagedDependencies(project, manifest.dependencies).catch(() => undefined)
       if (target && previousTarget) await atomicWriteFile(target, previousTarget)
       throw error
     }

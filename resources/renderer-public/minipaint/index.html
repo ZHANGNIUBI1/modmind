@@ -1,0 +1,47 @@
+<!doctype html>
+<html dir="ltr" lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="x-ua-compatible" content="IE=edge">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=0">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'none'; worker-src 'self' blob:; media-src 'self' blob:; object-src 'none'; base-uri 'none'; form-action 'none'">
+  <link rel="icon" href="images/favicon.png">
+  <title>ModMind Image Editor</title>
+  <script src="dist/bundle.js"></script>
+  <script src="modmind-bridge.js" defer></script>
+</head>
+<body class="theme-light">
+  <div class="wrapper">
+    <nav aria-label="主菜单" class="main_menu" id="main_menu"></nav>
+    <div class="submenu">
+      <div class="block attributes" id="action_attributes"></div>
+      <button class="undo_button" id="undo_button" type="button"><span class="sr_only">撤销</span></button>
+    </div>
+    <div class="sidebar_left" id="tools_container"></div>
+    <div class="middle_area" id="middle_area">
+      <canvas class="ruler_left" id="ruler_left"></canvas>
+      <canvas class="ruler_top" id="ruler_top"></canvas>
+      <div class="main_wrapper" id="main_wrapper">
+        <div class="canvas_wrapper" id="canvas_wrapper">
+          <div id="mouse"></div>
+          <div class="transparent-grid" id="canvas_minipaint_background"></div>
+          <canvas id="canvas_minipaint">当前环境不支持 Canvas。</canvas>
+        </div>
+      </div>
+    </div>
+    <div class="sidebar_right">
+      <div class="preview block"><h2 class="trn toggle" data-target="toggle_preview">预览</h2><div id="toggle_preview"></div></div>
+      <div class="colors block"><h2 class="trn toggle" data-target="toggle_colors">颜色</h2><div class="content" id="toggle_colors"></div></div>
+      <div class="block" id="info_base"><h2 class="trn toggle toggle-full" data-target="toggle_info">信息</h2><div class="content" id="toggle_info"></div></div>
+      <div class="details block" id="details_base"><h2 class="trn toggle toggle-full" data-target="toggle_details">图层详情</h2><div class="content details-content" id="toggle_details"></div></div>
+      <div class="layers block"><h2 class="trn">图层</h2><div class="content" id="layers_base"></div></div>
+    </div>
+  </div>
+  <div class="mobile_menu">
+    <button class="left_mobile_menu" id="left_mobile_menu_button" type="button"><span class="sr_only">工具菜单</span></button>
+    <button class="right_mobile_menu" id="mobile_menu_button" type="button"><span class="sr_only">图层菜单</span></button>
+  </div>
+  <div class="hidden" id="tmp"></div>
+  <div id="popups"></div>
+</body>
+</html>

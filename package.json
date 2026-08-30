@@ -1,6 +1,6 @@
 {
   "name": "modmind",
-  "version": "1.1.3",
+  "version": "1.4.2",
   "private": true,
   "description": "AI-assisted Minecraft mod development workspace",
   "main": "out/main/index.js",
@@ -8,13 +8,16 @@
   "license": "MIT",
   "scripts": {
     "dev": "electron-vite dev",
+    "prebuild": "node scripts/clean-build-output.mjs",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
-    "test": "vitest run",
+    "test": "vitest run src && npm run test:mcp",
+    "test:mcp": "npm --prefix modmind-mcp-open-source test",
     "typecheck": "tsc --noEmit -p tsconfig.node.json --pretty false && tsc --noEmit -p tsconfig.web.json --pretty false",
+    "assets:installer": "node scripts/generate-installer-assets.mjs",
     "version:patch": "npm version patch --no-git-tag-version",
-    "dist:win": "npm run build && electron-builder --win --config.forceCodeSigning=true && node scripts/verify-release.mjs",
-    "dist:win:unsigned": "npm run build && electron-builder --win --config.win.signAndEditExecutable=false && node scripts/verify-release.mjs --allow-unsigned",
+    "dist:win": "npm run build && electron-builder --win --config.forceCodeSigning=true && node scripts/verify-release.mjs && node scripts/prepare-update-artifacts.mjs",
+    "dist:win:unsigned": "set CSC_IDENTITY_AUTO_DISCOVERY=false&& npm run build && electron-builder --win && node scripts/verify-release.mjs --allow-unsigned && node scripts/prepare-update-artifacts.mjs",
     "dist:linux": "npm run build && electron-builder --linux AppImage zip",
     "dist:mac": "npm run build && electron-builder --mac dmg zip",
     "verify:release": "node scripts/verify-release.mjs"
@@ -22,21 +25,25 @@
   "dependencies": {
     "@electron-toolkit/preload": "^3.0.2",
     "@electron-toolkit/utils": "^4.0.0",
-    "@monaco-editor/react": "^4.7.0",
     "@types/marked": "^6.0.0",
+    "@xmcl/asm": "1.0.1",
     "@xmcl/core": "^2.15.1",
     "@xmcl/installer": "^6.1.2",
+    "@xyflow/react": "^12.11.2",
+    "7zip-bin": "^5.2.0",
+    "cheerio": "^1.1.2",
+    "electron-updater": "^6.8.9",
     "extract-zip": "^2.0.1",
     "fast-xml-parser": "^5.2.5",
     "ffmpeg-static": "^5.3.0",
-    "lucide-react": "^0.468.0",
-    "marked": "^15.0.7",
-    "monaco-editor": "^0.56.0",
-    "react": "^18.3.1",
-    "react-dom": "^18.3.1",
+    "ftbq-nbt": "^1.4.1",
+    "json5": "^2.2.3",
+    "sharp": "^0.33.5",
+    "smol-toml": "^1.8.0",
     "undici": "7.2.3"
   },
   "devDependencies": {
+    "@monaco-editor/react": "^4.7.0",
     "@types/node": "^22.10.2",
     "@types/react": "^18.3.18",
     "@types/react-dom": "^18.3.5",
@@ -44,25 +51,48 @@
     "electron": "^33.3.1",
     "electron-builder": "^25.1.8",
     "electron-vite": "^3.0.0",
+    "lucide-react": "^0.468.0",
+    "marked": "^15.0.7",
+    "monaco-editor": "^0.56.0",
     "playwright": "^1.54.1",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
     "typescript": "^5.7.2",
     "vite": "^6.0.5",
-    "vitest": "^3.2.4"
+    "vitest": "^3.2.4",
+    "yaml": "^2.8.1"
   },
   "build": {
     "appId": "dev.modmind.desktop",
     "productName": "ModMind",
+    "compression": "maximum",
+    "protocols": [
+      {
+        "name": "ModMind Device Sync",
+        "schemes": [
+          "mcdev"
+        ]
+      }
+    ],
     "copyright": "Copyright © ModMind contributors",
     "directories": {
       "output": "release"
     },
+    "electronLanguages": [
+      "zh-CN",
+      "en-US"
+    ],
     "files": [
       "out/**/*",
       "package.json",
-      "THIRD_PARTY_NOTICES.md"
+      "THIRD_PARTY_NOTICES.md",
+      "!android-twa/**"
     ],
     "asarUnpack": [
-      "node_modules/ffmpeg-static/**"
+      "node_modules/ffmpeg-static/**",
+      "node_modules/sharp/**",
+      "node_modules/@img/**",
+      "node_modules/7zip-bin/**"
     ],
     "extraResources": [
       {
@@ -81,6 +111,38 @@
         "to": "icon.ico"
       },
       {
+        "from": "resources/service-config.json",
+        "to": "service-config.json"
+      },
+      {
+        "from": "resources/codex-skills",
+        "to": "codex-skills",
+        "filter": [
+          "**/*"
+        ]
+      },
+      {
+        "from": "resources/server-pack-creator",
+        "to": "server-pack-creator",
+        "filter": [
+          "ServerPackCreator-8.1.2.jar",
+          "LICENSE",
+          "UPSTREAM.md",
+          "checksum.txt"
+        ]
+      },
+      {
+        "from": "resources/decompile-tools",
+        "to": "decompile-tools",
+        "filter": [
+          "*.jar",
+          "LICENSE",
+          "LICENSE-bsd-asm.txt",
+          "UPSTREAM.md",
+          "checksums.txt"
+        ]
+      },
+      {
         "from": "vendor/gradle-wrapper",
         "to": "gradle-wrapper",
         "filter": [
@@ -90,18 +152,34 @@
           "UPSTREAM.txt",
           "LICENSE"
         ]
+      },
+      {
+        "from": "resources/plugin-host",
+        "to": "plugin-host",
+        "filter": [
+          "*.mjs"
+        ]
+      },
+      {
+        "from": "resources/plugin-templates",
+        "to": "plugin-templates",
+        "filter": [
+          "**/*"
+        ]
       }
     ],
     "win": {
-      "target": [
-        "nsis",
-        "portable"
-      ],
+      "target": "nsis",
       "icon": "resources/icon.ico"
     },
     "nsis": {
       "oneClick": false,
       "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": false,
+      "include": "resources/installer.nsh",
+      "installerHeader": "resources/installer-header.bmp",
+      "installerSidebar": "resources/installer-sidebar.bmp",
+      "uninstallerSidebar": "resources/installer-sidebar.bmp",
       "installerIcon": "resources/icon.ico",
       "uninstallerIcon": "resources/icon.ico"
     },

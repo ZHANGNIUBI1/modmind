@@ -16,6 +16,7 @@ import {
 } from 'lucide-react'
 import type { GitRemote, GitStatus } from '../../../shared/production'
 import type { ProjectInfo } from '../../../shared/types'
+import { useConfirmDialog } from './InteractionDialogs'
 
 function errorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
@@ -32,6 +33,7 @@ function changeLabel(index: string, worktree: string): string {
 }
 
 export default function GitWorkspace({ project, onFilesChanged }: { project: ProjectInfo; onFilesChanged: () => void }): React.JSX.Element {
+  const { confirm: requestConfirm, dialog: confirmDialog } = useConfirmDialog()
   const [status, setStatus] = useState<GitStatus | null>(null)
   const [diff, setDiff] = useState('')
   const [diffPath, setDiffPath] = useState('')
@@ -73,7 +75,7 @@ export default function GitWorkspace({ project, onFilesChanged }: { project: Pro
     try {
       setStatus(await window.modmind.production.git.initialize())
       onFilesChanged()
-      setNotice('Git 仓库已初始化，并已补全项目忽略规则。')
+      setNotice('Git 仓库已初始化，并已补全项目忽略规则')
     } catch (error) {
       setNotice(errorMessage(error))
     } finally {
@@ -102,7 +104,7 @@ export default function GitWorkspace({ project, onFilesChanged }: { project: Pro
       setStatus(await window.modmind.production.git.commit({ message, authorName, authorEmail }))
       setMessage('')
       setDiff('')
-      setNotice('提交已创建。')
+      setNotice('提交已创建')
       onFilesChanged()
     } catch (error) {
       setNotice(errorMessage(error))
@@ -118,7 +120,7 @@ export default function GitWorkspace({ project, onFilesChanged }: { project: Pro
     try {
       setStatus(await window.modmind.production.git.createBranch(branchName))
       setBranchName('')
-      setNotice('新分支已创建并切换。')
+      setNotice('新分支已创建并切换')
     } catch (error) {
       setNotice(errorMessage(error))
     } finally {
@@ -135,7 +137,7 @@ export default function GitWorkspace({ project, onFilesChanged }: { project: Pro
       setRemotes(next)
       setSelectedRemote(remoteName.trim())
       setRemoteUrl('')
-      setNotice('远程仓库已添加。')
+      setNotice('远程仓库已添加')
     } catch (error) {
       setNotice(errorMessage(error))
     } finally {
@@ -144,14 +146,14 @@ export default function GitWorkspace({ project, onFilesChanged }: { project: Pro
   }
 
   const removeRemote = async (): Promise<void> => {
-    if (!selectedRemote || !window.confirm(`移除远程仓库“${selectedRemote}”？`)) return
+    if (!selectedRemote || !await requestConfirm({ title: `移除远程仓库“${selectedRemote}”？`, message: '本地代码不会被删除，但后续同步将不再使用这个远程地址', confirmLabel: '移除远程', tone: 'danger' })) return
     setBusy('remote-remove')
     setNotice('')
     try {
       const next = await window.modmind.production.git.removeRemote(selectedRemote)
       setRemotes(next)
       setSelectedRemote(next[0]?.name ?? 'origin')
-      setNotice('远程仓库已移除。')
+      setNotice('远程仓库已移除')
     } catch (error) {
       setNotice(errorMessage(error))
     } finally {
@@ -171,7 +173,7 @@ export default function GitWorkspace({ project, onFilesChanged }: { project: Pro
           : await window.modmind.production.git.push(selectedRemote, status.branch)
       setStatus(next)
       onFilesChanged()
-      setNotice(action === 'fetch' ? '远程状态已获取。' : action === 'pull' ? '已完成仅快进拉取。' : '当前分支已推送。')
+      setNotice(action === 'fetch' ? '远程状态已获取' : action === 'pull' ? '已完成仅快进拉取' : '当前分支已推送')
     } catch (error) {
       setNotice(errorMessage(error))
     } finally {
@@ -187,7 +189,7 @@ export default function GitWorkspace({ project, onFilesChanged }: { project: Pro
       setStatus(mode === 'merge'
         ? await window.modmind.production.git.merge(integrationBranch)
         : await window.modmind.production.git.rebase(integrationBranch))
-      setNotice(mode === 'merge' ? '分支已合并。' : '分支变基已完成。')
+      setNotice(mode === 'merge' ? '分支已合并' : '分支变基已完成')
       onFilesChanged()
     } catch (error) {
       setNotice(errorMessage(error))
@@ -201,7 +203,7 @@ export default function GitWorkspace({ project, onFilesChanged }: { project: Pro
     setNotice('')
     try {
       await window.modmind.production.git.pullRequestUrl(selectedRemote)
-      setNotice('已在浏览器中打开 GitHub PR 页面。')
+      setNotice('已在浏览器中打开 GitHub PR 页面')
     } catch (error) {
       setNotice(errorMessage(error))
     } finally {
@@ -214,8 +216,8 @@ export default function GitWorkspace({ project, onFilesChanged }: { project: Pro
       <div className="git-heading"><GitBranch size={16} /><h2>Git 工作流</h2></div>
       <button className="icon-button" title="刷新 Git 状态" disabled={Boolean(busy)} onClick={() => void refresh()}>{busy === 'status' ? <LoaderCircle className="spin" size={14} /> : <RefreshCw size={14} />}</button>
     </div>
-    {status && !status.available ? <div className="git-empty"><CircleAlert size={18} /><div><strong>未检测到 Git</strong><p>安装 Git 后即可使用本地提交和分支管理。</p></div></div> : null}
-    {status?.available && !status.initialized ? <div className="git-empty"><GitBranch size={18} /><div><strong>当前项目还不是 Git 仓库</strong><p>初始化会创建 main 分支并写入适合模组项目的 .gitignore。</p></div><button className="primary-button" disabled={Boolean(busy)} onClick={() => void initialize()}>{busy === 'initialize' ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}初始化</button></div> : null}
+    {status && !status.available ? <div className="git-empty"><CircleAlert size={18} /><div><strong>未检测到 Git</strong><p>安装 Git 后即可使用本地提交和分支管理</p></div></div> : null}
+    {status?.available && !status.initialized ? <div className="git-empty"><GitBranch size={18} /><div><strong>当前项目还不是 Git 仓库</strong><p>初始化会创建 main 分支并写入适合模组项目的 .gitignore</p></div><button className="primary-button" disabled={Boolean(busy)} onClick={() => void initialize()}>{busy === 'initialize' ? <LoaderCircle className="spin" size={15} /> : <Plus size={15} />}初始化</button></div> : null}
     {status?.initialized ? <>
       <div className="git-status-line">
         <span><GitBranch size={14} /><strong>{status.branch || 'HEAD'}</strong></span>
@@ -249,7 +251,7 @@ export default function GitWorkspace({ project, onFilesChanged }: { project: Pro
         </div>
         <div className="git-diff">
           <div className="git-subhead"><strong>{diffPath || '差异预览'}</strong><span>{diff ? `${diff.split('\n').length} 行` : ''}</span></div>
-          <pre>{diff || '选择变更文件查看工作区与暂存区差异。'}</pre>
+          <pre>{diff || '选择变更文件查看工作区与暂存区差异'}</pre>
         </div>
       </div>
       <div className="git-actions">
@@ -268,5 +270,6 @@ export default function GitWorkspace({ project, onFilesChanged }: { project: Pro
       </div>
     </> : null}
     {notice ? <div className="production-notice"><CircleAlert size={14} /><span>{notice}</span></div> : null}
+    {confirmDialog}
   </section>
 }

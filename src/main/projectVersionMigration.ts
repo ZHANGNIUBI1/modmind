@@ -17,7 +17,6 @@ async function exists(target: string): Promise<boolean> {
 
 export async function detectedProjectVersion(project: ProjectInfo): Promise<string | null> {
   if (project.projectVersion) return project.projectVersion
-  if (project.toolDataDirectory === '.modtool') return null
   const [readme, build] = await Promise.all([
     fs.readFile(path.join(project.path, 'README.md'), 'utf8').catch(() => ''),
     fs.readFile(path.join(project.path, 'build.gradle'), 'utf8').catch(() => '')
