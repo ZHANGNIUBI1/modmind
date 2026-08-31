@@ -5,6 +5,7 @@ import path from 'node:path'
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process'
 import { auditExternalAgentCompletion, agentStreamFailureMessage, buildWindowsExternalAgentLaunch, classifyAgentStreamFailure, clearExternalAgentFailureCircuits, decodeExternalProcessOutput, detectExternalAgent, externalAgentAttemptPrompt, externalAgentContextText, externalAgentDocsUrl, externalAgentLabel, externalAgentRetryPrompt, installExternalAgent, isExternalAgentCompletionEvent, isForcefulProcessTerminationCommand, isNativeGradleBuildCommand, isReadOnlyActionDenied, isResumedPromptRejection, managedNativeDownloadAction, MCP_SERVER_SOURCE, ModMindBridge, nativePermissionArgs, parseExternalAgentOutputLine, readExternalAgentHistory, refreshExternalAgentContext, runExternalAgent, type ExternalAgentBridgeHandlers } from './externalAgents'
 import type { ProjectInfo } from '../shared/types'
+import { MODMIND_SOURCE_FINGERPRINT } from '../shared/sourceFingerprint'
 
 const temporaryRoots: string[] = []
 const bridges: ModMindBridge[] = []
@@ -12,6 +13,7 @@ const children: ChildProcessWithoutNullStreams[] = []
 
 describe('MC百科 MCP boundary', () => {
   it('exposes query-only tools and no captcha or download action', () => {
+    expect(MCP_SERVER_SOURCE).toContain("'dev.modmind/source-fingerprint'")
     expect(MCP_SERVER_SOURCE).toContain("name:'modmind_mcmod_search'")
     expect(MCP_SERVER_SOURCE).toContain("name:'modmind_mcmod_files'")
     expect(MCP_SERVER_SOURCE).not.toMatch(/name:'modmind_mcmod_(?:download|captcha|submit)/)
@@ -1091,6 +1093,8 @@ describe('ModMind external agent MCP bridge', () => {
     await first.writeMcpConfig(firstPaths.mcpConfigPath)
     await second.writeMcpConfig(secondPaths.mcpConfigPath)
     expect(firstPaths.mcpConfigPath).not.toBe(secondPaths.mcpConfigPath)
+    const firstBridgeConfig = JSON.parse(await fs.readFile(path.join(path.dirname(firstPaths.mcpConfigPath), 'bridge.json'), 'utf8')) as {sourceFingerprint?: string}
+    expect(firstBridgeConfig.sourceFingerprint).toBe(MODMIND_SOURCE_FINGERPRINT)
     expect(await fs.readFile(path.join(path.dirname(firstPaths.mcpConfigPath), 'bridge.json'), 'utf8')).not.toBe(await fs.readFile(path.join(path.dirname(secondPaths.mcpConfigPath), 'bridge.json'), 'utf8'))
     await first.stop()
     await expect(fs.stat(path.join(path.dirname(firstPaths.mcpConfigPath), 'bridge.json'))).rejects.toThrow()

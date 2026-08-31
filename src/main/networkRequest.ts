@@ -88,6 +88,11 @@ export function setNetworkProxy(url: string): void {
   proxyOverrideAgent = trimmed ? newProxyAgent(trimmed) : undefined
 }
 
+/** Returns the proxy currently selected by the app or the process environment. */
+export function getNetworkProxyUrl(): string {
+  return proxyOverrideUrl || (process.env.HTTPS_PROXY ?? process.env.https_proxy ?? process.env.HTTP_PROXY ?? process.env.http_proxy ?? '').trim()
+}
+
 /**
  * Hosts that must never be routed through the configured proxy: MC百科 and
  * Gitee are China-only services whose anti-abuse defenses may reject foreign

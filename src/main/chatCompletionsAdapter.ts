@@ -1,5 +1,8 @@
 import { createHash, randomUUID } from 'node:crypto'
+import { brotliDecompress, gunzip, inflate } from 'node:zlib'
 import { createServer, type IncomingHttpHeaders, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { promisify } from 'node:util'
+import { Decompress as ZstdDecompress } from 'fzstd'
 
 type JsonRecord = Record<string, unknown>
 type UpstreamProtocol = 'unknown' | 'responses' | 'chat-completions'
@@ -23,6 +26,15 @@ export interface ChatCompletionTranslation {
 }
 
 const MAX_REQUEST_BYTES = 128 * 1024 * 1024
+const gunzipAsync = promisify(gunzip)
+const inflateAsync = promisify(inflate)
+const brotliDecompressAsync = promisify(brotliDecompress)
+
+class AdapterRequestError extends Error {
+  constructor(readonly status: 413 | 415, message: string) {
+    super(message)
+  }
+}
 
 function isRecord(value: unknown): value is JsonRecord {
   return Boolean(value && typeof value === 'object' && !Array.isArray(value))
@@ -323,13 +335,60 @@ export function chatCompletionToResponsesEvents(value: unknown, tools: Map<strin
 }
 
 function requestHeaders(headers: IncomingHttpHeaders): Record<string, string> {
-  const result: Record<string, string> = { 'Content-Type': 'application/json', Accept: 'application/json' }
+  const result: Record<string, string> = { 'content-type': 'application/json', accept: 'application/json' }
   const hopByHop = new Set(['host', 'connection', 'content-length', 'transfer-encoding', 'accept-encoding', 'content-encoding'])
   for (const [name, value] of Object.entries(headers)) {
-    if (hopByHop.has(name.toLowerCase()) || typeof value !== 'string' || !value) continue
-    result[name] = value
+    const lower = name.toLowerCase()
+    if (hopByHop.has(lower) || typeof value !== 'string' || !value) continue
+    result[lower] = value
   }
   return result
+}
+
+function decompressedSizeError(maxBytes: number): AdapterRequestError {
+  return new AdapterRequestError(413, `Agent 请求解压后超过 ${Math.floor(maxBytes / 1024 / 1024) || 1} MB 限制`)
+}
+
+function isZlibSizeError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  const code = 'code' in error ? String(error.code) : ''
+  const message = 'message' in error ? String(error.message) : ''
+  return code === 'ERR_BUFFER_TOO_LARGE' || /maxOutputLength|Buffer larger than|larger than.*bytes/i.test(message)
+}
+
+function decompressZstd(body: Buffer, maxBytes: number): Buffer {
+  const chunks: Buffer[] = []
+  let size = 0
+  const stream = new ZstdDecompress((chunk) => {
+    size += chunk.byteLength
+    if (size > maxBytes) throw decompressedSizeError(maxBytes)
+    chunks.push(Buffer.from(chunk))
+  })
+  stream.push(body, true)
+  return Buffer.concat(chunks, size)
+}
+
+export async function decompressRequest(body: Buffer, encoding: string | string[], maxBytes = MAX_REQUEST_BYTES): Promise<Buffer> {
+  const encodings = (Array.isArray(encoding) ? encoding : [encoding])
+    .flatMap((value) => value.split(','))
+    .map((value) => value.trim().toLowerCase())
+    .filter((value) => value && value !== 'identity')
+  let output = body
+  for (const value of encodings.reverse()) {
+    try {
+      if (value === 'gzip' || value === 'x-gzip') output = Buffer.from(await gunzipAsync(output, { maxOutputLength: maxBytes }))
+      else if (value === 'deflate') output = Buffer.from(await inflateAsync(output, { maxOutputLength: maxBytes }))
+      else if (value === 'br') output = Buffer.from(await brotliDecompressAsync(output, { maxOutputLength: maxBytes }))
+      else if (value === 'zstd') output = decompressZstd(output, maxBytes)
+      else throw new AdapterRequestError(415, `暂不支持 ${value} 压缩的 Agent 请求`)
+      if (output.length > maxBytes) throw decompressedSizeError(maxBytes)
+    } catch (error) {
+      if (error instanceof AdapterRequestError) throw error
+      if (isZlibSizeError(error)) throw decompressedSizeError(maxBytes)
+      throw new AdapterRequestError(415, `Agent 请求解压失败（${value}），内容可能已损坏`)
+    }
+  }
+  return output
 }
 
 async function readBody(request: IncomingMessage): Promise<Buffer> {
@@ -338,7 +397,7 @@ async function readBody(request: IncomingMessage): Promise<Buffer> {
   for await (const chunk of request) {
     const buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
     size += buffer.length
-    if (size > MAX_REQUEST_BYTES) throw new Error('Agent 请求超过 128 MB 限制')
+    if (size > MAX_REQUEST_BYTES) throw new AdapterRequestError(413, 'Agent 请求超过 128 MB 限制')
     chunks.push(buffer)
   }
   return Buffer.concat(chunks)
@@ -374,6 +433,8 @@ async function relayResponse(upstream: Response, response: ServerResponse): Prom
 
 function shouldFallbackToChat(status: number, body: string): boolean {
   if (status === 404 || status === 405 || status === 501) return true
+  if (status === 415) return /(?:\/v1\/responses|responses endpoint|responses api)/i.test(body)
+    && /(?:unsupported|not supported|not found|unknown|unrecognized|not implemented|does not exist|only supports|use chat)/i.test(body)
   if (status !== 400 && status !== 422) return false
   if (/(?:\/v1\/responses|responses endpoint|chat completions)/i.test(body)
     && /(?:unsupported|not supported|not found|unknown|unrecognized|not implemented|does not exist|cannot post|only supports|use chat)/i.test(body)) return true
@@ -387,6 +448,8 @@ function shouldFallbackToChat(status: number, body: string): boolean {
 
 function shouldFallbackToResponses(status: number, body: string): boolean {
   if (status === 404 || status === 405 || status === 501) return true
+  if (status === 415) return /(?:chat\/completions|chat completions endpoint|chat completions api)/i.test(body)
+    && /(?:unsupported|not supported|not found|unknown|unrecognized|not implemented|does not exist|only supports|use responses)/i.test(body)
   if (status !== 400 && status !== 422) return false
   if (/(?:chat\/completions|chat completions endpoint|responses api)/i.test(body)
     && /(?:unsupported|not supported|not found|unknown|unrecognized|not implemented|does not exist|cannot post|only supports|use responses)/i.test(body)) return true
@@ -463,11 +526,9 @@ export class ChatCompletionsAdapter {
         sendJson(response, 405, { error: { message: 'Method not allowed', type: 'invalid_request_error' } })
         return
       }
-      if (request.headers['content-encoding']) {
-        sendJson(response, 415, { error: { message: '压缩的 Agent 请求暂不支持自动协议适配', type: 'invalid_request_error' } })
-        return
-      }
-      const body = await readBody(request)
+      const binaryBody = await readBody(request)
+      const contentEncoding = request.headers['content-encoding']
+      const body = contentEncoding ? await decompressRequest(binaryBody, contentEncoding) : binaryBody
       // Strip invalid token budgets (negative/NaN) on every path — including
       // native Responses passthrough — so one bad field cannot make the
       // provider reject an otherwise valid request.
@@ -545,7 +606,8 @@ export class ChatCompletionsAdapter {
         response.destroy(error instanceof Error ? error : new Error(String(error)))
         return
       }
-      sendJson(response, 502, { error: { message: error instanceof Error ? error.message : String(error), type: 'adapter_error' } })
+      const status = error instanceof AdapterRequestError ? error.status : 502
+      sendJson(response, status, { error: { message: error instanceof Error ? error.message : String(error), type: status === 502 ? 'adapter_error' : 'invalid_request_error' } })
     }
   }
 }

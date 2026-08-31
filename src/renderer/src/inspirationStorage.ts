@@ -1,4 +1,5 @@
 import type { InspirationChatMessage } from '../../shared/types'
+import { normalizeAiTurnReplay } from '../../shared/aiReplay'
 import { isAiOperationalStatusText } from '../../shared/aiOutput'
 
 export interface InspirationConversation {
@@ -40,7 +41,10 @@ export function boundInspirationMessages(messages: InspirationChatMessage[], max
 
 export function normalizeStoredInspirationMessages(messages: InspirationChatMessage[]): InspirationChatMessage[] {
   return messages.map((message, index, allMessages) => {
-    if (message.role !== 'assistant') return message
+    if (message.role !== 'assistant') {
+      const replay = normalizeAiTurnReplay(message.replay)
+      return replay ? { ...message, replay } : message.replay ? { ...message, replay: undefined } : message
+    }
     if (message.kind === 'tool') return message.status === 'streaming' ? { ...message, status: 'completed' } : message
     if (message.status === 'streaming') {
       return {

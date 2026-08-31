@@ -1,0 +1,4 @@
+interface:
+  display_name: "Minecraft Modpack Migration"
+  short_description: "Migrate modpacks with evidence and rollback"
+  default_prompt: "Use $minecraft-modpack-migration to assess and safely migrate this modpack."

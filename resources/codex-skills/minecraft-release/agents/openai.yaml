@@ -1,0 +1,4 @@
+interface:
+  display_name: "Minecraft Release"
+  short_description: "Prepare verified mod and modpack releases"
+  default_prompt: "Use $minecraft-release to validate and prepare this Minecraft project release."

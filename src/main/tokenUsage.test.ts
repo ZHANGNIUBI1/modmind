@@ -31,6 +31,14 @@ describe('extractCodexTokenUsage', () => {
     expect(usage).toMatchObject({ inputTokens: 100, outputTokens: 20, contextWindow: 400_000 })
   })
 
+  it('reads the current codex exec turn.completed usage shape without inventing a context window', () => {
+    const usage = extractCodexTokenUsage({
+      type: 'turn.completed',
+      usage: { input_tokens: 24_763, cached_input_tokens: 24_448, output_tokens: 122, reasoning_output_tokens: 0 }
+    })
+    expect(usage).toEqual({ inputTokens: 24_763, cachedInputTokens: 24_448, outputTokens: 122 })
+  })
+
   it('ignores non-token_count events and malformed payloads', () => {
     expect(extractCodexTokenUsage({ type: 'response_item', payload: {} })).toBeUndefined()
     expect(extractCodexTokenUsage(null)).toBeUndefined()

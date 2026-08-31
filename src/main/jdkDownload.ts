@@ -5,6 +5,7 @@ import path from 'node:path'
 import extractZip from 'extract-zip'
 import { diagnosticJournal } from './diagnosticLog'
 import { verifiedDownload } from './downloadService'
+import { fetchJsonWithRetry } from './networkRequest'
 
 interface AdoptiumAsset {
   binary?: {
@@ -61,15 +62,17 @@ export function jdkDownloadSources(fileName: string, major: number, officialUrl:
 async function fetchAsset(major: number): Promise<Required<AdoptiumAsset>['binary']['package'] & { checksum: string; link: string; name: string }> {
   const url = adoptiumMetadataUrl(major)
   const startedAt = Date.now()
-  let response: Response
+  let assets: AdoptiumAsset[]
   try {
-    response = await fetch(url, { headers: { 'User-Agent': 'ModMind/1.2 (managed-jdk)' }, signal: AbortSignal.timeout(30_000) })
+    assets = await fetchJsonWithRetry<AdoptiumAsset[]>(url, {
+      headers: { 'User-Agent': 'ModMind/1.2 (managed-jdk)' },
+      attempts: 4,
+      signal: AbortSignal.timeout(30_000)
+    })
   } catch (error) {
     diagnosticJournal.record({ subsystem: 'jdk-download', operation: 'metadata', phase: 'error', message: `Unable to fetch JDK ${major} metadata`, durationMs: Date.now() - startedAt, data: { url }, error })
     throw error
   }
-  if (!response.ok) throw new Error(`无法读取 JDK ${major} 元数据：HTTP ${response.status}`)
-  const assets = await response.json() as AdoptiumAsset[]
   const value = assets[0]?.binary?.package
   if (!value?.checksum || !value.link || !value.name || !/^[a-f0-9]{64}$/i.test(value.checksum)) {
     throw new Error(`JDK ${major} 元数据不完整`)

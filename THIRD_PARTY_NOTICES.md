@@ -78,6 +78,15 @@ the TOML specification. It is provided under the BSD-3-Clause License.
 - Project: https://github.com/squirrelchat/smol-toml
 - License: BSD-3-Clause
 
+## fzstd
+
+ModMind uses `fzstd` to decompress Zstandard-encoded local Agent requests on
+Electron releases whose embedded Node.js runtime does not provide Zstandard.
+It is provided under the MIT License by Arjun Barrett.
+
+- Project: https://github.com/101arrowz/fzstd
+- License: MIT
+
 ## 7zip-bin / 7-Zip
 
 ModMind bundles the `7za` executable from `7zip-bin` for importing common project

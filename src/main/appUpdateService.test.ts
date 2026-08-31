@@ -13,8 +13,13 @@ class FakeUpdater extends EventEmitter {
   autoRunAppAfterInstall = false
   allowPrerelease = false
   allowDowngrade = false
+  disableDifferentialDownload = false
   channel: string | null = null
   feed: unknown
+  feeds: unknown[] = []
+  checkCalls = 0
+  downloadCalls = 0
+  failuresBeforeSuccess = 0
   quitAndInstall = vi.fn()
 
   constructor(private readonly result: UpdateCheckResult, private readonly installerPath: string) {
@@ -23,13 +28,17 @@ class FakeUpdater extends EventEmitter {
 
   setFeedURL(value: unknown): void {
     this.feed = value
+    this.feeds.push(value)
   }
 
   async checkForUpdates(): Promise<UpdateCheckResult> {
+    this.checkCalls += 1
     return this.result
   }
 
   async downloadUpdate(): Promise<string[]> {
+    this.downloadCalls += 1
+    if (this.downloadCalls <= this.failuresBeforeSuccess) throw new Error(`download mode ${this.downloadCalls} failed`)
     const stat = await fs.stat(this.installerPath)
     this.emit('download-progress', { total: stat.size, delta: stat.size, transferred: stat.size, percent: 100, bytesPerSecond: 4 * 1024 * 1024 })
     return [this.installerPath]
@@ -166,5 +175,39 @@ describe('AppUpdateService', () => {
       updateAvailable: false
     })
     await expect(service.downloadUpdate()).rejects.toThrow(/没有可下载/)
+  })
+
+  it('falls back from multi-range to single-range and then full installer download', async () => {
+    const files = await fixture('1.4.1')
+    const updateInfo = {
+      version: '1.4.1',
+      files: [{ url: 'ModMind-Setup-1.4.1.exe', sha512: files.sha512, size: 10 * 1024 * 1024 + 1 }],
+      path: 'ModMind-Setup-1.4.1.exe',
+      sha512: files.sha512,
+      releaseDate: '2026-08-31T00:00:00.000Z'
+    }
+    const updater = new FakeUpdater({ isUpdateAvailable: true, updateInfo, versionInfo: updateInfo }, files.installer)
+    updater.failuresBeforeSuccess = 2
+    const service = new AppUpdateService({
+      currentVersion: '1.4.0',
+      updateUrl: 'https://updates.example.com/',
+      userDataPath: files.userData,
+      isPackaged: true,
+      platform: 'win32',
+      updater: updater as unknown as AppUpdater,
+      beforeInstall: vi.fn(),
+      quit: vi.fn(),
+      notifyDownloaded: vi.fn()
+    })
+    service.setAvailableUpdate({
+      currentVersion: '1.4.0', latestVersion: '1.4.1', currentChannel: 'stable', targetChannel: 'stable', updateAvailable: true
+    })
+
+    await expect(service.downloadUpdate()).resolves.toMatchObject({ phase: 'downloaded' })
+    expect(updater.downloadCalls).toBe(3)
+    expect(updater.checkCalls).toBe(3)
+    expect(updater.feeds.map((feed) => (feed as { useMultipleRangeRequest?: boolean }).useMultipleRangeRequest)).toEqual([true, true, false, false])
+    expect(updater.feed).toMatchObject({ useMultipleRangeRequest: false })
+    expect(updater.disableDifferentialDownload).toBe(true)
   })
 })

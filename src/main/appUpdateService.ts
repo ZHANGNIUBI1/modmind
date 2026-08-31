@@ -204,19 +204,65 @@ export class AppUpdateService {
 
     try {
       const channel = candidate.targetChannel === 'beta' ? 'beta' : 'latest'
-      this.updater.setFeedURL({ provider: 'generic', url: normalizeAppUpdateUrl(this.options.updateUrl), channel, useMultipleRangeRequest: true })
-      this.updater.channel = channel
-      this.updater.allowPrerelease = candidate.targetChannel === 'beta'
-      this.updater.allowDowngrade = candidate.currentChannel === 'beta' && candidate.targetChannel === 'stable'
+      const updateBaseUrl = normalizeAppUpdateUrl(this.options.updateUrl)
+      const configureUpdater = (useMultipleRangeRequest: boolean, disableDifferentialDownload: boolean): void => {
+        this.updater.setFeedURL({ provider: 'generic', url: updateBaseUrl, channel, useMultipleRangeRequest })
+        this.updater.channel = channel
+        this.updater.allowPrerelease = candidate.targetChannel === 'beta'
+        this.updater.allowDowngrade = candidate.currentChannel === 'beta' && candidate.targetChannel === 'stable'
+        this.updater.disableDifferentialDownload = disableDifferentialDownload
+      }
+      configureUpdater(true, false)
 
-      const checked = await this.updater.checkForUpdates()
+      let checked = await this.updater.checkForUpdates()
       if (!checked) throw new Error('更新服务当前不可用')
       if (checked.updateInfo.version !== candidate.latestVersion) {
         throw new Error(`更新清单版本 ${checked.updateInfo.version} 与服务器版本 ${candidate.latestVersion} 不一致`)
       }
       if (!checked.isUpdateAvailable) throw new Error('更新清单未提供适用于当前版本的更新')
 
-      const files = await this.updater.downloadUpdate()
+      let files: string[] = []
+      let differentialError: unknown
+      for (const [modeIndex, mode] of [
+        { label: '多 Range 差分', multiple: true, full: false },
+        { label: '单 Range 差分', multiple: false, full: false },
+        { label: '完整安装包', multiple: false, full: true }
+      ].entries()) {
+        try {
+          configureUpdater(mode.multiple, mode.full)
+          // electron-updater captures the provider (and its range capability)
+          // during checkForUpdates, so refresh it before every fallback mode.
+          if (modeIndex > 0) {
+            const modeChecked = await this.updater.checkForUpdates()
+            if (!modeChecked?.isUpdateAvailable) throw new Error('更新清单未提供当前回退方式所需的安装包')
+            if (modeChecked.updateInfo.version !== candidate.latestVersion) {
+              throw new Error(`回退下载清单版本 ${modeChecked.updateInfo.version} 与服务器版本 ${candidate.latestVersion} 不一致`)
+            }
+            checked = modeChecked
+          }
+          this.setState({
+            phase: 'downloading',
+            currentVersion: candidate.currentVersion,
+            latestVersion: candidate.latestVersion,
+            targetChannel: candidate.targetChannel,
+            message: `正在尝试${mode.label}更新下载`
+          })
+          files = await this.updater.downloadUpdate()
+          if (files.length) break
+        } catch (error) {
+          differentialError = error
+          this.setState({
+            phase: 'downloading',
+            currentVersion: candidate.currentVersion,
+            latestVersion: candidate.latestVersion,
+            targetChannel: candidate.targetChannel,
+            message: `${mode.label}下载失败，准备下一种回退方式`
+          })
+        }
+      }
+      if (!files.length) {
+        throw differentialError instanceof Error ? differentialError : new Error('更新器未返回安装包路径')
+      }
       const installerPath = files.find((file) => file.toLowerCase().endsWith('.exe')) ?? files[0]
       if (!installerPath) throw new Error('更新器没有返回已下载的安装包')
       const installerInfo = checked.updateInfo.files.find((file) => file.url.toLowerCase().endsWith('.exe')) ?? checked.updateInfo.files[0]

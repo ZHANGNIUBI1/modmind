@@ -526,6 +526,12 @@ export interface AiAttachment {
   isDirectory?: boolean
 }
 
+/** Structured user-turn data retained for edit, resend, and context rebuilds. */
+export interface AiTurnReplay {
+  prompt: string
+  attachments?: AiAttachment[]
+}
+
 export type AiAttachmentSelectionKind = 'files' | 'directory'
 
 export type PipelineStage = 'planning' | 'writing' | 'checking' | 'building' | 'complete' | 'error'
@@ -847,6 +853,7 @@ export interface InspirationChatMessage {
   content: string
   status?: 'streaming' | 'completed' | 'error' | 'cancelled'
   dedupeKey?: string
+  replay?: AiTurnReplay
   /** Only the completed answer for a turn can be sent to the workbench. */
   isFinal?: boolean
 }
@@ -1181,6 +1188,7 @@ export interface ModMindApi {
   ai: {
     createCode: (prompt: string, sessionId?: string, backend?: CodingBackend, executionProfile?: AiExecutionProfile, options?: AiCreateCodeOptions) => Promise<CodingResult>
     pickAttachments: (kind: AiAttachmentSelectionKind) => Promise<AiAttachment[]>
+    validateAttachments: (attachments: AiAttachment[], projectPath?: string) => Promise<AiAttachment[]>
     cancelCode: (sessionId?: string, projectPath?: string) => Promise<AiCancellationResult>
     clearQuotaCredentials: () => Promise<void>
     getRecovery: (projectPath?: string) => Promise<AiRecoveryInfo>

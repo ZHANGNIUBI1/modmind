@@ -1,4 +1,5 @@
-import type { AiOutputEvent, AiTokenUsage, PipelineEvent } from '../../shared/types'
+import { normalizeAiTurnReplay, replayUserText } from '../../shared/aiReplay'
+import type { AiOutputEvent, AiTokenUsage, AiTurnReplay, PipelineEvent } from '../../shared/types'
 
 export type WorkbenchTimelineDiff = { path: string; added: number; removed: number; additions: string[]; removals: string[] }
 
@@ -13,6 +14,7 @@ export type WorkbenchTimelineItem = {
   recoverable?: boolean
   diff?: WorkbenchTimelineDiff[]
   usage?: AiTokenUsage
+  replay?: AiTurnReplay
 }
 
 /** Latest usage in the timeline; recovers the context badge after a restart. */
@@ -22,6 +24,24 @@ export function latestWorkbenchUsage(items: WorkbenchTimelineItem[]): AiTokenUsa
     if (usage) return usage
   }
   return undefined
+}
+
+export type WorkbenchContextUsageState =
+  | { kind: 'waiting' }
+  | { kind: 'tokens' }
+  | { kind: 'capacity'; ratio: number; percent: number }
+
+export function workbenchContextUsageState(usage: AiTokenUsage | undefined): WorkbenchContextUsageState {
+  if (!usage) return { kind: 'waiting' }
+  const hasReportedTokens = [usage.inputTokens, usage.cachedInputTokens, usage.outputTokens]
+    .some((value) => typeof value === 'number' && Number.isFinite(value) && value >= 0)
+  if (!hasReportedTokens) return { kind: 'waiting' }
+  if (typeof usage.contextWindow !== 'number' || !Number.isFinite(usage.contextWindow) || usage.contextWindow <= 0
+    || typeof usage.inputTokens !== 'number' || !Number.isFinite(usage.inputTokens) || usage.inputTokens < 0) {
+    return { kind: 'tokens' }
+  }
+  const ratio = usage.inputTokens / usage.contextWindow
+  return { kind: 'capacity', ratio, percent: Math.min(100, Math.max(0, Math.round(ratio * 100))) }
 }
 
 function bounded(items: WorkbenchTimelineItem[]): WorkbenchTimelineItem[] {
@@ -56,8 +76,8 @@ export function settleWorkbenchActivity(items: WorkbenchTimelineItem[], thinking
   return changed ? next : items
 }
 
-export function appendUserTurn(items: WorkbenchTimelineItem[], text: string, runId: string, time = new Date().toISOString()): WorkbenchTimelineItem[] {
-  return bounded([...items, { id: `${runId}:user`, kind: 'user', content: text, time, runId, status: 'done' }])
+export function appendUserTurn(items: WorkbenchTimelineItem[], text: string, runId: string, time = new Date().toISOString(), replay?: AiTurnReplay): WorkbenchTimelineItem[] {
+  return bounded([...items, { id: `${runId}:user`, kind: 'user', content: text, time, runId, status: 'done', ...(replay ? { replay } : {}) }])
 }
 
 export function reduceWorkbenchOutput(
@@ -150,17 +170,56 @@ export function reduceWorkbenchProgress(
 }
 
 export function normalizeStoredWorkbenchTimeline(item: WorkbenchTimelineItem): WorkbenchTimelineItem {
-  if (item.kind === 'warning' || item.kind === 'retry') return { ...item, status: 'warning', terminal: false, recoverable: true }
-  if (item.kind !== 'error') return item
-  if (/(?:warning|warn|deprecated|deprecation|警告|重试|重新连接)/i.test(item.content)) return { ...item, kind: 'warning', status: 'warning', terminal: false, recoverable: true }
+  const replay = normalizeAiTurnReplay(item.replay)
+  const normalized = replay ? { ...item, replay } : item.replay ? { ...item, replay: undefined } : item
+  if (normalized.kind === 'warning' || normalized.kind === 'retry') return { ...normalized, status: 'warning', terminal: false, recoverable: true }
+  if (normalized.kind !== 'error') return normalized
+  if (/(?:warning|warn|deprecated|deprecation|警告|重试|重新连接)/i.test(normalized.content)) return { ...normalized, kind: 'warning', status: 'warning', terminal: false, recoverable: true }
   // Earlier builds guessed terminal=true from error text and persisted that
   // guess. Only the new explicit pair is authoritative across restarts.
-  if (item.terminal === true && item.recoverable === false) return item
-  if (/(?:error|fatal|exception|failed|forbidden|unauthori[sz]ed|timed out|timeout|错误|失败|异常|无法|超时|退出码|拒绝)/i.test(item.content)) return { ...item, terminal: false, recoverable: true }
-  return { ...item, kind: 'tool', status: 'done', terminal: false, recoverable: true }
+  if (normalized.terminal === true && normalized.recoverable === false) return normalized
+  if (/(?:error|fatal|exception|failed|forbidden|unauthori[sz]ed|timed out|timeout|错误|失败|异常|无法|超时|退出码|拒绝)/i.test(normalized.content)) return { ...normalized, terminal: false, recoverable: true }
+  return { ...normalized, kind: 'tool', status: 'done', terminal: false, recoverable: true }
 }
 
 export function timelineToPlainText(items: WorkbenchTimelineItem[]): string {
   const labels: Partial<Record<WorkbenchTimelineItem['kind'], string>> = { history: '已恢复上下文', start: '任务开始', retry: '重试', tool: '工具结果', warning: '警告', error: '错误', diff: '代码修改', status: '状态', user: '你' }
   return items.map((item) => `${labels[item.kind] ? `[${labels[item.kind]}]\n` : ''}${item.content}`).join('\n\n')
+}
+
+/** 回退/编辑重发时，只保留「用户提问 + AI 最终回答」，清掉思考步骤、工具调用、停止残留等半处理中间态。 */
+export function workbenchFinalDialogue(items: WorkbenchTimelineItem[]): WorkbenchTimelineItem[] {
+  return items.filter((item) => item.kind === 'user' || item.kind === 'answer')
+}
+
+/** 删除某条消息时按「轮」整体删除：删除用户提问会连带其后的中间态步骤与回答，删除回答则连带其同轮的中间态步骤，避免留下「查看步骤」等半处理残留。 */
+export function workbenchDeleteTimelineItem(items: WorkbenchTimelineItem[], id: string): WorkbenchTimelineItem[] {
+  const index = items.findIndex((item) => item.id === id)
+  if (index < 0) return items
+  if (items[index].kind === 'user') {
+    let end = index + 1
+    while (end < items.length && items[end].kind !== 'user') end += 1
+    return [...items.slice(0, index), ...items.slice(end)]
+  }
+  let start = index
+  while (start > 0 && items[start - 1].kind !== 'user') start -= 1
+  return [...items.slice(0, start), ...items.slice(index + 1)]
+}
+
+/** User turns are removed so they can be replaced; assistant turns remain as the retained boundary. */
+export function workbenchRewindTimelineTo(items: WorkbenchTimelineItem[], id: string): WorkbenchTimelineItem[] {
+  const index = items.findIndex((item) => item.id === id)
+  if (index < 0) return items
+  return items.slice(0, items[index].kind === 'user' ? index : index + 1)
+}
+
+/** 提取用户提问与 AI 最终回答，用于在「回退重发」时把前文作为文字上下文重新注入。 */
+export function workbenchDialogueToText(items: WorkbenchTimelineItem[], maxTurns = 8, maxChars = 12_000): string {
+  const lines: string[] = []
+  for (const item of items) {
+    if (item.kind === 'user') lines.push(`用户：${replayUserText(item.content, item.replay)}`)
+    else if (item.kind === 'answer') lines.push(`AI：${item.content}`)
+  }
+  const text = lines.slice(-maxTurns * 2).join('\n')
+  return text.length <= maxChars ? text : text.slice(-maxChars)
 }

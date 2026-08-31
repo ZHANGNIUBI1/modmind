@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { buildInspirationRows, finalInspirationReply, inspirationConversationHandoff, settleInspirationCancellation, settleInspirationFailure, shouldResumeInspirationSession } from './inspirationOutput'
+import { buildInspirationRows, deleteInspirationTimelineItem, finalInspirationReply, inspirationConversationHandoff, rewindInspirationTimelineTo, settleInspirationCancellation, settleInspirationFailure, shouldResumeInspirationSession } from './inspirationOutput'
 
 describe('inspiration output settlement', () => {
   it('renders retry/tool steps in order between the question and provisional answer', () => {
@@ -9,6 +9,29 @@ describe('inspiration output settlement', () => {
       { role: 'assistant', content: '', status: 'streaming', sessionId: 'run-1' }
     ])
     expect(rows.map((row) => row.kind)).toEqual(['message', 'tool-group', 'message'])
+  })
+
+  it('deletes whole turns without leaving tool-step artifacts', () => {
+    const messages = [
+      { role: 'user' as const, content: 'first', status: 'completed' as const },
+      { role: 'assistant' as const, kind: 'tool' as const, content: 'step', status: 'completed' as const },
+      { role: 'assistant' as const, content: 'answer', status: 'completed' as const, isFinal: true },
+      { role: 'user' as const, content: 'second', status: 'completed' as const }
+    ]
+    expect(deleteInspirationTimelineItem(messages, 0).map((message) => message.content)).toEqual(['second'])
+    expect(deleteInspirationTimelineItem(messages, 2).map((message) => message.content)).toEqual(['first', 'second'])
+    expect(deleteInspirationTimelineItem(messages, 99)).toBe(messages)
+  })
+
+  it('drops a selected user turn but retains a selected assistant boundary', () => {
+    const messages = [
+      { role: 'user' as const, content: 'first', status: 'completed' as const },
+      { role: 'assistant' as const, content: 'answer', status: 'completed' as const, isFinal: true },
+      { role: 'user' as const, content: 'second', status: 'completed' as const }
+    ]
+    expect(rewindInspirationTimelineTo(messages, 2).map((message) => message.content)).toEqual(['first', 'answer'])
+    expect(rewindInspirationTimelineTo(messages, 1).map((message) => message.content)).toEqual(['first', 'answer'])
+    expect(rewindInspirationTimelineTo(messages, 99)).toBe(messages)
   })
 
   it('never promotes summary or retry status to the final answer', () => {
@@ -45,5 +68,18 @@ describe('inspiration output settlement', () => {
     const handoff = inspirationConversationHandoff(messages, 120)
     expect(handoff.length).toBeLessThanOrEqual(120)
     expect(handoff).toContain('answer-7')
+  })
+
+  it('carries structured attachment paths and falls back to legacy visible text', () => {
+    const handoff = inspirationConversationHandoff([
+      {
+        role: 'user', content: '分析附件\n\n已附 1 个文件', status: 'completed',
+        replay: { prompt: '分析附件', attachments: [{ id: 'a1', name: 'api.txt', path: '.modmind/attachments/a1-api.txt', size: 10, isImage: false }] }
+      },
+      { role: 'assistant', content: '收到', status: 'completed', isFinal: true },
+      { role: 'user', content: '旧记录', status: 'completed' }
+    ])
+    expect(handoff).toContain('.modmind/attachments/a1-api.txt')
+    expect(handoff).toContain('User: 旧记录')
   })
 })

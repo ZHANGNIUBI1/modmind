@@ -52,6 +52,23 @@ describe('inspiration storage', () => {
     ])[0]).toMatchObject({ kind: 'tool', status: 'completed' })
   })
 
+  it('sanitizes structured replay metadata loaded from browser storage', () => {
+    const normalized = normalizeStoredInspirationMessages([{
+      role: 'user', content: '分析附件', status: 'completed',
+      replay: {
+        prompt: '分析附件',
+        attachments: [
+          { id: 'valid', name: 'api.txt', path: '.modmind/attachments/api.txt', size: 10, isImage: false },
+          { id: '', name: 'broken', path: '', size: -1, isImage: false }
+        ]
+      }
+    }])
+    expect(normalized[0].replay).toEqual({
+      prompt: '分析附件',
+      attachments: [{ id: 'valid', name: 'api.txt', path: '.modmind/attachments/api.txt', size: 10, isImage: false }]
+    })
+  })
+
   it('keeps bounded retry/tool steps and bounds the stored history', () => {
     let stored = ''
     const conversations = Array.from({ length: 15 }, (_, index) => conversation(`c-${index}`, [

@@ -20,6 +20,7 @@ import { GitService } from './gitService'
 import { ReleaseService, type ReleaseSecrets } from './releaseService'
 import { generateGithubWorkflow } from './workflowService'
 import { buildScriptFingerprint } from './buildTrust'
+import { MODMIND_SOURCE_FINGERPRINT } from '../shared/sourceFingerprint'
 import { detectedProjectVersion, migrateProjectVersion112 } from './projectVersionMigration'
 import { CURRENT_PROJECT_VERSION, MIGRATABLE_PROJECT_VERSION } from './projectVersion'
 import { inspectProjectPreflight } from './projectPreflight'
@@ -560,6 +561,40 @@ async function pickAiAttachments(kind: AiAttachmentSelectionKind): Promise<AiAtt
     }
     return { id, name: file.name, path: relativePath, size: file.size, isImage: !file.isDirectory && isImageAttachment(file.name), isDirectory: file.isDirectory }
   }))
+}
+
+async function validateAiAttachments(attachments: AiAttachment[], requestedProjectPath?: string): Promise<AiAttachment[]> {
+  if (!Array.isArray(attachments)) return []
+  const project = requestedProjectPath?.trim()
+    ? await readProjectInfo(path.resolve(requestedProjectPath))
+    : requireProject()
+  if (!project) throw new Error('附件所属项目不存在或不是有效 ModMind 项目')
+  const attachmentDirectory = path.join(project.path, projectDataDirectory(project), 'attachments')
+  const canonicalAttachmentDirectory = await fs.realpath(attachmentDirectory).catch(() => path.resolve(attachmentDirectory))
+  const validated: AiAttachment[] = []
+  const seen = new Set<string>()
+  for (const attachment of attachments.slice(0, MAX_AI_ATTACHMENT_FILES)) {
+    if (!attachment || typeof attachment.path !== 'string' || typeof attachment.id !== 'string' || typeof attachment.name !== 'string') continue
+    const relativePath = attachment.path.slice(0, 8_192).replaceAll('\\', '/')
+    if (/[\0\r\n]/.test(relativePath)) continue
+    const absolutePath = path.resolve(project.path, ...relativePath.split('/'))
+    const childPath = path.relative(attachmentDirectory, absolutePath)
+    if (!childPath || !isPathInside(absolutePath, attachmentDirectory) || seen.has(absolutePath.toLowerCase())) continue
+    const stat = await fs.stat(absolutePath).catch(() => null)
+    if (!stat || (!stat.isFile() && !stat.isDirectory()) || stat.isDirectory() !== (attachment.isDirectory === true)) continue
+    const canonicalPath = await fs.realpath(absolutePath).catch(() => '')
+    if (!canonicalPath || !isPathInside(canonicalPath, canonicalAttachmentDirectory)) continue
+    seen.add(absolutePath.toLowerCase())
+    validated.push({
+      id: attachment.id.slice(0, 256),
+      name: attachment.name.slice(0, 1_024),
+      path: path.relative(project.path, absolutePath).replaceAll('\\', '/'),
+      size: stat.isDirectory() ? await attachmentDirectorySize(absolutePath) : stat.size,
+      isImage: stat.isFile() && isImageAttachment(attachment.name),
+      ...(stat.isDirectory() ? { isDirectory: true } : {})
+    })
+  }
+  return validated
 }
 
 function requireMappings(): MappingService {
@@ -3135,6 +3170,7 @@ async function exportDiagnosticLogs(pageSnapshots: DiagnosticPageSnapshot[] = []
   const summary = {
     exportedAt,
     appVersion: app.getVersion(),
+    sourceFingerprint: MODMIND_SOURCE_FINGERPRINT,
     platform: process.platform,
     arch: process.arch,
     osRelease: os.release(),
@@ -8320,6 +8356,7 @@ function registerIpc(): void {
     if (kind !== 'files' && kind !== 'directory') throw new Error('附件选择类型无效')
     return pickAiAttachments(kind)
   })
+  ipcMain.handle('ai:validateAttachments', (_event, attachments: AiAttachment[], projectPath?: string) => validateAiAttachments(attachments, projectPath))
   ipcMain.handle('ai:createCode', async (event, prompt: string, sessionId?: string, backend?: AgentSettings['codingBackend'], executionProfile?: AiExecutionProfile, options?: AiCreateCodeOptions) => {
     if (false) {
       aiCancelRequests.delete(event.sender.id)

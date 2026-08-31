@@ -1,4 +1,5 @@
 import type { CodingResult, InspirationChatMessage } from '../../shared/types'
+import { replayUserText } from '../../shared/aiReplay'
 import { isUsableAiAnswer } from '../../shared/aiOutput'
 
 type IdFactory = () => string
@@ -29,6 +30,24 @@ export function buildInspirationRows(messages: InspirationChatMessage[]): Inspir
   return rows
 }
 
+export function deleteInspirationTimelineItem(messages: InspirationChatMessage[], messageIndex: number): InspirationChatMessage[] {
+  if (messageIndex < 0 || messageIndex >= messages.length) return messages
+  if (messages[messageIndex].role === 'user') {
+    let end = messageIndex + 1
+    while (end < messages.length && messages[end].role !== 'user') end += 1
+    return [...messages.slice(0, messageIndex), ...messages.slice(end)]
+  }
+  let start = messageIndex
+  while (start > 0 && messages[start - 1].role !== 'user') start -= 1
+  return [...messages.slice(0, start), ...messages.slice(messageIndex + 1)]
+}
+
+export function rewindInspirationTimelineTo(messages: InspirationChatMessage[], messageIndex: number): InspirationChatMessage[] {
+  const selected = messages[messageIndex]
+  if (!selected) return messages
+  return messages.slice(0, selected.role === 'user' ? messageIndex : messageIndex + 1)
+}
+
 function defaultId(): string {
   return `inspiration-step-${Date.now()}-${crypto.randomUUID()}`
 }
@@ -56,7 +75,7 @@ export function inspirationConversationHandoff(messages: InspirationChatMessage[
   const transcript = messages
     .filter((message) => message.kind !== 'tool' && (message.role === 'user' || message.isFinal))
     .slice(-12)
-    .map((message) => `${message.role === 'user' ? 'User' : 'Assistant'}: ${message.content.trim()}`)
+    .map((message) => `${message.role === 'user' ? 'User' : 'Assistant'}: ${message.role === 'user' ? replayUserText(message.content, message.replay) : message.content.trim()}`)
     .filter((line) => !line.endsWith(':'))
     .join('\n\n')
   if (!transcript) return ''

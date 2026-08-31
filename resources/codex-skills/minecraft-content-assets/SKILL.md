@@ -1,6 +1,6 @@
 ---
 name: minecraft-content-assets
-description: Create and integrate Minecraft mod content assets, including item and block models, textures, blockstates, entity geometry, animations, language entries, recipes, loot tables, tags, sounds, particles, and data resources. Use when a feature needs coordinated visual or data-driven content.
+description: Create, integrate, and validate Minecraft mod content assets, including item and block models, textures, blockstates, entity geometry, animations, language entries, recipes, loot tables, tags, sounds, particles, and data resources. Use when a feature needs coordinated visual or data-driven content.
 ---
 
 # Minecraft Content Assets
@@ -14,9 +14,21 @@ Treat assets, data, and code references as one connected feature rather than iso
 3. Choose the right production path: edit text formats directly, use Blockbench for models/textures, use data generators when the project supports them, or create binary assets with an appropriate native tool.
 4. Build recognizable silhouettes and material detail at Minecraft's native viewing size. Check transparency, tileability, UV alignment, animation pivots, and texture references.
 5. Connect blockstates, models, textures, language, recipes, loot, tags, sounds, particles, and code registrations.
-6. Validate JSON and generated resources, then inspect in game when appearance or interaction matters.
+6. Run `modmind_validate_content` after coherent resource batches, then inspect in game when appearance or interaction matters.
 7. Keep editable source assets such as `.bbmodel` files when they will help future iteration.
 
 ## Blockbench Integration
 
-Start with `modmind_blockbench_actions` for structured model and texture operations inside ModMind. Use native Blockbench, image, audio, and filesystem tools when the integration does not cover the required asset operation.
+Invoke `$modmind-blockbench-modeling` for nontrivial models, UV work, rigs, animation, reference-image geometry, or visual acceptance. Use direct `modmind_blockbench_actions` only for focused operations already covered by that tool schema.
+
+Invoke `$modmind-image-assets` for generated textures, icons, reference images, pixel refinement, or background removal. Reuse project images through `modmind_image_project_assets` and `modmind_image_read_project_asset` instead of describing available pixels from memory.
+
+Keep the handoff explicit: stabilize geometry, establish UV intent, inspect generated pixels, create or assign the texture, save editable sources, then validate paths and references. Use native image, audio, or filesystem tools only when ModMind lacks the required operation.
+
+## Content Acceptance
+
+- Require valid JSON/SNBT and resolvable model, texture, sound, animation, and tag references.
+- Verify exact resource paths and namespaces against registry IDs.
+- Check assets at native Minecraft viewing size, not only enlarged previews.
+- Run the relevant client, server, or GameTest target when data changes behavior.
+- Do not call isolated files complete until registrations and all consuming references are connected.

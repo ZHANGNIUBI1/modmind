@@ -262,6 +262,7 @@ const api: ModMindApi = {
   ai: {
     createCode: (prompt: string, sessionId?: string, backend?: AgentSettings['codingBackend'], executionProfile?: AiExecutionProfile, options?: AiCreateCodeOptions) => invoke('ai:createCode', prompt, sessionId, backend, executionProfile, options),
     pickAttachments: (kind) => invoke('ai:pickAttachments', kind),
+    validateAttachments: (attachments, projectPath) => invoke('ai:validateAttachments', attachments, projectPath),
     cancelCode: (sessionId?: string, projectPath?: string) => invoke('ai:cancelCode', sessionId, projectPath),
     clearQuotaCredentials: () => invoke('ai:clearQuotaCredentials'),
     getRecovery: (projectPath?: string) => invoke('ai:getRecovery', projectPath),

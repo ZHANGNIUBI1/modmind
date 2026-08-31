@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import {
+  isForgeJavaProvisioningFailure,
   isGradleDistributionLockFailure,
   isGradleNetworkFailure,
   isGradleWrapperBootstrapFailure
@@ -30,6 +31,18 @@ describe('Gradle wrapper failure classification', () => {
   it('keeps Maven dependency timeouts out of Wrapper recovery', () => {
     const log = "Could not download mercury-0.4.3.jar (net.fabricmc:mercury:0.4.3)\nCould not get resource 'https://maven.fabricmc.net/net/fabricmc/mercury/0.4.3/mercury-0.4.3.jar'.\nRead timed out"
 
+    expect(isGradleNetworkFailure(log)).toBe(false)
+    expect(isGradleWrapperBootstrapFailure(log)).toBe(false)
+  })
+
+  it('keeps Forge-managed JDK provisioning failures out of Wrapper recovery', () => {
+    const log = [
+      'Failed to provision JDK 8',
+      'Downloading https://github.com/adoptium/temurin8-binaries/releases/download/jdk8/file.zip',
+      'Caused by: java.net.http.HttpConnectTimeoutException: HTTP connect timed out'
+    ].join('\n')
+
+    expect(isForgeJavaProvisioningFailure(log)).toBe(true)
     expect(isGradleNetworkFailure(log)).toBe(false)
     expect(isGradleWrapperBootstrapFailure(log)).toBe(false)
   })

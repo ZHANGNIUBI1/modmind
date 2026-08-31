@@ -1,0 +1,4 @@
+interface:
+  display_name: "Minecraft Server Pack Testing"
+  short_description: "Build and verify reproducible server packs"
+  default_prompt: "Use $minecraft-server-pack-testing to build and verify this modpack server."

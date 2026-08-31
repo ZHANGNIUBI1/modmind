@@ -31,6 +31,7 @@ import {
   Sparkles,
   Square,
   Trash2,
+  Undo2,
   UserRound
 } from 'lucide-react'
 import type {
@@ -48,7 +49,7 @@ import type {
 } from '../../../shared/types'
 import AiAttachmentPicker from './AiAttachmentPicker'
 import { useConfirmDialog } from './InteractionDialogs'
-import { latestWorkbenchUsage, type WorkbenchTimelineItem } from '../workbenchTimeline'
+import { latestWorkbenchUsage, workbenchContextUsageState, type WorkbenchTimelineItem } from '../workbenchTimeline'
 import { formatConversationTime, isLegacyWorkbenchConversation, type WorkbenchConversation } from '../workbenchConversations'
 import { workbenchElapsedSeconds } from '../workbenchElapsed'
 
@@ -104,12 +105,16 @@ type AgentWorkbenchProps = {
   scanningBeginnerModels?: boolean
   savingAiPreferences?: boolean
   beginnerModelScanMessage?: string
+  contextModel?: string
   onScanBeginnerModels?: () => void
   onModelChange?: (model: string) => void
   onReasoningLevelChange?: (level: BeginnerReasoningLevel) => void
   onFastModeChange?: (enabled: boolean) => void
   placeholder: string
   humanizeActivity: (value: string) => string
+  onEditTimelineItem?: (id: string, content: string) => void
+  onDeleteTimelineItem?: (id: string) => void
+  onRewindTimelineTo?: (id: string) => void
 }
 
 function MarkdownMessage({ content }: { content: string }): React.JSX.Element {
@@ -137,29 +142,21 @@ function formatTime(value: string): string {
   return new Intl.DateTimeFormat('zh-CN', { hour: '2-digit', minute: '2-digit' }).format(new Date(value))
 }
 
-function contextUsage(usage: AiTokenUsage | undefined): { ratio: number; percent: number } | null {
-  if (!usage?.contextWindow || !usage.inputTokens) return null
-  const ratio = usage.inputTokens / usage.contextWindow
-  if (!Number.isFinite(ratio) || ratio <= 0) return null
-  return { ratio, percent: Math.min(100, Math.round(ratio * 100)) }
+function compactTokens(value: number | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '未报告'
+  return new Intl.NumberFormat('zh-CN', { notation: 'compact', maximumFractionDigits: 1 }).format(value)
 }
 
-function ContextBadge({ usage }: { usage: AiTokenUsage | undefined }): React.JSX.Element | null {
-  const state = contextUsage(usage)
-  if (!state || !usage) return null
-  const level = state.ratio > 0.92 ? 'critical' : state.ratio > 0.8 ? 'warning' : 'ok'
-  const detail = [
-    `输入 ${usage.inputTokens ?? 0}`,
-    ...(usage.cachedInputTokens ? [`缓存 ${usage.cachedInputTokens}`] : []),
-    `输出 ${usage.outputTokens ?? 0}`,
-    `窗口 ${usage.contextWindow}`
-  ].join(' · ')
-  return (
-    <span className={`agent-context-badge ${level}`} title={`本轮 Token 用量：${detail}${state.ratio > 0.8 ? '\n占用过高时建议新建对话' : ''}`}>
-      <span>上下文 {state.percent}%</span>
-      {state.ratio > 0.92 ? <em>建议新建对话</em> : null}
-    </span>
-  )
+function ContextBadge({ usage, manual, onClick }: { usage: AiTokenUsage | undefined; manual: boolean; onClick: () => void }): React.JSX.Element {
+  const state = workbenchContextUsageState(usage)
+  const level = state.kind === 'capacity' ? state.ratio > 0.92 ? 'critical' : state.ratio > 0.8 ? 'warning' : 'ok' : 'unknown'
+  const label = state.kind === 'capacity'
+    ? `上下文 ${state.percent}%${manual ? '，使用手动窗口' : ''}`
+    : state.kind === 'tokens' ? `输入 ${compactTokens(usage?.inputTokens)}，窗口未知` : '上下文等待统计'
+  const style = state.kind === 'capacity'
+    ? { '--agent-context-progress': `${state.percent * 3.6}deg` } as React.CSSProperties
+    : undefined
+  return <button type="button" className={`agent-context-ring ${level}`} style={style} title={`${label}；悬停查看详情，点击固定面板`} aria-label={label} onClick={onClick} />
 }
 
 function groupTimeline(items: AgentWorkbenchTimelineItem[]): TimelineRow[] {
@@ -238,17 +235,17 @@ function ToolGroup({ items, humanizeActivity }: { items: AgentWorkbenchTimelineI
   </section>
 }
 
-function TimelineItem({ item, humanizeActivity }: { item: AgentWorkbenchTimelineItem; humanizeActivity: (value: string) => string }): React.JSX.Element | null {
+function TimelineItem({ item, humanizeActivity, onEdit, onDelete, onRewind }: { item: AgentWorkbenchTimelineItem; humanizeActivity: (value: string) => string; onEdit?: (id: string, content: string) => void; onDelete?: (id: string) => void; onRewind?: (id: string) => void }): React.JSX.Element | null {
   const [expanded, setExpanded] = useState(item.kind === 'error')
   const content = humanizeActivity(item.content)
-  if (item.kind === 'user') return <article className="agent-message-row user"><div className="agent-message agent-message-user"><p>{content}</p></div><time>{formatTime(item.time)}</time></article>
+  if (item.kind === 'user') return <article className="agent-message-row user"><div className="agent-message agent-message-user"><p>{content}</p></div>{(onEdit || onDelete || onRewind) ? <div className="agent-message-actions">{onEdit ? <button type="button" title="编辑并重新发送" aria-label="编辑并重新发送" onClick={() => onEdit(item.id, item.content)}><Pencil size={12} /></button> : null}{onDelete ? <button type="button" title="删除这轮对话" aria-label="删除这轮对话" onClick={() => onDelete(item.id)}><Trash2 size={12} /></button> : null}{onRewind ? <button type="button" title="从这条提问重新开始" aria-label="从这条提问重新开始" onClick={() => onRewind(item.id)}><Undo2 size={12} /></button> : null}</div> : null}<time>{formatTime(item.time)}</time></article>
   if (item.kind === 'thinking') return <ThinkingItem item={item} content={content} />
   if (item.kind === 'start' || item.kind === 'retry' || item.kind === 'history') return <div className="agent-event-muted"><Clock3 size={13} /><span>{content}</span></div>
   if (item.kind === 'diff') return <section className="agent-diff-card">
     <button type="button" className="agent-diff-heading" onClick={() => setExpanded((value) => !value)}><FileCode2 size={14} /><span>{item.diff?.length ?? 0} 个文件变更</span><ChevronRight className={expanded ? 'expanded' : ''} size={12} /></button>
     {expanded ? <div className="agent-diff-body">{item.diff?.map((file) => <div className="agent-diff-file" key={file.path}><code>{file.path}</code><span>+{file.added} -{file.removed}</span><pre>{[...file.additions.map((line) => `+ ${line}`), ...file.removals.map((line) => `- ${line}`)].join('\n')}</pre></div>)}</div> : null}
   </section>
-  if (item.kind === 'answer' || item.kind === 'response') return content ? <article className="agent-message-row assistant"><div className="agent-message agent-message-assistant"><MarkdownMessage content={content} /></div><time>{formatTime(item.time)}</time></article> : null
+  if (item.kind === 'answer' || item.kind === 'response') return content ? <article className="agent-message-row assistant"><div className="agent-message agent-message-assistant"><MarkdownMessage content={content} /></div>{(onDelete || onRewind) ? <div className="agent-message-actions">{onDelete ? <button type="button" title="删除这轮对话" aria-label="删除这轮对话" onClick={() => onDelete(item.id)}><Trash2 size={12} /></button> : null}{onRewind ? <button type="button" title="保留此回答并截断后续对话" aria-label="保留此回答并截断后续对话" onClick={() => onRewind(item.id)}><Undo2 size={12} /></button> : null}</div> : null}<time>{formatTime(item.time)}</time></article> : null
   if (item.kind === 'error' || item.kind === 'warning') {
     if (item.terminal !== true) return <div className="agent-event-muted"><CircleAlert size={13} /><span>{content}</span></div>
     return <div className={`agent-notice ${item.kind}`}><CircleAlert size={14} /><span>{content}</span></div>
@@ -289,6 +286,10 @@ export default function AgentWorkbench(props: AgentWorkbenchProps): React.JSX.El
   const { project, modpack, planning, taskState, aiTimeline, aiTodo, aiPlan } = props
   const effectiveBackend: AgentSettings['codingBackend'] = props.uiMode === 'beginner' ? 'quota' : (props.runningBackend ?? props.backend)
   const [settingsOpen, setSettingsOpen] = useState(false)
+  const [contextSettingsOpen, setContextSettingsOpen] = useState(false)
+  const [manualContextWindow, setManualContextWindow] = useState<number | undefined>()
+  const [contextWindowDraft, setContextWindowDraft] = useState('')
+  const [contextWindowError, setContextWindowError] = useState('')
   const [agentPickerOpen, setAgentPickerOpen] = useState(false)
   const [conversationPickerOpen, setConversationPickerOpen] = useState(false)
   const { confirm: confirmConversationDelete, dialog: conversationDeleteDialog } = useConfirmDialog()
@@ -309,6 +310,57 @@ export default function AgentWorkbench(props: AgentWorkbenchProps): React.JSX.El
   const timelineRows = useMemo(() => groupTimeline(displayedTimeline), [displayedTimeline])
   const hasLiveThinking = displayedTimeline.some((item) => item.kind === 'thinking' && item.status === 'running')
   const canExport = props.canExportArtifact && !planning && !props.building
+  const latestUsage = latestWorkbenchUsage(aiTimeline)
+  const contextModel = props.uiMode === 'beginner' ? props.beginnerAiPreferences?.model ?? 'default' : props.contextModel?.trim() || 'default'
+  const contextStorageKey = `modmind-context-window:${project.path}:${effectiveBackend}:${contextModel}`
+  const displayedUsage = manualContextWindow
+    ? { ...(latestUsage ?? {}), contextWindow: manualContextWindow }
+    : latestUsage
+  const displayedContextState = workbenchContextUsageState(displayedUsage)
+  const contextSummary = displayedContextState.kind === 'capacity'
+    ? `上下文 ${displayedContextState.percent}%`
+    : displayedContextState.kind === 'tokens'
+      ? `输入 ${compactTokens(displayedUsage?.inputTokens)} · 窗口未知`
+      : '等待 Token 用量'
+  useEffect(() => {
+    try {
+      const stored = Number(window.localStorage.getItem(contextStorageKey))
+      const value = Number.isSafeInteger(stored) && stored > 0 ? stored : undefined
+      setManualContextWindow(value)
+      setContextWindowDraft(value ? String(value) : '')
+    } catch {
+      setManualContextWindow(undefined)
+      setContextWindowDraft('')
+    }
+    setContextWindowError('')
+  }, [contextStorageKey])
+  useEffect(() => {
+    if (!contextSettingsOpen) return
+    const closeOnOutsidePointer = (event: PointerEvent): void => {
+      if (event.target instanceof Element && event.target.closest('.agent-context-control')) return
+      setContextSettingsOpen(false)
+    }
+    document.addEventListener('pointerdown', closeOnOutsidePointer)
+    return () => document.removeEventListener('pointerdown', closeOnOutsidePointer)
+  }, [contextSettingsOpen])
+  const saveContextWindow = (): void => {
+    const value = Number(contextWindowDraft.replace(/[,_\s]/g, ''))
+    if (!Number.isSafeInteger(value) || value <= 0) {
+      setContextWindowError('请输入正整数 Token 数')
+      return
+    }
+    try { window.localStorage.setItem(contextStorageKey, String(value)) } catch { /* The current session can still use the value. */ }
+    setManualContextWindow(value)
+    setContextWindowDraft(String(value))
+    setContextWindowError('')
+    setContextSettingsOpen(false)
+  }
+  const clearContextWindow = (): void => {
+    try { window.localStorage.removeItem(contextStorageKey) } catch { /* Storage is optional. */ }
+    setManualContextWindow(undefined)
+    setContextWindowDraft('')
+    setContextWindowError('')
+  }
   useEffect(() => {
     if (!conversationPickerOpen) return
     const closeOnOutsidePointer = (event: PointerEvent): void => {
@@ -359,7 +411,7 @@ export default function AgentWorkbench(props: AgentWorkbenchProps): React.JSX.El
     {props.aiRecovery ? <section className="agent-recovery-banner"><CircleAlert size={16} /><div><strong>发现未完成任务</strong><span>恢复点已保存{props.aiRecovery.backend ? `，将使用 ${backendLabel(props.aiRecovery.backend)} 继续` : ''}。</span></div><button type="button" className="agent-text-button" disabled={planning} onClick={props.onDismissRecovery}>稍后</button><button type="button" className="agent-primary-button" disabled={planning} onClick={props.onResume}>{planning ? <LoaderCircle className="spin" size={13} /> : null}继续</button></section> : null}
 
     <div ref={timelineRef} className="agent-conversation" onScroll={handleScroll}><div className="agent-conversation-surface">
-      {timelineRows.length ? timelineRows.map((row) => row.kind === 'tool-group' ? <ToolGroup key={row.id} items={row.items} humanizeActivity={props.humanizeActivity} /> : <TimelineItem key={row.id} item={row} humanizeActivity={props.humanizeActivity} />) : <div className="agent-empty"><span className="agent-empty-avatar">{backendIcon(effectiveBackend, 24)}</span><strong>{backendLabel(effectiveBackend)}</strong><span>有什么我可以帮助你的？</span></div>}
+      {timelineRows.length ? timelineRows.map((row) => row.kind === 'tool-group' ? <ToolGroup key={row.id} items={row.items} humanizeActivity={props.humanizeActivity} /> : <TimelineItem key={row.id} item={row} humanizeActivity={props.humanizeActivity} onEdit={!planning ? props.onEditTimelineItem : undefined} onDelete={!planning ? props.onDeleteTimelineItem : undefined} onRewind={!planning ? props.onRewindTimelineTo : undefined} />) : <div className="agent-empty"><span className="agent-empty-avatar">{backendIcon(effectiveBackend, 24)}</span><strong>{backendLabel(effectiveBackend)}</strong><span>有什么我可以帮助你的？</span></div>}
       {taskState === 'success' && aiPlan ? <div className="agent-result-actions"><button type="button" className="agent-secondary-button" onClick={props.onTest}><Gamepad2 size={14} />进入游戏测试</button>{props.canExportArtifact ? <button type="button" className="agent-secondary-button" onClick={props.onExport}><Download size={14} />导出</button> : null}</div> : null}
     </div></div>
 
@@ -369,7 +421,7 @@ export default function AgentWorkbench(props: AgentWorkbenchProps): React.JSX.El
       {settingsOpen ? <SettingsPopover props={props} /> : null}
       <footer className="agent-composer">
         <textarea value={props.prompt} onChange={(event) => props.setPrompt(event.target.value)} onKeyDown={(event) => { if (event.nativeEvent.isComposing || event.keyCode === 229) return; if (event.ctrlKey || event.metaKey) { if (event.key === 'Enter' && !planning) { event.preventDefault(); const textarea = event.currentTarget; const start = textarea.selectionStart; const end = textarea.selectionEnd; props.setPrompt(`${props.prompt.slice(0, start)}\n${props.prompt.slice(end)}`); window.requestAnimationFrame(() => textarea.setSelectionRange(start + 1, start + 1)) } return } if (event.key === 'Enter' && !planning && (props.prompt.trim() || props.attachments.length)) { event.preventDefault(); props.onStart() } }} placeholder={props.placeholder} disabled={planning} rows={2} />
-        <div className="agent-composer-toolbar"><div className="agent-composer-tools"><AiAttachmentPicker attachments={props.attachments} onChange={props.setAttachments} disabled={planning} onError={props.onAttachmentError} /><ContextBadge usage={latestWorkbenchUsage(aiTimeline)} /></div><div className="agent-composer-actions">{props.uiMode === 'beginner' ? <button type="button" className="agent-mode-pill" onClick={() => setSettingsOpen((value) => !value)}><Settings size={14} /><span>制作设置</span><ChevronDown size={12} /></button> : null}{planning ? <button type="button" className="agent-send-button stop" title="停止任务" aria-label="停止任务" onClick={props.onCancel}><Square size={14} fill="currentColor" /></button> : <button type="button" className="agent-send-button" title="发送" aria-label="发送" disabled={!props.prompt.trim() && !props.attachments.length} onClick={props.onStart}><ArrowUp size={17} strokeWidth={2.7} /></button>}</div></div>
+        <div className="agent-composer-toolbar"><div className="agent-composer-tools"><AiAttachmentPicker attachments={props.attachments} onChange={props.setAttachments} disabled={planning} onError={props.onAttachmentError} /></div><div className="agent-composer-actions">{props.uiMode === 'beginner' ? <button type="button" className="agent-mode-pill" onClick={() => setSettingsOpen((value) => !value)}><Settings size={14} /><span>制作设置</span><ChevronDown size={12} /></button> : null}<div className={`agent-context-control ${contextSettingsOpen ? 'open' : ''}`}><ContextBadge usage={displayedUsage} manual={manualContextWindow !== undefined} onClick={() => setContextSettingsOpen((value) => !value)} /><form className="agent-context-popover" onSubmit={(event) => { event.preventDefault(); saveContextWindow() }}><strong>{contextSummary}</strong><label htmlFor="agent-context-window">上下文窗口 Token</label><input id="agent-context-window" type="text" inputMode="numeric" value={contextWindowDraft} placeholder={latestUsage?.contextWindow ? String(latestUsage.contextWindow) : '例如 128000'} onChange={(event) => { setContextWindowDraft(event.target.value); setContextWindowError('') }} /><div><button type="button" className="agent-text-button" onClick={clearContextWindow}>自动</button><button type="submit" className="agent-primary-button">应用</button></div>{contextWindowError ? <small>{contextWindowError}</small> : manualContextWindow ? <small>当前使用手动窗口 {manualContextWindow.toLocaleString('zh-CN')}</small> : latestUsage?.contextWindow ? <small>CLI 返回 {latestUsage.contextWindow.toLocaleString('zh-CN')}</small> : <small>CLI 未返回窗口大小</small>}</form></div>{planning ? <button type="button" className="agent-send-button stop" title="停止任务" aria-label="停止任务" onClick={props.onCancel}><Square size={14} fill="currentColor" /></button> : <button type="button" className="agent-send-button" title="发送" aria-label="发送" disabled={!props.prompt.trim() && !props.attachments.length} onClick={props.onStart}><ArrowUp size={17} strokeWidth={2.7} /></button>}</div></div>
       </footer>
       {props.aiOutputStatus === 'error' && !planning ? <div className="agent-error-footer"><CircleAlert size={14} /><span>任务没有完成，详细信息已保留</span><button type="button" className="agent-text-button" onClick={props.onExportLogs}>导出诊断</button></div> : null}
     </div>

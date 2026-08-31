@@ -1,4 +1,4 @@
 interface:
   display_name: "ModMind Image Assets"
-  short_description: "Generate and refine project images through Image Studio"
-  default_prompt: "Use ModMind Image Studio to generate or refine the visual assets needed for this task."
+  short_description: "Generate, reuse, and inspect Image Studio assets"
+  default_prompt: "Use $modmind-image-assets to generate or refine the visual assets needed for this task."

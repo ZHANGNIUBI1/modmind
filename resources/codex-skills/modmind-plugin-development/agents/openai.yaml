@@ -1,0 +1,4 @@
+interface:
+  display_name: "ModMind Plugin Development"
+  short_description: "Build and reload trusted ModMind plugins"
+  default_prompt: "Use $modmind-plugin-development to create or update this ModMind plugin."

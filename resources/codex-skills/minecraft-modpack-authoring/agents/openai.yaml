@@ -1,0 +1,4 @@
+interface:
+  display_name: "Minecraft Modpack Authoring"
+  short_description: "Plan and author reliable Minecraft modpacks"
+  default_prompt: "Use $minecraft-modpack-authoring to plan, assemble, configure, and verify this modpack."

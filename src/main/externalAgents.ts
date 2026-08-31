@@ -12,6 +12,7 @@ import { windowsCmdInvocation } from './windowsCommand'
 import { getPreparedCodexExecutable, getPreparedCodexHome } from './codexSetup'
 import type { AiReviewDecision } from './aiReviewer'
 import { awaitWithAbort, throwIfAborted } from './asyncControl'
+import { MODMIND_SOURCE_FINGERPRINT } from '../shared/sourceFingerprint'
 
 export type { ExternalAgentKind } from '../shared/types'
 
@@ -392,10 +393,29 @@ function asFiniteNumber(value: unknown): number | undefined {
   return typeof value === 'number' && Number.isFinite(value) ? value : undefined
 }
 
-/** Extracts the CLI-reported token usage from Codex `token_count` stream events. */
+function normalizedCodexUsage(totals: Record<string, unknown>, contextWindowValue?: unknown): AiTokenUsage | undefined {
+  const inputTokens = asFiniteNumber(totals.input_tokens)
+  const cachedInputTokens = asFiniteNumber(totals.cached_input_tokens)
+  const outputTokens = asFiniteNumber(totals.output_tokens)
+  const contextWindow = asFiniteNumber(contextWindowValue ?? totals.model_context_window ?? totals.context_window)
+  if (inputTokens === undefined && outputTokens === undefined && contextWindow === undefined) return undefined
+  return {
+    ...(inputTokens !== undefined ? { inputTokens } : {}),
+    ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
+    ...(outputTokens !== undefined ? { outputTokens } : {}),
+    ...(contextWindow !== undefined ? { contextWindow: Math.round(contextWindow) } : {})
+  }
+}
+
+/** Extracts usage from current `turn.completed` JSONL and legacy `token_count` events. */
 export function extractCodexTokenUsage(parsed: Record<string, unknown> | null): AiTokenUsage | undefined {
   const type = typeof parsed?.type === 'string' ? parsed.type.toLowerCase() : ''
-  if (!parsed || type !== 'token_count') return undefined
+  if (!parsed) return undefined
+  if (type === 'turn.completed') {
+    const usage = parsed.usage && typeof parsed.usage === 'object' ? parsed.usage as Record<string, unknown> : undefined
+    return usage ? normalizedCodexUsage(usage) : undefined
+  }
+  if (type !== 'token_count') return undefined
   const payload = parsed.payload && typeof parsed.payload === 'object' ? parsed.payload as Record<string, unknown> : undefined
   const info = payload?.info && typeof payload.info === 'object' ? payload.info as Record<string, unknown> : undefined
   if (!info) return undefined
@@ -409,17 +429,7 @@ export function extractCodexTokenUsage(parsed: Record<string, unknown> | null): 
     if (perModel) totals = perModel as Record<string, unknown>
   }
   if (!totals) return undefined
-  const inputTokens = asFiniteNumber(totals.input_tokens)
-  const cachedInputTokens = asFiniteNumber(totals.cached_input_tokens)
-  const outputTokens = asFiniteNumber(totals.output_tokens)
-  const contextWindow = asFiniteNumber(info.model_context_window)
-  if (inputTokens === undefined && outputTokens === undefined && contextWindow === undefined) return undefined
-  return {
-    ...(inputTokens !== undefined ? { inputTokens } : {}),
-    ...(cachedInputTokens !== undefined ? { cachedInputTokens } : {}),
-    ...(outputTokens !== undefined ? { outputTokens } : {}),
-    ...(contextWindow !== undefined ? { contextWindow: Math.round(contextWindow) } : {})
-  }
+  return normalizedCodexUsage(totals, info.model_context_window)
 }
 
 /** Claude Code reports cumulative usage once on the terminal `result` event. */
@@ -603,6 +613,7 @@ export const MCP_SERVER_SOURCE = String.raw`import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
 
+const MODMIND_SOURCE_FINGERPRINT = 'sha256:235b5b247370dc5069a627962c848fb0d80f557114a51f51ebf5610db303f504';
 const config = JSON.parse(fs.readFileSync(path.join(path.dirname(process.argv[1]), 'bridge.json'), 'utf8'));
 const endpoint = 'http://127.0.0.1:' + config.port + '/tool';
 
@@ -882,7 +893,7 @@ input.on('line', async (line) => {
   try { request = JSON.parse(line); } catch { return; }
   if (request.method === 'notifications/initialized' || request.method?.startsWith('notifications/')) return;
   if (request.method === 'initialize') {
-    process.stdout.write(JSON.stringify(result(request.id,{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'modmind',version:config.version || 'development'}}))+'\n');
+    process.stdout.write(JSON.stringify(result(request.id,{protocolVersion:'2024-11-05',capabilities:{tools:{}},serverInfo:{name:'modmind',version:config.version || 'development'},_meta:{'dev.modmind/source-fingerprint':config.sourceFingerprint || MODMIND_SOURCE_FINGERPRINT}}))+'\n');
     return;
   }
   if (request.method === 'tools/list') {
@@ -1416,7 +1427,7 @@ export class ModMindBridge {
     if (!address || typeof address === 'string') throw new Error('无法启动 ModMind 外部代理桥接服务')
     this.port = address.port
     const bridgePath = path.join(this.directory, 'bridge.json')
-    await fs.writeFile(bridgePath, JSON.stringify({port: this.port, token: this.token, version: this.appVersion}, null, 2), 'utf8')
+    await fs.writeFile(bridgePath, JSON.stringify({port: this.port, token: this.token, version: this.appVersion, sourceFingerprint: MODMIND_SOURCE_FINGERPRINT}, null, 2), 'utf8')
     const mcpPath = path.join(this.directory, 'modmind-mcp-server.mjs')
     await fs.writeFile(mcpPath, MCP_SERVER_SOURCE, 'utf8')
     const contextPath = path.join(this.directory, 'agent-context.md')

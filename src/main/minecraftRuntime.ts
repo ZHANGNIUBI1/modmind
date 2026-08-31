@@ -35,7 +35,7 @@ import type {
 } from '../shared/minecraft'
 import type { JavaPreferences, DetectedJavaHome, LoaderKind, ProjectInfo } from '../shared/types'
 import { isJavaLoader, platformLabel } from '../shared/projectPlatform'
-import { isGradleNetworkFailure } from './gradleFailure'
+import { isForgeJavaProvisioningFailure, isGradleNetworkFailure } from './gradleFailure'
 import { readModpackManifest, syncModpackOverrides } from './modpackService'
 import { modpackModsRoot } from './modpackPaths'
 import { buildJavaRangeForProject, gradleVersionForProject, javaRuntimeTargetForJavaVersion, javaRuntimeTargetForMinecraft, javaVersionForMinecraft } from './loaderCompatibility'
@@ -56,6 +56,8 @@ import {
   resolveMinecraftVersionFromManifests
 } from './minecraftVersionManifest'
 import { runMinecraftTaskWithRecovery } from './minecraftTaskRecovery'
+import { getNetworkProxyUrl } from './networkRequest'
+import { detectToolchainRequirements, mergeToolchainJavaHomes } from './toolchainDetection'
 
 const BMCLAPI = BMCLAPI_BASE_URL
 const MINECRAFT_ASSET_HOSTS = [`${BMCLAPI}/assets`, 'https://resources.download.minecraft.net']
@@ -106,6 +108,22 @@ async function validAssetIndex(filePath: string, expectedSha1: string): Promise<
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message
   return String(error)
+}
+
+function javaProxyOptions(proxyUrl: string): string {
+  if (!proxyUrl.trim()) return ''
+  try {
+    const parsed = new URL(/^[a-z][a-z0-9+.-]*:\/\//i.test(proxyUrl) ? proxyUrl : `http://${proxyUrl}`)
+    if (!parsed.hostname) return ''
+    const host = parsed.hostname.includes(':') ? `[${parsed.hostname}]` : parsed.hostname
+    const port = parsed.port || (parsed.protocol.toLowerCase() === 'https:' ? '443' : '80')
+    if (parsed.protocol.toLowerCase().startsWith('socks')) {
+      return `-DsocksProxyHost=${host} -DsocksProxyPort=${port}`
+    }
+    return `-Dhttps.proxyHost=${host} -Dhttps.proxyPort=${port} -Dhttp.proxyHost=${host} -Dhttp.proxyPort=${port}`
+  } catch {
+    return ''
+  }
 }
 
 /**
@@ -271,6 +289,11 @@ function managedLoaderApiName(project: ProjectInfo): string {
 
 function summarizeGradleFailure(logText: string): string {
   const lines = logText.split(/\r?\n/)
+  if (isForgeJavaProvisioningFailure(logText)) {
+    const requirements = detectToolchainRequirements(logText)
+    const requested = requirements.javaMajors.length ? `（日志要求 Java ${requirements.javaMajors.join('、')}）` : ''
+    return `Forge/Mavenizer 无法准备项目所需的 JDK${requested}。ModMind 已尝试自动下载并配置；请检查网络代理或下载源\n${lines.filter(Boolean).slice(-8).join('\n')}`
+  }
   if (isGradleNetworkFailure(logText)) {
     return '项目 Gradle Wrapper 无法取得配置的 Gradle 分发包。请检查 gradle/wrapper/gradle-wrapper.properties、网络或代理设置'
   }
@@ -746,6 +769,8 @@ export class MinecraftRuntimeManager {
   private buildProcess: ChildProcess | null = null
   private verificationProcess: ChildProcess | null = null
   private readonly gradleCleanupPromises = new Map<string, Promise<void>>()
+  /** JDK homes discovered from failed builds, keyed by the requested major. */
+  private readonly buildToolchainHomes = new Map<number, string>()
   private stopRequested = false
   private lastProgressAt = 0
   private lastProgressStage: MinecraftRuntimeStage | '' = ''
@@ -1178,9 +1203,20 @@ export class MinecraftRuntimeManager {
     args: string[],
     env: NodeJS.ProcessEnv
   ): ChildProcessWithoutNullStreams {
+    const toolchainHomes = env.MODMIND_GRADLE_JAVA_HOMES?.trim()
+    const toolchainEnvNames = env.MODMIND_GRADLE_JAVA_ENV_NAMES?.trim()
+    const managedArguments = toolchainHomes
+      ? [
+          `-Dorg.gradle.java.installations.paths=${toolchainHomes}`,
+          ...(toolchainEnvNames ? [`-Dorg.gradle.java.installations.fromEnv=${toolchainEnvNames}`] : []),
+          '-Dorg.gradle.java.installations.auto-detect=true',
+          '-Dorg.gradle.java.installations.auto-download=false',
+          ...args
+        ]
+      : args
     const invocation = process.platform === 'win32'
-      ? windowsCmdInvocation(runtime.executable, args)
-      : { command: runtime.executable, args, windowsVerbatimArguments: false as const }
+      ? windowsCmdInvocation(runtime.executable, managedArguments)
+      : { command: runtime.executable, args: managedArguments, windowsVerbatimArguments: false as const }
     return spawn(invocation.command, invocation.args, {
       cwd: project.path,
       windowsHide: true,
@@ -1188,6 +1224,22 @@ export class MinecraftRuntimeManager {
       windowsVerbatimArguments: invocation.windowsVerbatimArguments,
       env
     })
+  }
+
+  private gradleEnvironment(runtime: GradleRuntimeSelection): NodeJS.ProcessEnv {
+    const homes = mergeToolchainJavaHomes(this.buildToolchainHomes.values())
+    const javaEnvironment = Object.fromEntries([...this.buildToolchainHomes.entries()].map(([major, home]) => [`MODMIND_JAVA_${major}`, home]))
+    const javaEnvironmentNames = Object.keys(javaEnvironment).join(',')
+    const proxy = javaProxyOptions(getNetworkProxyUrl())
+    const existingJavaOptions = process.env.JAVA_TOOL_OPTIONS?.trim() ?? ''
+    return {
+      ...process.env,
+      JAVA_HOME: runtime.javaHome,
+      GRADLE_USER_HOME: path.join(app.getPath('userData'), 'gradle-runtime', 'cache'),
+      ...(homes ? { MODMIND_GRADLE_JAVA_HOMES: homes } : {}),
+      ...(javaEnvironmentNames ? { MODMIND_GRADLE_JAVA_ENV_NAMES: javaEnvironmentNames, ...javaEnvironment } : {}),
+      ...(proxy ? { JAVA_TOOL_OPTIONS: `${existingJavaOptions}${existingJavaOptions ? ' ' : ''}${proxy}` } : {})
+    }
   }
 
   private async stopStaleGradleDaemons(runtime: GradleRuntimeSelection, project: ProjectInfo, env: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<void> {
@@ -1247,6 +1299,7 @@ export class MinecraftRuntimeManager {
     if (preferredBuildJava) {
       const preferredCandidate = await probeJavaHome(preferredBuildJava, range.minimum, true, range.maximum)
       if (preferredCandidate) {
+        this.buildToolchainHomes.set(preferredCandidate.major, path.dirname(path.dirname(preferredCandidate.javaPath)))
         this.emit('building-mod', `使用手动选择的 JDK ${preferredCandidate.major}：${preferredCandidate.javaPath}`)
         return preferredCandidate.javaPath
       }
@@ -1259,6 +1312,7 @@ export class MinecraftRuntimeManager {
     for (const home of await configuredBuildJavaHomes(project)) {
       const candidate = await probeJavaHome(home, range.minimum, true, range.maximum)
       if (candidate) {
+        this.buildToolchainHomes.set(candidate.major, path.dirname(path.dirname(candidate.javaPath)))
         this.emit('building-mod', `使用项目/系统 JDK ${candidate.major}：${candidate.javaPath}`)
         return candidate.javaPath
       }
@@ -1272,7 +1326,40 @@ export class MinecraftRuntimeManager {
       throw new Error(`ModMind 下载的 JDK 无法用于 Gradle 编译：${managed.home}。请设置有效的 JDK（包含 javac）或修复 JDK 缓存`)
     }
     this.emit('building-mod', `使用已验证的 JDK ${candidate.major}（${managed.source}）：${candidate.javaPath}`)
+    this.buildToolchainHomes.set(candidate.major, path.dirname(path.dirname(candidate.javaPath)))
     return candidate.javaPath
+  }
+
+  /**
+   * Forge and Gradle can request additional toolchain JDKs after the build has
+   * already started. Resolve those versions from the actual failure output,
+   * register their homes with Gradle, and let the caller retry the same task.
+   */
+  private async ensureDetectedBuildToolchains(logText: string, project?: ProjectInfo): Promise<boolean> {
+    const requirements = detectToolchainRequirements(logText)
+    const configuredHomes = project ? await configuredBuildJavaHomes(project) : []
+    let changed = false
+    for (const major of requirements.javaMajors) {
+      if (this.buildToolchainHomes.has(major)) continue
+      const existing = await Promise.all(configuredHomes.map((home) => probeJavaHome(home, major, true, major)))
+      const configured = existing.find((candidate): candidate is JavaProbeResult => Boolean(candidate))
+      if (configured) {
+        this.buildToolchainHomes.set(major, path.dirname(path.dirname(configured.javaPath)))
+        this.emit('building-mod', `发现并配置现有 JDK ${major}：${configured.javaPath}`)
+        changed = true
+        continue
+      }
+      this.emit('building-mod', `构建日志要求 Java ${major}，正在自动准备对应 JDK`, 'warning')
+      const managed = await ensureManagedJdk(path.join(app.getPath('userData'), 'build-jdks'), major, (progress) => {
+        this.emitProgress('downloading-java', `正在为构建下载 JDK ${major}（${progress.source}）`, progress.downloaded, progress.total)
+      })
+      const candidate = await probeJavaHome(managed.home, major, true)
+      if (!candidate) throw new Error(`自动下载的 JDK ${major} 未通过 javac 验证：${managed.home}`)
+      this.buildToolchainHomes.set(major, path.dirname(path.dirname(candidate.javaPath)))
+      this.emit('building-mod', `JDK ${major} 已配置，正在重新尝试构建`)
+      changed = true
+    }
+    return changed
   }
 
   async testGradleTask(candidates: string[], stableWindowMs = 0, signal?: AbortSignal): Promise<GradleVerificationResult> {
@@ -1282,11 +1369,7 @@ export class MinecraftRuntimeManager {
     if (this.process || this.verificationProcess || this.buildPromise) throw new Error('已有 Minecraft、构建或验证任务正在运行')
     await this.authorizeBuild?.(project)
     const runtime = await this.gradleRuntime(project)
-    const env = {
-      ...process.env,
-      JAVA_HOME: runtime.javaHome,
-      GRADLE_USER_HOME: path.join(app.getPath('userData'), 'gradle-runtime', 'cache')
-    }
+    const env = this.gradleEnvironment(runtime)
     const taskList = this.spawnGradle(runtime, project, ['tasks', '--all', '--console=plain', '--no-daemon'], env)
     let taskOutput = ''
     taskList.stdout.on('data', (chunk: Buffer) => { if (taskOutput.length < 2_000_000) taskOutput += chunk.toString('utf8') })
@@ -1556,11 +1639,7 @@ export class MinecraftRuntimeManager {
     await fs.mkdir(logDirectory, { recursive: true })
     const javaHome = runtime.javaHome
     const javaPath = path.join(javaHome, 'bin', process.platform === 'win32' ? 'java.exe' : 'java')
-    const gradleEnvironment = {
-      ...process.env,
-      JAVA_HOME: javaHome,
-      GRADLE_USER_HOME: path.join(app.getPath('userData'), 'gradle-runtime', 'cache')
-    }
+    const gradleEnvironment = this.gradleEnvironment(runtime)
     await this.stopStaleGradleDaemons(runtime, project, gradleEnvironment, signal)
     if (signal?.aborted) throw Object.assign(new Error('构建已取消'), { name: 'AbortError' })
     const log = createWriteStream(logPath, { flags: 'w' })
@@ -1615,6 +1694,13 @@ export class MinecraftRuntimeManager {
     if (spawnError) throw new Error(`无法启动 Gradle Wrapper：${spawnError}\nJava: ${javaPath}\nWrapper: ${runtime.executable}\n工作目录：${project.path}`)
     if (termination.code !== 0) {
       const fullLog = await fs.readFile(logPath, 'utf8').catch(() => recentLines.join('\n'))
+      if (!aborted && retryAttempt < 4) {
+        const toolchainsPrepared = await this.ensureDetectedBuildToolchains(fullLog, project)
+        if (toolchainsPrepared) {
+          this.emit('building-mod', '已根据构建日志补齐工具链，正在重试原构建任务', 'warning')
+          return this.buildProjectInternal(signal, retryAttempt + 1)
+        }
+      }
       const detail = summarizeGradleFailure(fullLog)
       if (!aborted && retryAttempt < 2 && isGradleNetworkFailure(fullLog)) {
         this.emit('building-mod', 'Gradle 下载源暂时不可用，正在切换备用源重试', 'warning')
@@ -1661,8 +1747,15 @@ export class MinecraftRuntimeManager {
     const content = await fs.readFile(propertiesPath, 'utf8').catch(() => '')
     const match = content.match(/distributionUrl=.*?gradle-([0-9A-Za-z.+_-]+)-(bin|all)\.zip/i)
     if (!match) return
+    const configuredUrl = content.match(/^distributionUrl\s*=\s*(.+)$/mi)?.[1]?.trim().replaceAll('\\:', ':') ?? ''
     const preference = await this.getGradleDownloadSource?.() ?? 'auto'
-    const source = gradleDistributionSources(match[1], preference, match[2].toLowerCase() as 'bin' | 'all')[Math.min(attempt, 2)]
+    const sources = gradleDistributionSources(match[1], preference, match[2].toLowerCase() as 'bin' | 'all')
+    // Keep the project's original/recommended distribution on the first run.
+    // Only rewrite the URL after a failed attempt, then walk every distinct
+    // mirror before surfacing the original failure.
+    if (attempt === 0 && /^https:\/\//i.test(configuredUrl)) return
+    const alternatives = sources.filter((source) => source.url !== configuredUrl)
+    const source = alternatives[Math.max(0, attempt - 1)]
     if (!source) return
     const next = content.replace(/distributionUrl=.*$/m, `distributionUrl=${source.url.replace(/:/g, '\\:')}`)
     if (next !== content) await fs.writeFile(propertiesPath, next, 'utf8')
@@ -1688,11 +1781,7 @@ export class MinecraftRuntimeManager {
     await fs.mkdir(logDirectory, { recursive: true })
     const javaHome = runtime.javaHome
     const javaPath = path.join(javaHome, 'bin', process.platform === 'win32' ? 'java.exe' : 'java')
-    const gradleEnvironment = {
-      ...process.env,
-      JAVA_HOME: javaHome,
-      GRADLE_USER_HOME: path.join(app.getPath('userData'), 'gradle-runtime', 'cache')
-    }
+    const gradleEnvironment = this.gradleEnvironment(runtime)
     await this.stopStaleGradleDaemons(runtime, project, gradleEnvironment, signal)
     if (signal?.aborted) throw Object.assign(new Error('构建已取消'), { name: 'AbortError' })
     const log = createWriteStream(logPath, { flags: 'w' })
@@ -1735,11 +1824,19 @@ export class MinecraftRuntimeManager {
     if (aborted) throw Object.assign(new Error('构建已取消'), { name: 'AbortError' })
     if (spawnError) throw new Error(`无法启动 Gradle Wrapper：${spawnError}\nJava: ${javaPath}\nWrapper: ${runtime.executable}`)
     if (termination.code !== 0) {
-      if (!aborted && retryAttempt < 2 && isGradleNetworkFailure(output)) {
+      const fullLog = await fs.readFile(logPath, 'utf8').catch(() => output)
+      if (!aborted && retryAttempt < 4) {
+        const toolchainsPrepared = await this.ensureDetectedBuildToolchains(fullLog, project)
+        if (toolchainsPrepared) {
+          this.emit('building-mod', '已根据构建日志补齐工具链，正在重试原构建任务', 'warning')
+          return this.runGradleBuild(project, signal, retryAttempt + 1)
+        }
+      }
+      if (!aborted && retryAttempt < 2 && isGradleNetworkFailure(fullLog)) {
         this.emit('building-mod', 'Gradle 下载源暂时不可用，正在切换备用源重试', 'warning')
         return this.runGradleBuild(project, signal, retryAttempt + 1)
       }
-      throw new Error(`自制 Mod 构建失败（${describeProcessTermination(termination.code, termination.signal)}）\n${summarizeGradleFailure(output)}\n完整日志：${logPath}`)
+      throw new Error(`自制 Mod 构建失败（${describeProcessTermination(termination.code, termination.signal)}）\n${summarizeGradleFailure(fullLog)}\n完整日志：${logPath}`)
     }
   }
 

@@ -19,6 +19,8 @@ ui-check*.jpg
 /HeadlessMC/
 /log/
 /modmind-mcp-open-source.zip
+/docs/
+/modmind-mcp-open-source/
 /resources/server-pack-creator/.parts/
 /resources/server-pack-creator/*.partial
 

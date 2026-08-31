@@ -1,0 +1,4 @@
+interface:
+  display_name: "Minecraft Add-on Development"
+  short_description: "Extend exact versions of third-party mods"
+  default_prompt: "Use $minecraft-addon-development to prepare and implement this third-party mod integration."

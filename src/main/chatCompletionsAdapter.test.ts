@@ -1,6 +1,7 @@
 import { createServer } from 'node:http'
+import { brotliCompressSync, deflateSync, gzipSync } from 'node:zlib'
 import { afterEach, describe, expect, it } from 'vitest'
-import { ChatCompletionsAdapter, chatCompletionToResponsesEvents, responsesRequestToChatCompletions, sanitizeTokenBudgets } from './chatCompletionsAdapter'
+import { ChatCompletionsAdapter, chatCompletionToResponsesEvents, decompressRequest, responsesRequestToChatCompletions, sanitizeTokenBudgets } from './chatCompletionsAdapter'
 
 const adapters: ChatCompletionsAdapter[] = []
 
@@ -71,11 +72,28 @@ describe('Chat Completions compatibility adapter', () => {
     ]))
   })
 
+  it('decompresses Node 20 codecs and a static zstd frame', async () => {
+    const payload = Buffer.from('{"model":"m","input":"hi"}')
+    await expect(decompressRequest(gzipSync(payload), 'gzip')).resolves.toEqual(payload)
+    await expect(decompressRequest(deflateSync(payload), 'deflate')).resolves.toEqual(payload)
+    await expect(decompressRequest(brotliCompressSync(payload), 'br')).resolves.toEqual(payload)
+    const zstdFixture = Buffer.from('KLUv/SAa0QAAeyJtb2RlbCI6Im0iLCJpbnB1dCI6ImhpIn0=', 'base64')
+    await expect(decompressRequest(zstdFixture, 'zstd')).resolves.toEqual(payload)
+  })
+
+  it('rejects unsupported, corrupt, and oversized decompressed requests', async () => {
+    await expect(decompressRequest(Buffer.from('bad'), 'snappy')).rejects.toThrow(/暂不支持 snappy/)
+    await expect(decompressRequest(Buffer.from('bad'), 'gzip')).rejects.toThrow(/解压失败/)
+    await expect(decompressRequest(gzipSync(Buffer.alloc(512)), 'gzip', 64)).rejects.toThrow(/解压后超过/)
+  })
+
   it('falls back from an unsupported Responses endpoint and caches the Chat protocol', async () => {
     let chatRequests = 0
     let receivedBody: Record<string, unknown> | undefined
+    let receivedContentType = ''
     const upstream = createServer((request, response) => {
       if (request.url === '/responses') {
+        receivedContentType = request.headers['content-type'] ?? ''
         response.writeHead(404, { 'Content-Type': 'application/json' })
         response.end(JSON.stringify({ error: { message: 'The /responses endpoint is not supported' } }))
         return
@@ -115,6 +133,7 @@ describe('Chat Completions compatibility adapter', () => {
       expect(stream).toContain('response.output_item.done')
       expect(stream).toContain('ok')
       expect(chatRequests).toBe(1)
+      expect(receivedContentType).toBe('application/json')
       expect(receivedBody).toMatchObject({ model: 'test-model', messages: [{ role: 'user', content: 'hello' }], stream: false })
 
       const second = await fetch(`${baseUrl}/responses`, {
@@ -163,6 +182,64 @@ describe('Chat Completions compatibility adapter', () => {
       expect(await (await send()).text()).toContain('recovered')
       expect(responsesRequests).toBe(2)
       expect(chatRequests).toBe(1)
+    } finally {
+      await new Promise<void>((resolve, reject) => upstream.close((error) => error ? reject(error) : resolve()))
+    }
+  })
+
+  it('accepts zstd requests through the adapter on the Electron-compatible decoder', async () => {
+    let receivedBody = ''
+    const upstream = createServer((request, response) => {
+      const chunks: Buffer[] = []
+      request.on('data', (chunk) => chunks.push(Buffer.from(chunk)))
+      request.on('end', () => {
+        receivedBody = Buffer.concat(chunks).toString('utf8')
+        response.writeHead(200, { 'Content-Type': 'text/event-stream' })
+        response.end('data: {"type":"response.completed","response":{"id":"zstd-ok"}}\n\ndata: [DONE]\n\n')
+      })
+    })
+    await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = upstream.address()
+      if (!address || typeof address === 'string') throw new Error('missing test server address')
+      const adapter = new ChatCompletionsAdapter()
+      adapters.push(adapter)
+      const baseUrl = await adapter.baseUrl(`http://127.0.0.1:${address.port}`)
+      const zstdFixture = Buffer.from('KLUv/SAa0QAAeyJtb2RlbCI6Im0iLCJpbnB1dCI6ImhpIn0=', 'base64')
+      const response = await fetch(`${baseUrl}/responses`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json', 'Content-Encoding': 'zstd' }, body: zstdFixture
+      })
+      expect(response.status).toBe(200)
+      expect(await response.text()).toContain('zstd-ok')
+      expect(receivedBody).toBe('{"model":"m","input":"hi"}')
+    } finally {
+      await new Promise<void>((resolve, reject) => upstream.close((error) => error ? reject(error) : resolve()))
+    }
+  })
+
+  it('does not treat a generic 415 media-type error as a protocol switch', async () => {
+    let chatRequests = 0
+    const upstream = createServer((request, response) => {
+      if (request.url === '/responses') {
+        response.writeHead(415, { 'Content-Type': 'application/json' })
+        response.end(JSON.stringify({ error: { message: 'Expected request with Content-Type: application/json' } }))
+        return
+      }
+      if (request.url === '/chat/completions') chatRequests += 1
+      response.writeHead(500); response.end()
+    })
+    await new Promise<void>((resolve) => upstream.listen(0, '127.0.0.1', resolve))
+    try {
+      const address = upstream.address()
+      if (!address || typeof address === 'string') throw new Error('missing test server address')
+      const adapter = new ChatCompletionsAdapter()
+      adapters.push(adapter)
+      const baseUrl = await adapter.baseUrl(`http://127.0.0.1:${address.port}`)
+      const response = await fetch(`${baseUrl}/responses`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"model":"m","input":"hi"}'
+      })
+      expect(response.status).toBe(415)
+      expect(chatRequests).toBe(0)
     } finally {
       await new Promise<void>((resolve, reject) => upstream.close((error) => error ? reject(error) : resolve()))
     }

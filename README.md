@@ -2,10 +2,37 @@
 
 Electron-based workspace for AI-assisted Minecraft mod development.
 
+## ModMind 1.4.4
+
+- Added conversation rewind, edit, and delete controls.
+- Fixed DeepSeek compatibility based on a contribution from
+  [@ZHANGNIUBI1](https://github.com/ZHANGNIUBI1), with additional ModMind changes.
+- Added 13 built-in skills for Minecraft development, migration, testing, release,
+  content creation, Blockbench modeling, image assets, and plugin development.
+- Improved Java toolchain fallback and runtime selection.
+- Improved automatic-update downloads and general download reliability.
+- Removed Herobrine.
+
+The standalone MCP server is maintained in the
+[ModMind-MCP repository](https://github.com/waterpail114514/ModMind-MCP).
+
+## License
+
+Starting with the `1.4.4` release, ModMind's original source code is licensed
+under the GNU Affero General Public License v3.0 only (`AGPL-3.0-only`). The
+`1.4.3` and earlier releases remain available under their previously published
+MIT license; those grants are not revoked. See [LICENSE](LICENSE) for the full
+license text and [CONTRIBUTING.md](CONTRIBUTING.md) for contribution terms.
+
+Third-party components and bundled tools remain under their own licenses listed
+in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The ModMind name and logos
+are trademarks and are not granted by the software license; see
+[TRADEMARKS.md](TRADEMARKS.md).
+
 ## Versioning
 
-The current product development line is `1.3.0-beta`. Stable patch releases increment
-only the patch component (`1.3.1`, `1.3.2`, and so on).
+The current product development line is `1.4.4`. Stable patch releases increment
+only the patch component (`1.4.5`, `1.4.6`, and so on).
 Run `npm.cmd run version:patch` once for each future change set; it updates both
 `package.json` and `package-lock.json` without creating a Git tag.
 

@@ -1,0 +1,4 @@
+interface:
+  display_name: "ModMind Blockbench Modeling"
+  short_description: "Create and rigorously review production-ready Blockbench assets"
+  default_prompt: "Use $modmind-blockbench-modeling to create and verify a production-ready Blockbench model through ModMind MCP."

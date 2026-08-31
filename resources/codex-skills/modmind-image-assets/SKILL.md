@@ -1,24 +1,44 @@
 ---
 name: modmind-image-assets
-description: Generate and process visual assets through ModMind Image Studio for Minecraft textures, icons, promotional art, pixel refinement, or background removal.
+description: Generate, inspect, reuse, and process visual assets through ModMind Image Studio for Minecraft textures, icons, promotional art, pixel refinement, reference-guided edits, or background removal. Use when an image should be created from a prompt or existing project pixels and handed into a Minecraft resource or Blockbench workflow.
 ---
 
 # ModMind Image Assets
 
-Available ModMind MCP tools:
+Treat every generated or processed image as a candidate until its returned pixels are inspected.
 
-- `modmind_image_generate`: generate a raster asset through the configured provider.
-- `modmind_image_perfect_pixel`: refine a generated or uploaded pixel-art image.
-- `modmind_image_remove_background`: remove a detected solid background from an image.
+## Tool Routing
 
-Use these tools whenever they help the requested task. The configured image provider
-applies its own service-side moderation.
+- Use `modmind_image_project_assets` to discover existing project images and `modmind_image_read_project_asset` to obtain the exact `dataUrl` for a reference. Do not describe available pixels from memory.
+- Use `modmind_image_generate` for generation or reference-guided editing. ModMind owns credentials, quota, billing, and provider moderation.
+- Use `modmind_image_perfect_pixel` when inspected Minecraft-style output needs pixel-grid cleanup.
+- Use `modmind_image_remove_background` only when the observed background should become transparent; inspect the returned edges afterward.
+- Pass a final `dataUrl` to a Blockbench `create-texture` action when it belongs on a model. Invoke `$modmind-blockbench-modeling` for the geometry, UV, and visual acceptance workflow.
 
-- Choose `style: minecraft` for Minecraft textures, item icons, block art, and other pixel assets. Prefer a flat solid background so the result can be processed reliably.
-- Choose `style: free` when the user explicitly wants another visual style.
-- Use one focused prompt per distinct asset. Use `count` only for variants of the same prompt.
-- The generation result includes an `assets` list. When `handoffAvailable` is true, its `dataUrl` can be passed to the image-processing tools and then to a Blockbench `create-texture` action; this is the supported handoff from a generated image to a project texture.
-- When the user provides an image or asks to follow an existing project texture, pass that image as `referenceImage` to `modmind_image_generate`; do not describe a reference image from memory when its pixels are available.
-- Treat the returned image as a draft until it has been inspected. Use the PerfectPixel or background-removal tool when the output needs that processing. Processing accepts the `dataUrl` returned by the generation tool or an image supplied by the user.
-- A concept image is not a UV unwrap. For cube, entity, and animated models, create the model first and align its face regions deliberately; use a generated image as a reference or as an appropriate texture source only after that mapping is established. Save final textures under the exact Minecraft resource path and save editable `.bbmodel` sources for nontrivial models.
-- ModMind owns credentials, quota checks, and billing. Do not place API keys in project files or task output.
+## Generation Rules
+
+- Choose `style: minecraft` for textures, item icons, block art, and native pixel assets. Use `style: free` only for a requested non-Minecraft visual style.
+- Use one focused prompt per distinct asset. Use `count` for comparable variants of the same brief, not unrelated deliverables.
+- Include subject, view, silhouette, palette, material, pixel scale, transparency/background, and prohibited artifacts in the prompt when they matter.
+- Pass an available source image as `referenceImage`. Do not substitute a prose reconstruction.
+- Prefer a flat solid background when reliable removal is part of the plan.
+
+## Acceptance Loop
+
+1. Inspect every returned image at full size and intended Minecraft display size.
+2. Compare variants for subject accuracy, silhouette, palette, material readability, edge quality, tiling or symmetry, and unwanted text or artifacts.
+3. Refine only observed defects. Do not run PerfectPixel or background removal automatically when the source is already correct.
+4. Re-inspect processed pixels, especially alpha edges and one-pixel features.
+5. Hand off only the selected candidate and record its returned project path or data URL destination.
+
+Reject a texture with unintended blur, anti-aliasing, palette noise, broken tile edges, illegible icon silhouette, dirty transparency, inconsistent lighting, or details below the target pixel scale.
+
+## Blockbench and Persistence
+
+A concept image is not a UV unwrap. Stabilize model geometry and face regions before assigning generated pixels. For cubes, entities, and animation, map face regions deliberately and retain editable `.bbmodel` sources.
+
+The generation result may already include a project path. Processing tools return image data for handoff; do not claim a processed asset was persisted unless a subsequent supported save or model action confirms it. Save final resources under exact Minecraft namespace paths and validate their consumers.
+
+## Reporting
+
+Report the selected variant, style and dimensions, reference used, processing performed, visual defects checked, persisted project path or handoff target, and any remaining manual art review.

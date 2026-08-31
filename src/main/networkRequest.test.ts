@@ -1,6 +1,6 @@
 import { createServer, type Server } from 'node:http'
 import { afterAll, beforeAll, describe, expect, it } from 'vitest'
-import { fetchTextWithRetry, postJsonWithRetry, proxyDispatcher, setNetworkProxy } from './networkRequest'
+import { fetchTextWithRetry, getNetworkProxyUrl, postJsonWithRetry, proxyDispatcher, setNetworkProxy } from './networkRequest'
 
 let server: Server
 const hitCounts = new Map<string, number>()
@@ -90,6 +90,11 @@ describe('configured network proxy', () => {
     setNetworkProxy('http://127.0.0.1:7890')
     setNetworkProxy('')
     expect(proxyDispatcher('https://api.curseforge.com/v1/games')).toBeUndefined()
+  })
+
+  it('exposes the configured proxy for Java and Gradle child processes', () => {
+    setNetworkProxy('http://127.0.0.1:7890')
+    expect(getNetworkProxyUrl()).toBe('http://127.0.0.1:7890')
   })
 
   it('still bypasses China-only hosts when only the environment proxy is set', () => {

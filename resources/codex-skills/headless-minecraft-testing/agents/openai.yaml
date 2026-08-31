@@ -1,4 +1,4 @@
 interface:
   display_name: "Headless Minecraft Testing"
-  short_description: "Plan and validate safe headless Minecraft smoke tests"
-  default_prompt: "Use $headless-minecraft-testing to plan or diagnose a headless Minecraft smoke test for this mod."
+  short_description: "Run managed and external headless Minecraft tests"
+  default_prompt: "Use $headless-minecraft-testing to run or diagnose the appropriate headless Minecraft test."
